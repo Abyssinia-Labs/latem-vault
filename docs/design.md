@@ -157,7 +157,7 @@ The coordinator distributes the log, and devices also exchange it directly, so a
 
 1. An admin signs `revoke_device`. Every device that sees it stops serving and accepting connections from the revoked device.
 2. Each collection the device could read moves to a new key epoch, and new writes use the new key.
-3. Secrets and variables are re-encrypted under the new epoch right away, since they are small. Files are re-encrypted only on request (see §17).
+3. Secrets and variables are re-encrypted under the new epoch right away, since they are small. Files are re-encrypted only on request (see §19).
 4. OpenVault lists every secret the revoked device could read, so you can rotate them at their providers.
 
 ## 8. Joining
@@ -343,31 +343,23 @@ Changes from the template:
 
 The device protocol carries a version number, so one coordinator can serve devices on different releases.
 
-## 17. Hosted product
-
-- **Paid:** hosted coordinators and relays (reach your devices from anywhere with no port forwarding, dynamic DNS or carrier-grade NAT problems), iOS push, and the dashboard.
-- **Free:** everything self-hosted.
-- **Metered:** relay bandwidth, with limits set by plan. Most connections go direct; file transfers that can't are the main cost.
-
-## 18. Cost
+## 17. Cost
 
 Estimates to check against real usage once there is any:
 
-- **Convex (hosted):**
-  - Writes come from sign-up, billing events and token issuance.
-  - With tokens refreshed once a day, that's one call per device per day, reading about 2 KB (account and subscription): roughly 200 KB/day per 100 devices.
-  - There are no presence writes.
 - **Coordinator:** a handful of directory writes per device per day (network changes), log reads only after a change, and mailbox traffic only during joins. Mailbox expiry keeps the SQLite file bounded.
-- **Relay:** the variable cost, equal to the bytes of connections that can't go direct. Meter it per vault.
+- **Relay:** the variable cost, equal to the bytes of connections that can't go direct.
 - **Device to device:** idle peers exchange root hashes only: bytes per minute per pair.
 
-What to watch: Convex function calls and database bandwidth on token issuance; relay egress per vault; coordinator database size (a growing file means mailbox expiry isn't working).
+What to watch: relay egress; coordinator database size (a growing file means mailbox expiry isn't working).
 
-## 19. Milestones
+The hosted product's plans and running costs are documented in `openvault-cloud`.
+
+## 18. Milestones
 
 | Milestone | Delivers | Done when |
 | --- | --- | --- |
-| M0 Spec | Threat model, protocol spec, ADRs for §20 | Crypto and wire formats are written down |
+| M0 Spec | Threat model, protocol spec, ADRs for §19 | Crypto and wire formats are written down |
 | M1 One device | Store, collections, secrets and variables, CLI, `openvault run`, Keychain / Secure Enclave and file keystores | `~/.latem/secrets.env` can be replaced on the MacBook |
 | M2 LAN | PAKE join without a coordinator, membership log, admin Touch ID, recovery key, peer sync over iroh, latem store | The Android build runs on the desktop with secrets from the MacBook |
 | M3 Grandfather | Coordinator, relay, `hold` storage, Docker image | The MacBook reaches the mini from outside the house |
@@ -377,11 +369,9 @@ What to watch: Convex function calls and database bandwidth on token issuance; r
 
 Later: native Windows, Android, a Linux FUSE mount, a hardware security key for recovery, and an external security audit before the hosted launch.
 
-## 20. Open decisions
+## 19. Open decisions
 
 1. **Key wrapping: HPKE or age.** I recommend HPKE: one standard that covers P-256 (Secure Enclave, TPM) and X25519. age would need `age-plugin-se` for the Secure Enclave.
 2. **Re-encryption on revoke.** I recommend re-encrypting secrets and variables immediately, and files only on request.
 3. **Chunking: fixed size or content-defined.** Content-defined chunking deduplicates better but reveals more about file contents. I recommend fixed 1 MiB chunks.
 4. **Name.** `openvault` and the `openvault-*` names are free on GitHub (Abyssinia-Labs) and crates.io. Small GitHub projects already use "OpenVault" (one is a password manager and file locker), and it is also the name of a broadband data company. Check the trademark before the hosted launch.
-5. **Fleet provider** for hosted coordinators and relays. It must support UDP.
-6. **Billing provider.**

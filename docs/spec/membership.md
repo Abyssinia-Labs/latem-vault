@@ -1,6 +1,6 @@
 # Membership log spec, v1
 
-Status: draft, 2026-11-05. The format and rules are implemented by `crates/core` (`membership`); keeping the log in the local store comes next. Builds on [crypto.md](crypto.md) and [records.md](records.md); the design is in [design §7](../design.md#membership-log) and [§8](../design.md#8-joining).
+Status: draft, 2026-11-05. Implemented by `crates/core`: the format and rules in `membership`, and keeping the log in the local store in `store`. Receiving entries from other devices comes with sync. Builds on [crypto.md](crypto.md) and [records.md](records.md); the design is in [design §7](../design.md#membership-log) and [§8](../design.md#8-joining).
 
 The membership log decides who is in a vault:
 
@@ -82,6 +82,15 @@ When a device receives an entry whose `seq` it already has and whose hash differ
 
 Each device keeps every accepted entry, in order, and never deletes one. It checks each entry once, when it arrives, and keeps the resulting state (admins, devices, scopes and epochs) next to the entries, so opening a vault doesn't replay the log. Only fork checks replay it, up to the conflicting `seq`.
 
+In the local store (records.md) that is:
+
+- a `log` table of `seq`, entry hash and entry bytes;
+- the state, encoded by `Membership::to_state_bytes`, in the `membership` row of `meta`. It's written in the same transaction as the entries it follows from, and only this device reads it.
+
+On open, the state's head must equal the hash of the last row in `log`, and this device must be in it with the keys it opened the vault with. Otherwise the store is corrupt. Both checks are single-row reads.
+
+A device's **transport key** comes from its local key (records.md, local store), so `add_device` can name it without the key file holding one.
+
 The log grows with membership changes, not with data. A vault with 10 devices and 20 collections has a few hundred entries of under 1.2 KB each.
 
 ## Creating a vault
@@ -91,9 +100,14 @@ The log grows with membership changes, not with data. A vault with 10 devices an
 1. genesis, listing the recovery admin key (and, from M2, this device's admin key) and the recovery wrapping key;
 2. add_device for this device.
 
-The recovery key is then dropped. It's needed again only to recover, or to sign as an admin on a device that has no admin key.
+The recovery key is then dropped. It's needed again only to recover, or to sign as an admin on a device that has no admin key. Until devices have admin keys of their own (M2), that's every device, so `openvault collections create` asks for the recovery phrase.
 
-Vaults created in M1 have no log. The first version that keeps one asks once for the recovery phrase, checks that it derives the vault's recovery wrapping key, and writes the genesis and add_device entries for the existing device. This also proves the phrase was written down correctly.
+Vaults created in M1 have no log. Opening one adds the empty `log` table (store version 2) and nothing else, so reading keeps working. The first time an admin signature is needed, which today means creating a collection, `openvault` asks for the recovery phrase. It checks that the phrase derives the vault's recovery wrapping key, then writes, in one transaction:
+
+1. genesis and add_device for the existing device;
+2. a set_scope giving it `write` on each existing collection, plus rotate_epoch entries for any epoch past 0.
+
+This also proves the phrase was written down correctly.
 
 ## Not in v1
 

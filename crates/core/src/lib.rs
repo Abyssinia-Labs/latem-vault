@@ -53,6 +53,12 @@ pub enum Error {
     InvalidRecord(&'static str),
     #[error("invalid log entry: {0}")]
     InvalidLogEntry(&'static str),
+    #[error("this vault has no membership log yet")]
+    NoLog,
+    #[error("this vault already has a membership log")]
+    LogExists,
+    #[error("that recovery phrase belongs to another vault")]
+    WrongRecoveryKey,
     #[error("store is corrupt: {0}")]
     Corrupt(&'static str),
 }

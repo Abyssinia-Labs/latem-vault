@@ -8,14 +8,14 @@ mod env_file;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use openvault_core::record::MAX_VALUE_LEN;
-use openvault_core::{Kind, Vault, names};
+use openvault_core::{Kind, Vault, membership, names};
 use openvault_crypto::RecoveryKey;
 use openvault_keystore::{Backend, Keys};
 use zeroize::Zeroizing;
@@ -38,6 +38,9 @@ enum Command {
         /// Where this device's keys live [default: the Secure Enclave when this Mac has one]
         #[arg(long, value_enum)]
         keys: Option<KeysArg>,
+        /// This device's name in the vault [default: this computer's host name]
+        #[arg(long)]
+        name: Option<String>,
     },
     /// List collections, or create one.
     Collections {
@@ -102,7 +105,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CollectionsAction {
-    /// Create a collection.
+    /// Create a collection. Asks for the recovery phrase, which signs as admin until this
+    /// device has an admin key of its own.
     Create { name: String },
 }
 
@@ -137,13 +141,13 @@ fn main() -> ExitCode {
 fn dispatch(command: Command) -> Result<ExitCode> {
     let home = Home::locate()?;
     match command {
-        Command::Init { keys } => {
+        Command::Init { keys, name } => {
             let backend = match keys {
                 Some(KeysArg::SecureEnclave) => Backend::SecureEnclave,
                 Some(KeysArg::Software) => Backend::Software,
                 None => Backend::best(),
             };
-            init(&home, backend)?;
+            init(&home, backend, &name.unwrap_or_else(default_device_name))?;
         }
         Command::Collections { action: None } => {
             for collection in home.open()?.collections()? {
@@ -152,9 +156,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         }
         Command::Collections {
             action: Some(CollectionsAction::Create { name }),
-        } => {
-            home.open()?.create_collection(&name)?;
-        }
+        } => create_collection(&home, &name)?,
         Command::Set { entry, kind } => {
             set(
                 &home,
@@ -215,18 +217,16 @@ impl Home {
     }
 }
 
-fn init(home: &Home, backend: Backend) -> Result<()> {
+fn init(home: &Home, backend: Backend, name: &str) -> Result<()> {
     if home.vault().exists() {
         bail!("there is already a vault in {}", home.0.display());
     }
     create_private_dir(&home.0)?;
     let keys = Keys::create(&home.keys(), backend)?;
     let recovery = RecoveryKey::generate();
-    let vault = Vault::create(&home.vault(), keys, &recovery.unwrap_key().wrap_key()).inspect_err(
-        |_| {
-            let _ = fs::remove_file(home.keys());
-        },
-    )?;
+    let vault = Vault::create(&home.vault(), keys, &recovery, name).inspect_err(|_| {
+        let _ = fs::remove_file(home.keys());
+    })?;
 
     let keys = match backend {
         Backend::SecureEnclave => "Secure Enclave".to_owned(),
@@ -235,7 +235,7 @@ fn init(home: &Home, backend: Backend) -> Result<()> {
     println!("Created a vault in {}.", home.0.display());
     println!();
     println!("  Vault   {}", vault.vault_id());
-    println!("  Device  {}", vault.device_id());
+    println!("  Device  {name}, {}", vault.device_id());
     println!("  Keys    {keys}");
     println!();
     println!("Recovery phrase:");
@@ -253,8 +253,85 @@ fn init(home: &Home, backend: Backend) -> Result<()> {
     println!();
     println!("Write these 24 words down and keep them offline, on paper or in the Passwords app.");
     println!("They are shown only once. With them you can recover every collection if this");
-    println!("device is lost.");
+    println!("device is lost. Until this device has an admin key of its own, creating a");
+    println!("collection asks for them too.");
     Ok(())
+}
+
+/// Creates a collection. Its set_scope entry needs an admin signature, which for now comes
+/// from the recovery key, since devices don't have admin keys of their own yet. A vault from
+/// before the membership log starts its log first, with the same phrase.
+fn create_collection(home: &Home, name: &str) -> Result<()> {
+    names::check_collection(name)?;
+    let mut vault = home.open()?;
+    // Checked before asking for 24 words.
+    if vault.collection(name).is_ok() {
+        bail!("collection {name} already exists");
+    }
+    if io::stdin().is_terminal() {
+        eprintln!("Creating a collection needs an admin signature. Until this device has an");
+        eprintln!("admin key of its own, that comes from your recovery phrase.");
+    }
+    let recovery = read_recovery_phrase()?;
+    if !vault.is_recovery_key(&recovery) {
+        bail!("that recovery phrase belongs to another vault");
+    }
+    if vault.membership().is_none() {
+        vault.start_log(&recovery, &default_device_name())?;
+        println!("Started this vault's membership log.");
+    }
+    vault.create_collection(name, &recovery.admin_signing_key())?;
+    Ok(())
+}
+
+/// Reads a recovery phrase: typed at a hidden prompt, or the first line of stdin.
+fn read_recovery_phrase() -> Result<RecoveryKey> {
+    // 24 words of at most 8 letters, with room for extra spaces.
+    const MAX_LEN: usize = 1024;
+    let stdin = io::stdin();
+    let phrase = if stdin.is_terminal() {
+        Zeroizing::new(rpassword::prompt_password("Recovery phrase (hidden): ")?)
+    } else {
+        // Sized up front so reading never reallocates and leaves copies behind.
+        let mut line = Zeroizing::new(String::with_capacity(MAX_LEN + 1));
+        stdin.lock().take(MAX_LEN as u64 + 1).read_line(&mut line)?;
+        line
+    };
+    Ok(RecoveryKey::from_phrase(&phrase)?)
+}
+
+/// This computer's host name without `.local`, as the device's name in the membership log.
+fn default_device_name() -> String {
+    let host = hostname().unwrap_or_default();
+    let host = host.strip_suffix(".local").unwrap_or(&host);
+    let mut name = String::new();
+    for c in host.chars().filter(|c| !c.is_control()) {
+        if name.len() + c.len_utf8() > membership::MAX_NAME_LEN {
+            break;
+        }
+        name.push(c);
+    }
+    if name.is_empty() {
+        "device".to_owned()
+    } else {
+        name
+    }
+}
+
+#[cfg(unix)]
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the pointer and length describe `buf`, which gethostname writes into.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
+#[cfg(not(unix))]
+fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
 }
 
 fn set(home: &Home, entry: &str, kind: Kind) -> Result<()> {

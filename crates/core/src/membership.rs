@@ -16,7 +16,7 @@ const SIGNATURE_LEN: usize = 65;
 pub const MAX_PAYLOAD_LEN: usize = 1024;
 pub const MAX_ADMINS: usize = 8;
 const MAX_PLATFORM_LEN: usize = 16;
-const MAX_NAME_LEN: usize = 64;
+pub const MAX_NAME_LEN: usize = 64;
 
 const GENESIS: u8 = 0x01;
 const ADD_DEVICE: u8 = 0x02;
@@ -74,6 +74,20 @@ pub struct DeviceInfo {
     pub name: String,
 }
 
+impl DeviceInfo {
+    /// The add_device payload. Call [`Change::check_fields`] first.
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.id.as_bytes());
+        out.extend_from_slice(self.verifying_key.as_bytes());
+        out.extend_from_slice(self.wrap_key.as_bytes());
+        out.extend_from_slice(self.transport_key.as_bytes());
+        for text in [&self.platform, &self.name] {
+            out.push(u8::try_from(text.len()).expect("checked against the limits"));
+            out.extend_from_slice(text.as_bytes());
+        }
+    }
+}
+
 /// One change to the membership: a log entry's type and payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
@@ -110,14 +124,7 @@ impl Change {
                 GENESIS
             }
             Self::AddDevice(info) => {
-                out.extend_from_slice(info.id.as_bytes());
-                out.extend_from_slice(info.verifying_key.as_bytes());
-                out.extend_from_slice(info.wrap_key.as_bytes());
-                out.extend_from_slice(info.transport_key.as_bytes());
-                for text in [&info.platform, &info.name] {
-                    out.push(u8::try_from(text.len()).expect("checked against the limits"));
-                    out.extend_from_slice(text.as_bytes());
-                }
+                info.encode(&mut out);
                 ADD_DEVICE
             }
             Self::SetScope {
@@ -162,22 +169,7 @@ impl Change {
                     .collect::<Result<_>>()?;
                 Self::Genesis { recovery, admins }
             }
-            ADD_DEVICE => {
-                let id = DeviceId::from_bytes(r.array()?);
-                let verifying_key = r.verifying_key()?;
-                let wrap_key = r.wrap_key()?;
-                let transport_key = r.verifying_key()?;
-                let platform = r.short_text()?;
-                let name = r.short_text()?;
-                Self::AddDevice(DeviceInfo {
-                    id,
-                    verifying_key,
-                    wrap_key,
-                    transport_key,
-                    platform,
-                    name,
-                })
-            }
+            ADD_DEVICE => Self::AddDevice(r.device_info()?),
             SET_SCOPE => {
                 let device = DeviceId::from_bytes(r.array()?);
                 let collection = CollectionId::from_bytes(r.array()?);
@@ -546,6 +538,95 @@ impl Membership {
         self.epochs.get(&collection).copied()
     }
 
+    /// The state as bytes, which a device keeps next to its log so that opening a vault
+    /// doesn't replay it (membership.md, keeping the log). Only the device that wrote it reads
+    /// it back, so it isn't signed, and [`from_state_bytes`](Self::from_state_bytes) trusts it.
+    pub fn to_state_bytes(&self) -> Vec<u8> {
+        let mut out = [
+            &self.vault.as_bytes()[..],
+            &self.genesis,
+            &self.seq.to_be_bytes(),
+            &self.head,
+            self.recovery.as_bytes(),
+        ]
+        .concat();
+        out.push(u8::try_from(self.admins.len()).expect("checked against MAX_ADMINS"));
+        for admin in &self.admins {
+            out.extend_from_slice(admin.as_bytes());
+        }
+
+        // Sorted, so the same state is always the same bytes.
+        let mut devices: Vec<&Device> = self.devices.values().collect();
+        devices.sort_by_key(|device| device.info.id);
+        push_count(&mut out, devices.len());
+        for device in devices {
+            device.info.encode(&mut out);
+            out.push(u8::from(device.revoked));
+        }
+        let mut scopes: Vec<_> = self.scopes.iter().collect();
+        scopes.sort();
+        push_count(&mut out, scopes.len());
+        for ((device, collection), scope) in scopes {
+            out.extend_from_slice(device.as_bytes());
+            out.extend_from_slice(collection.as_bytes());
+            out.push(scope.code());
+        }
+        let mut epochs: Vec<_> = self.epochs.iter().collect();
+        epochs.sort();
+        push_count(&mut out, epochs.len());
+        for (collection, epoch) in epochs {
+            out.extend_from_slice(collection.as_bytes());
+            out.extend_from_slice(&epoch.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn from_state_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader(bytes);
+        let vault = VaultId::from_bytes(r.array()?);
+        let genesis = r.array()?;
+        let seq = u64::from_be_bytes(r.array()?);
+        let head = r.array()?;
+        let recovery = r.wrap_key()?;
+        let admins = (0..r.u8()?)
+            .map(|_| r.verifying_key())
+            .collect::<Result<_>>()?;
+        let devices = (0..r.u32()?)
+            .map(|_| {
+                let info = r.device_info()?;
+                let revoked = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(invalid("unknown revoked flag")),
+                };
+                Ok((info.id, Device { info, revoked }))
+            })
+            .collect::<Result<_>>()?;
+        let scopes = (0..r.u32()?)
+            .map(|_| {
+                let device = DeviceId::from_bytes(r.array()?);
+                let collection = CollectionId::from_bytes(r.array()?);
+                let scope = Scope::from_code(r.u8()?).ok_or(invalid("unknown scope"))?;
+                Ok(((device, collection), scope))
+            })
+            .collect::<Result<_>>()?;
+        let epochs = (0..r.u32()?)
+            .map(|_| Ok((CollectionId::from_bytes(r.array()?), r.u32()?)))
+            .collect::<Result<_>>()?;
+        r.finish()?;
+        Ok(Self {
+            vault,
+            genesis,
+            seq,
+            head,
+            recovery,
+            admins,
+            devices,
+            scopes,
+            epochs,
+        })
+    }
+
     /// The rules for each type that depend on the log so far (membership.md).
     fn check(&self, change: &Change) -> Result<()> {
         let device = |id: &DeviceId| match self.devices.get(id) {
@@ -641,6 +722,10 @@ const fn invalid(reason: &'static str) -> Error {
     Error::InvalidLogEntry(reason)
 }
 
+fn push_count(out: &mut Vec<u8>, count: usize) {
+    out.extend_from_slice(&u32::try_from(count).expect("fewer than 2^32").to_be_bytes());
+}
+
 /// Reads an entry's fields in order.
 struct Reader<'a>(&'a [u8]);
 
@@ -674,6 +759,27 @@ impl<'a> Reader<'a> {
         let (key, rest) = WrapKey::split_prefix(self.0)?;
         self.0 = rest;
         Ok(key)
+    }
+
+    fn device_info(&mut self) -> Result<DeviceInfo> {
+        let id = DeviceId::from_bytes(self.array()?);
+        let verifying_key = self.verifying_key()?;
+        let wrap_key = self.wrap_key()?;
+        let transport_key = self.verifying_key()?;
+        let platform = self.short_text()?;
+        let name = self.short_text()?;
+        Ok(DeviceInfo {
+            id,
+            verifying_key,
+            wrap_key,
+            transport_key,
+            platform,
+            name,
+        })
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.array()?))
     }
 
     /// A `u8` length, then that many bytes of UTF-8.
@@ -775,6 +881,16 @@ mod tests {
         assert_eq!(rebuilt.genesis_hash(), log[0].hash());
         assert_eq!(rebuilt.scope(mac.id, c), Scope::Write);
         assert!(rebuilt.device(phone.id).unwrap().revoked);
+        assert_eq!(rebuilt.to_state_bytes(), m.to_state_bytes());
+
+        // The kept state restores the same membership without the log.
+        let state = m.to_state_bytes();
+        let restored = Membership::from_state_bytes(&state).unwrap();
+        assert_eq!(restored.to_state_bytes(), state);
+        assert_eq!(restored.scope(mac.id, c), Scope::Write);
+        assert_eq!(restored.epoch(c), Some(1));
+        assert!(Membership::from_state_bytes(&state[..state.len() - 1]).is_err());
+        assert!(Membership::from_state_bytes(&[&state[..], &[0]].concat()).is_err());
     }
 
     #[test]

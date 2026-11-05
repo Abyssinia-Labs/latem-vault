@@ -6,21 +6,33 @@ use std::process::{Command, Output, Stdio};
 
 struct Device {
     home: tempfile::TempDir,
+    /// The recovery phrase `init` showed.
+    phrase: String,
 }
 
 impl Device {
     /// A device with a vault and a `latem` collection.
     fn new() -> Self {
-        let device = Self::empty();
-        device.ok(&["init", "--keys", "software"]);
-        device.ok(&["collections", "create", "latem"]);
+        let mut device = Self::empty();
+        device.phrase = phrase(&device.ok(&["init", "--keys", "software", "--name", "test"]));
+        device.create_collection("latem");
         device
     }
 
     fn empty() -> Self {
         Self {
             home: tempfile::tempdir().unwrap(),
+            phrase: String::new(),
         }
+    }
+
+    fn create_collection(&self, name: &str) {
+        let output = self.run_with_stdin(&["collections", "create", name], self.phrase.as_bytes());
+        assert!(
+            output.status.success(),
+            "creating {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -81,28 +93,37 @@ impl Device {
     }
 }
 
+/// The recovery phrase in `init`'s output, whose numbered words run down the columns.
+fn phrase(stdout: &str) -> String {
+    let tokens: Vec<&str> = stdout
+        .split_whitespace()
+        .skip_while(|token| *token != "1.")
+        .collect();
+    let mut words: Vec<(usize, &str)> = tokens
+        .chunks(2)
+        .take(24)
+        .map(|pair| (pair[0].trim_end_matches('.').parse().unwrap(), pair[1]))
+        .collect();
+    words.sort();
+    let words: Vec<&str> = words.into_iter().map(|(_, word)| word).collect();
+    assert_eq!(words.len(), 24, "{stdout}");
+    words.join(" ")
+}
+
 #[test]
 fn init_creates_a_private_vault_and_shows_the_phrase() {
     let device = Device::empty();
     let home = device.home.path().join("nested");
     let output = Command::new(env!("CARGO_BIN_EXE_openvault"))
-        .args(["init", "--keys", "software"])
+        .args(["init", "--keys", "software", "--name", "Build Mac"])
         .env("OPENVAULT_HOME", &home)
         .output()
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Device  Build Mac, "), "{stdout}");
     assert!(stdout.contains("Recovery phrase"));
-    let words: Vec<&str> = stdout
-        .split_whitespace()
-        .skip_while(|w| *w != "1.")
-        .collect::<Vec<_>>()
-        .chunks(2)
-        .take(24)
-        .filter(|pair| pair[0].ends_with('.'))
-        .map(|pair| pair[1])
-        .collect();
-    assert_eq!(words.len(), 24, "{stdout}");
+    phrase(&stdout);
 
     #[cfg(unix)]
     {
@@ -120,6 +141,44 @@ fn init_creates_a_private_vault_and_shows_the_phrase() {
         .unwrap();
     assert!(!again.status.success());
     assert!(String::from_utf8_lossy(&again.stderr).contains("already a vault"));
+}
+
+#[test]
+fn creating_a_collection_asks_for_the_recovery_phrase() {
+    let device = Device::new();
+    let other = Device::new();
+    let create = |stdin: &str| {
+        let output = device.run_with_stdin(&["collections", "create", "ssh"], stdin.as_bytes());
+        (
+            output.status.success(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+
+    let (ok, stderr) = create("not a phrase\n");
+    assert!(
+        !ok && stderr.contains("recovery phrase is invalid"),
+        "{stderr}"
+    );
+    let (ok, stderr) = create(&other.phrase);
+    assert!(
+        !ok && stderr.contains("belongs to another vault"),
+        "{stderr}"
+    );
+    assert_eq!(device.ok(&["collections"]), "latem\n");
+
+    let (ok, stderr) = create(&format!("  {}\n", device.phrase.to_uppercase()));
+    assert!(ok, "{stderr}");
+    assert_eq!(device.ok(&["collections"]), "latem\nssh\n");
+
+    let bad_name = Device::empty();
+    assert!(
+        bad_name
+            .fails(&["init", "--keys", "software", "--name", ""])
+            .contains("device name")
+    );
+    assert!(!bad_name.home.path().join("vault.db").exists());
+    assert!(!bad_name.home.path().join("keys").exists());
 }
 
 #[test]

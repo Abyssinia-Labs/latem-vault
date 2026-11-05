@@ -6,14 +6,28 @@ use std::path::Path;
 use std::time::Duration;
 
 use openvault_crypto::hash::{Hash, contexts, derive_key, keyed_hash};
-use openvault_crypto::{SymmetricKey, VerifyingKey, WrapKey, WrappedKey};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use openvault_crypto::{RecoveryKey, SigningKey, SymmetricKey, VerifyingKey, WrapKey, WrappedKey};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use zeroize::Zeroizing;
 
+use crate::membership::{AdminKey, Change, DeviceInfo, LogEntry, Membership, Scope};
 use crate::record::{Body, Kind, Record, Version};
 use crate::{CollectionId, DeviceId, DeviceKeys, Error, Result, VaultId, names};
 
-const SCHEMA_VERSION: i64 = 1;
+/// Version 2 added the membership log. Opening a version 1 store adds its (empty) table.
+const SCHEMA_VERSION: i64 = 2;
+
+/// The membership log (membership.md), in order. Its current state is kept in `meta` as
+/// `membership`, so opening a vault doesn't replay it.
+const LOG_SCHEMA: &str = "
+CREATE TABLE log (
+    seq INTEGER PRIMARY KEY,
+    hash BLOB NOT NULL,
+    entry BLOB NOT NULL
+) STRICT;
+";
 
 const SCHEMA: &str = "
 CREATE TABLE meta (
@@ -116,13 +130,23 @@ pub struct Vault<K: DeviceKeys> {
     cache_key: SymmetricKey,
     /// Unwrapped collection keys, so each is unwrapped at most once per open.
     collection_keys: HashMap<(CollectionId, u32), SymmetricKey>,
+    /// `None` for a vault created before the membership log, until
+    /// [`start_log`](Self::start_log).
+    membership: Option<Membership>,
 }
 
 impl<K: DeviceKeys> Vault<K> {
-    /// Creates a new vault at `path`, with this device as its only member.
+    /// Creates a new vault at `path`, with this device, called `name`, as its only member.
     ///
-    /// Every collection key is also wrapped to `recovery`.
-    pub fn create(path: &Path, keys: K, recovery: &WrapKey) -> Result<Self> {
+    /// The recovery key signs the log's first entries as admin (membership.md, creating a
+    /// vault), and every collection key is also wrapped to it.
+    pub fn create(path: &Path, keys: K, recovery: &RecoveryKey, name: &str) -> Result<Self> {
+        let vault_id = VaultId::random();
+        let device_id = DeviceId::random();
+        let (membership, log) =
+            start_membership(vault_id, recovery, device_info(device_id, &keys, name))?;
+        let recovery = recovery.unwrap_key().wrap_key();
+
         // Create the file ourselves so it is never readable by others, even briefly.
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -135,12 +159,11 @@ impl<K: DeviceKeys> Vault<K> {
             result => drop(result?),
         }
 
-        let vault_id = VaultId::random();
-        let device_id = DeviceId::random();
         let init = || -> Result<Connection> {
             let conn = connect(path)?;
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(LOG_SCHEMA)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             for (key, value) in [
                 ("vault_id", &vault_id.as_bytes()[..]),
@@ -158,11 +181,19 @@ impl<K: DeviceKeys> Vault<K> {
                     keys.wrap_key().as_bytes()
                 ],
             )?;
+            save_log(&tx, &log, &membership)?;
             tx.commit()?;
             Ok(conn)
         };
         match init() {
-            Ok(conn) => Ok(Self::new(conn, keys, vault_id, device_id, recovery.clone())),
+            Ok(conn) => Ok(Self::new(
+                conn,
+                keys,
+                vault_id,
+                device_id,
+                recovery,
+                Some(membership),
+            )),
             Err(e) => {
                 let _ = std::fs::remove_file(path);
                 Err(e)
@@ -175,11 +206,8 @@ impl<K: DeviceKeys> Vault<K> {
         if !path.exists() {
             return Err(Error::NoVault(path.into()));
         }
-        let conn = connect(path)?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
-            return Err(Error::UnsupportedStore(version));
-        }
+        let mut conn = connect(path)?;
+        upgrade(&mut conn)?;
         let vault_id = VaultId::try_from(meta(&conn, "vault_id")?.as_slice())?;
         let device_id = DeviceId::try_from(meta(&conn, "device_id")?.as_slice())?;
         let recovery = WrapKey::from_bytes(&meta(&conn, "recovery_wrap_key")?)?;
@@ -196,7 +224,10 @@ impl<K: DeviceKeys> Vault<K> {
         {
             return Err(Error::WrongKeys);
         }
-        Ok(Self::new(conn, keys, vault_id, device_id, recovery))
+        let membership = load_membership(&conn, vault_id, device_id, &keys)?;
+        Ok(Self::new(
+            conn, keys, vault_id, device_id, recovery, membership,
+        ))
     }
 
     fn new(
@@ -205,6 +236,7 @@ impl<K: DeviceKeys> Vault<K> {
         vault_id: VaultId,
         device_id: DeviceId,
         recovery: WrapKey,
+        membership: Option<Membership>,
     ) -> Self {
         let local = keys.local_key().as_bytes();
         let index_key = derive_key(contexts::LOCAL_INDEX, local);
@@ -218,6 +250,7 @@ impl<K: DeviceKeys> Vault<K> {
             index_key,
             cache_key,
             collection_keys: HashMap::new(),
+            membership,
         }
     }
 
@@ -229,22 +262,77 @@ impl<K: DeviceKeys> Vault<K> {
         self.device_id
     }
 
-    pub fn create_collection(&mut self, name: &str) -> Result<CollectionId> {
+    /// Who is in the vault, or `None` for a vault that hasn't started its log.
+    pub fn membership(&self) -> Option<&Membership> {
+        self.membership.as_ref()
+    }
+
+    /// Whether `recovery` is this vault's recovery key.
+    pub fn is_recovery_key(&self, recovery: &RecoveryKey) -> bool {
+        recovery.unwrap_key().wrap_key() == self.recovery
+    }
+
+    /// Starts the log of a vault created before there was one (membership.md, creating a
+    /// vault): genesis, this device as `name`, and `write` on every existing collection, all
+    /// signed by `recovery`, which must be this vault's recovery key.
+    pub fn start_log(&mut self, recovery: &RecoveryKey, name: &str) -> Result<()> {
+        if self.membership.is_some() {
+            return Err(Error::LogExists);
+        }
+        if !self.is_recovery_key(recovery) {
+            return Err(Error::WrongRecoveryKey);
+        }
+        let (mut membership, mut log) = start_membership(
+            self.vault_id,
+            recovery,
+            device_info(self.device_id, &self.keys, name),
+        )?;
+        let admin = recovery.admin_signing_key();
+        for collection in self.collections()? {
+            let scope = Change::SetScope {
+                device: self.device_id,
+                collection: collection.id,
+                scope: Scope::Write,
+            };
+            log.push(membership.append(scope, &admin)?);
+            for epoch in 1..=self.epoch(collection.id)? {
+                let rotate = Change::RotateEpoch {
+                    collection: collection.id,
+                    epoch,
+                };
+                log.push(membership.append(rotate, &admin)?);
+            }
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        save_log(&tx, &log, &membership)?;
+        tx.commit()?;
+        self.membership = Some(membership);
+        Ok(())
+    }
+
+    /// Creates a collection this device can write. `admin` signs the set_scope entry that
+    /// gives it `write` (membership.md, types), so the vault must have started its log.
+    pub fn create_collection(&mut self, name: &str, admin: &impl AdminKey) -> Result<CollectionId> {
         names::check_collection(name)?;
+        let membership = self.membership.as_ref().ok_or(Error::NoLog)?;
         let tag = self.collection_tag(name);
+        if collection_exists(&self.conn, &tag)? {
+            return Err(Error::CollectionExists(name.into()));
+        }
         let id = CollectionId::random();
+        // Signed before anything is written, so a refused signature leaves nothing behind.
+        let mut membership = membership.clone();
+        let scope = Change::SetScope {
+            device: self.device_id,
+            collection: id,
+            scope: Scope::Write,
+        };
+        let entry = membership.append(scope, admin)?;
         let key = SymmetricKey::generate();
 
         let tx = self.conn.unchecked_transaction()?;
-        let taken = tx
-            .query_row(
-                "SELECT 1 FROM collections WHERE name_tag = ?1",
-                [&tag[..]],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if taken {
+        // Again inside the transaction, in case another process created it meanwhile.
+        if collection_exists(&tx, &tag)? {
             return Err(Error::CollectionExists(name.into()));
         }
         let label = self
@@ -267,9 +355,11 @@ impl<K: DeviceKeys> Vault<K> {
         }
         let body = Body::new(Kind::Collection, "", name.as_bytes());
         self.write_record(&tx, id, 0, &key, &body, false)?;
+        save_log(&tx, &[entry], &membership)?;
         tx.commit()?;
 
         self.collection_keys.insert((id, 0), key);
+        self.membership = Some(membership);
         Ok(id)
     }
 
@@ -634,6 +724,128 @@ fn connect(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Brings an older store up to [`SCHEMA_VERSION`]. Version 1 had no membership log.
+fn upgrade(conn: &mut Connection) -> Result<()> {
+    match user_version(conn)? {
+        SCHEMA_VERSION => return Ok(()),
+        1 => {}
+        other => return Err(Error::UnsupportedStore(other)),
+    }
+    // Immediate, so two processes opening the same old store don't both upgrade it.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if user_version(&tx)? == 1 {
+        tx.execute_batch(LOG_SCHEMA)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn user_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
+}
+
+/// The kept membership, checked against the log's last entry and this device's keys. `None`
+/// for a vault that hasn't started its log.
+fn load_membership(
+    conn: &Connection,
+    vault: VaultId,
+    device: DeviceId,
+    keys: &impl DeviceKeys,
+) -> Result<Option<Membership>> {
+    let Some(state) = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'membership'",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let membership =
+        Membership::from_state_bytes(&state).map_err(|_| Error::Corrupt("membership state"))?;
+    let last: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT hash FROM log ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if membership.vault() != vault || last.as_deref() != Some(&membership.head().1[..]) {
+        return Err(Error::Corrupt("the membership state doesn't match the log"));
+    }
+    match membership.device(device) {
+        Some(this)
+            if this.info.verifying_key == keys.verifying_key()
+                && this.info.wrap_key == keys.wrap_key() =>
+        {
+            Ok(Some(membership))
+        }
+        _ => Err(Error::Corrupt("this device isn't in the membership log")),
+    }
+}
+
+/// The log's first entries, signed by the recovery key's admin key: genesis, listing that key
+/// as the only admin, then add_device for this device (membership.md, creating a vault).
+fn start_membership(
+    vault: VaultId,
+    recovery: &RecoveryKey,
+    device: DeviceInfo,
+) -> Result<(Membership, Vec<LogEntry>)> {
+    let admin = recovery.admin_signing_key();
+    let (mut membership, genesis) = Membership::create(
+        vault,
+        recovery.unwrap_key().wrap_key(),
+        vec![admin.verifying_key()],
+        &admin,
+    )?;
+    let add = membership.append(Change::AddDevice(device), &admin)?;
+    Ok((membership, vec![genesis, add]))
+}
+
+/// This device as add_device describes it. Its transport key is derived from the local key
+/// (records.md, local store), so the key file doesn't need to hold one.
+fn device_info(id: DeviceId, keys: &impl DeviceKeys, name: &str) -> DeviceInfo {
+    let transport = derive_key(contexts::TRANSPORT, keys.local_key().as_bytes());
+    DeviceInfo {
+        id,
+        verifying_key: keys.verifying_key(),
+        wrap_key: keys.wrap_key(),
+        transport_key: SigningKey::from_ed25519_seed(&transport).verifying_key(),
+        platform: std::env::consts::OS.into(),
+        name: name.into(),
+    }
+}
+
+/// Adds accepted entries to the log and keeps the membership they lead to.
+fn save_log(tx: &Transaction<'_>, entries: &[LogEntry], membership: &Membership) -> Result<()> {
+    for entry in entries {
+        let seq = i64::try_from(entry.seq()).map_err(|_| Error::Corrupt("log sequence"))?;
+        tx.execute(
+            "INSERT INTO log VALUES (?1, ?2, ?3)",
+            params![seq, &entry.hash()[..], entry.to_bytes()],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO meta VALUES ('membership', ?1)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        [membership.to_state_bytes()],
+    )?;
+    Ok(())
+}
+
+fn collection_exists(conn: &Connection, tag: &Hash) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM collections WHERE name_tag = ?1",
+            [&tag[..]],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 fn meta(conn: &Connection, key: &str) -> Result<Vec<u8>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
         row.get(0)
@@ -689,17 +901,29 @@ mod tests {
 
     impl Setup {
         fn create(&self) -> Vault<&SoftwareKeys> {
-            Vault::create(
-                &self.path,
-                &self.keys,
-                &self.recovery.unwrap_key().wrap_key(),
-            )
-            .unwrap()
+            Vault::create(&self.path, &self.keys, &self.recovery, "test").unwrap()
         }
 
         fn open(&self) -> Vault<&SoftwareKeys> {
             Vault::open(&self.path, &self.keys).unwrap()
         }
+
+        /// The recovery key's admin key, the vault's only admin.
+        fn admin(&self) -> SigningKey {
+            self.recovery.admin_signing_key()
+        }
+    }
+
+    fn stored_log(vault: &Vault<&SoftwareKeys>) -> Vec<LogEntry> {
+        let mut statement = vault
+            .conn
+            .prepare("SELECT entry FROM log ORDER BY seq")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|entry| LogEntry::from_bytes(&entry.unwrap()).unwrap())
+            .collect()
     }
 
     fn value(entry: Option<Entry>) -> Option<Vec<u8>> {
@@ -711,7 +935,7 @@ mod tests {
         let s = setup();
         let (vault_id, id) = {
             let mut vault = s.create();
-            let id = vault.create_collection("latem-cloud").unwrap();
+            let id = vault.create_collection("latem-cloud", &s.admin()).unwrap();
             vault
                 .set(id, "prod/SENTRY_DSN", Kind::Var, b"https://sentry.example")
                 .unwrap();
@@ -756,11 +980,17 @@ mod tests {
     fn create_and_open_errors() {
         let s = setup();
         drop(s.create());
-        let recovery = s.recovery.unwrap_key().wrap_key();
         assert!(matches!(
-            Vault::create(&s.path, &s.keys, &recovery),
+            Vault::create(&s.path, &s.keys, &s.recovery, "test"),
             Err(Error::VaultExists(_))
         ));
+        // A name the log refuses leaves no file behind.
+        let unnamed = s.path.with_file_name("unnamed.db");
+        assert!(matches!(
+            Vault::create(&unnamed, &s.keys, &s.recovery, ""),
+            Err(Error::InvalidLogEntry(_))
+        ));
+        assert!(!unnamed.exists());
         assert!(matches!(
             Vault::open(&s.path, SoftwareKeys::generate()),
             Err(Error::WrongKeys)
@@ -769,6 +999,125 @@ mod tests {
         assert!(matches!(
             Vault::open(&missing, &s.keys),
             Err(Error::NoVault(_))
+        ));
+    }
+
+    #[test]
+    fn create_starts_the_membership_log() {
+        let s = setup();
+        let device = {
+            let vault = s.create();
+            let m = vault.membership().unwrap();
+            assert_eq!(m.head().0, 1);
+            assert_eq!(m.admins(), [s.admin().verifying_key()]);
+            assert_eq!(m.recovery_key(), &s.recovery.unwrap_key().wrap_key());
+            let device = m.device(vault.device_id()).unwrap().info.clone();
+            assert_eq!(device.verifying_key, s.keys.verifying_key());
+            assert_eq!(device.wrap_key, s.keys.wrap_key());
+            assert!(device.transport_key.is_ed25519());
+            assert_eq!(
+                (device.name.as_str(), device.platform.as_str()),
+                ("test", std::env::consts::OS)
+            );
+            assert!(vault.is_recovery_key(&s.recovery));
+            assert!(!vault.is_recovery_key(&RecoveryKey::generate()));
+            device
+        };
+
+        // Reopening restores the kept state, which matches a replay of the stored log.
+        let vault = s.open();
+        let m = vault.membership().unwrap();
+        assert_eq!(m.device(vault.device_id()).unwrap().info, device);
+        let log = stored_log(&vault);
+        assert_eq!(log.len(), 2);
+        assert_eq!(
+            Membership::replay(&log).unwrap().to_state_bytes(),
+            m.to_state_bytes()
+        );
+    }
+
+    #[test]
+    fn creating_a_collection_needs_an_admin() {
+        let s = setup();
+        let mut vault = s.create();
+        let head = vault.membership().unwrap().head();
+        let outsider = SigningKey::generate_ed25519();
+        assert!(matches!(
+            vault.create_collection("c", &outsider),
+            Err(Error::InvalidLogEntry("signer isn't an admin"))
+        ));
+        assert!(vault.collections().unwrap().is_empty());
+        assert_eq!(vault.membership().unwrap().head(), head);
+
+        let id = vault.create_collection("c", &s.admin()).unwrap();
+        let m = vault.membership().unwrap();
+        assert_eq!(m.scope(vault.device_id(), id), Scope::Write);
+        assert_eq!(m.epoch(id), Some(0));
+        drop(vault);
+        let vault = s.open();
+        assert_eq!(
+            vault.membership().unwrap().scope(vault.device_id(), id),
+            Scope::Write
+        );
+        assert_eq!(stored_log(&vault).len(), 3);
+    }
+
+    #[test]
+    fn vaults_from_before_the_log_start_one_with_the_recovery_key() {
+        let s = setup();
+        let id = {
+            let mut vault = s.create();
+            let id = vault.create_collection("c", &s.admin()).unwrap();
+            vault.set(id, "A", Kind::Var, b"1").unwrap();
+            // Make it a version 1 store, as M1 created them.
+            vault
+                .conn
+                .execute_batch(
+                    "DROP TABLE log;
+                     DELETE FROM meta WHERE key = 'membership';
+                     PRAGMA user_version = 1;",
+                )
+                .unwrap();
+            id
+        };
+
+        let mut vault = s.open();
+        assert!(vault.membership().is_none());
+        assert_eq!(value(vault.get(id, "A").unwrap()), Some(b"1".to_vec()));
+        assert!(matches!(
+            vault.create_collection("d", &s.admin()),
+            Err(Error::NoLog)
+        ));
+        assert!(matches!(
+            vault.start_log(&RecoveryKey::generate(), "test"),
+            Err(Error::WrongRecoveryKey)
+        ));
+        vault.start_log(&s.recovery, "test").unwrap();
+        assert!(matches!(
+            vault.start_log(&s.recovery, "test"),
+            Err(Error::LogExists)
+        ));
+        let d = vault.create_collection("d", &s.admin()).unwrap();
+
+        // genesis, add_device, the existing collection's scope, then the new one's.
+        let vault = s.open();
+        let m = vault.membership().unwrap();
+        assert_eq!(m.head().0, 3);
+        assert_eq!(m.scope(vault.device_id(), id), Scope::Write);
+        assert_eq!(m.scope(vault.device_id(), d), Scope::Write);
+    }
+
+    #[test]
+    fn rejects_state_that_doesnt_match_the_log() {
+        let s = setup();
+        drop(s.create());
+        Connection::open(&s.path)
+            .unwrap()
+            .execute("UPDATE log SET hash = zeroblob(32) WHERE seq = 1", [])
+            .unwrap();
+        assert!(matches!(
+            Vault::open(&s.path, &s.keys),
+            Err(Error::Corrupt(_))
         ));
     }
 
@@ -786,7 +1135,7 @@ mod tests {
     fn overwrite_delete_and_restore() {
         let s = setup();
         let mut vault = s.create();
-        let id = vault.create_collection("c").unwrap();
+        let id = vault.create_collection("c", &s.admin()).unwrap();
 
         vault.set(id, "A", Kind::Var, b"1").unwrap();
         let first = vault.get(id, "A").unwrap().unwrap().version;
@@ -810,7 +1159,7 @@ mod tests {
     fn set_all_writes_everything_or_nothing() {
         let s = setup();
         let mut vault = s.create();
-        let id = vault.create_collection("c").unwrap();
+        let id = vault.create_collection("c", &s.admin()).unwrap();
 
         let big = vec![0; crate::record::MAX_VALUE_LEN + 1];
         assert!(matches!(
@@ -837,7 +1186,7 @@ mod tests {
     fn older_versions_never_replace_newer() {
         let s = setup();
         let mut vault = s.create();
-        let id = vault.create_collection("c").unwrap();
+        let id = vault.create_collection("c", &s.admin()).unwrap();
         vault.set(id, "A", Kind::Var, b"new").unwrap();
 
         // Rewind the clock, as if this write had been made before the one above.
@@ -856,13 +1205,13 @@ mod tests {
     fn collection_errors() {
         let s = setup();
         let mut vault = s.create();
-        let id = vault.create_collection("c").unwrap();
+        let id = vault.create_collection("c", &s.admin()).unwrap();
         assert!(matches!(
-            vault.create_collection("c"),
+            vault.create_collection("c", &s.admin()),
             Err(Error::CollectionExists(_))
         ));
         assert!(matches!(
-            vault.create_collection("a/b"),
+            vault.create_collection("a/b", &s.admin()),
             Err(Error::InvalidName(_))
         ));
         assert!(matches!(
@@ -893,7 +1242,7 @@ mod tests {
     fn entries_in_a_folder() {
         let s = setup();
         let mut vault = s.create();
-        let id = vault.create_collection("c").unwrap();
+        let id = vault.create_collection("c", &s.admin()).unwrap();
         for name in ["prod/A", "prod/B", "staging/A", "prodx/C", "prod"] {
             vault.set(id, name, Kind::Var, name.as_bytes()).unwrap();
         }
@@ -910,7 +1259,7 @@ mod tests {
     fn recovery_key_unwraps_every_collection_key() {
         let s = setup();
         let mut vault = s.create();
-        let id = vault.create_collection("c").unwrap();
+        let id = vault.create_collection("c", &s.admin()).unwrap();
         vault.set(id, "A", Kind::Secret, b"recover me").unwrap();
 
         let recovery_wrap_key = s.recovery.unwrap_key().wrap_key();
@@ -949,7 +1298,7 @@ mod tests {
     fn tampered_records_are_rejected() {
         let s = setup();
         let mut vault = s.create();
-        let id = vault.create_collection("c").unwrap();
+        let id = vault.create_collection("c", &s.admin()).unwrap();
         vault.set(id, "A", Kind::Secret, b"value").unwrap();
 
         let original: Vec<u8> = vault
@@ -987,7 +1336,7 @@ mod tests {
         let s = setup();
         {
             let mut vault = s.create();
-            let id = vault.create_collection("latem-cloud").unwrap();
+            let id = vault.create_collection("latem-cloud", &s.admin()).unwrap();
             vault
                 .set(
                     id,

@@ -219,14 +219,16 @@ mod tests {
     #[test]
     fn vaults_work_with_every_backend() {
         let dir = tempfile::tempdir().unwrap();
-        let recovery = RecoveryKey::generate().unwrap_key().wrap_key();
+        let recovery = RecoveryKey::generate();
         for backend in backends() {
             let keys_path = dir.path().join(format!("{backend:?}.keys"));
             let vault_path = dir.path().join(format!("{backend:?}.db"));
             let id = {
                 let keys = Keys::create(&keys_path, backend).unwrap();
-                let mut vault = Vault::create(&vault_path, keys, &recovery).unwrap();
-                let id = vault.create_collection("latem").unwrap();
+                let mut vault = Vault::create(&vault_path, keys, &recovery, "test").unwrap();
+                let id = vault
+                    .create_collection("latem", &recovery.admin_signing_key())
+                    .unwrap();
                 vault
                     .set(id, "prod/SENTRY_DSN", Kind::Secret, b"https://sentry")
                     .unwrap();

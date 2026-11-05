@@ -669,6 +669,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "openvault-core",
  "openvault-crypto",
  "openvault-keystore",

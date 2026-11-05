@@ -29,6 +29,7 @@ pub mod contexts {
     pub const LOG_ENTRY_HASH: &str = "openvault v1 log entry hash";
     pub const LOCAL_INDEX: &str = "openvault v1 local index key";
     pub const LOCAL_CACHE: &str = "openvault v1 local cache key";
+    pub const TRANSPORT: &str = "openvault v1 transport key";
 }
 
 #[cfg(test)]

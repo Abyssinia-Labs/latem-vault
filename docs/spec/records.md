@@ -68,7 +68,10 @@ Each device keeps one SQLite database per vault, readable only by its user (mode
 - known devices and their public keys;
 - collections, their current epochs and wrapped keys;
 - every record, as received;
-- an index of each entry's current version.
+- an index of each entry's current version;
+- the membership log and the state it leads to ([membership.md](membership.md#keeping-the-log)).
+
+The database's `user_version` is the store version: 1 in M1, 2 since the membership log. Opening a version 1 store upgrades it by adding the empty log table.
 
 The index never stores a name in the clear. Each device has a 32-byte **local key**, kept by its keystore and never shared, from which it derives:
 
@@ -76,9 +79,10 @@ The index never stores a name in the clear. Each device has a 32-byte **local ke
 | --- | --- | --- |
 | Index key | `BLAKE3.derive_key("openvault v1 local index key", local key)` | `name_tag` = `BLAKE3.keyed_hash(index key, "entry" ‖ 0x00 ‖ collection_id ‖ name)`, or `"collection" ‖ 0x00 ‖ name` for collection names |
 | Cache key | `BLAKE3.derive_key("openvault v1 local cache key", local key)` | seals the kind and name in the index, so listing doesn't need collection keys |
+| Transport key | Ed25519 with seed `BLAKE3.derive_key("openvault v1 transport key", local key)` | the device's iroh identity, named in its add_device entry (design §7) |
 
 Looking up an entry costs one index read and one record read. Listing a collection reads its index rows and decrypts their names with the cache key. Neither scans history.
 
 ## Not in v1
 
-History pruning (N versions or D days), files and chunks, the membership log and receiving records from other devices. The format leaves room for each: pruning works on headers alone, files are kind `0x03`, and received records go through the same version rule as local writes.
+History pruning (N versions or D days), files and chunks, and receiving records from other devices. The format leaves room for each: pruning works on headers alone, files are kind `0x03`, and received records go through the same version rule as local writes.

@@ -14,7 +14,7 @@ Milestone M1, one device: secrets and variables work on a single machine, with n
 cargo install --path crates/cli
 
 openvault init                                   # shows the recovery phrase once
-openvault collections create latem
+openvault collections create latem               # asks for the recovery phrase, for now
 openvault set latem/prod/SENTRY_DSN --secret     # value from stdin; hidden when typed
 openvault set latem/prod/REGION --var
 openvault list latem

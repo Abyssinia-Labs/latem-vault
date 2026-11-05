@@ -38,6 +38,16 @@ Every name becomes a secret unless it is given with `--var`. The file is read as
 
 The vault and this device's key file are kept in `~/.openvault`; set `OPENVAULT_HOME` to use another directory. On a Mac with a Secure Enclave, the device keys stay in it. Elsewhere they are kept in the key file, which only you can read.
 
+## Development
+
+There's no hosted CI while the repository is private. Before anything lands on `main`, run:
+
+```sh
+scripts/ci.sh
+```
+
+It runs rustfmt, then clippy and the tests on this Mac and in a Linux container, which needs Docker. `scripts/ci.sh macos` or `scripts/ci.sh linux` runs one side only.
+
 ## License
 
 Licensed under either of

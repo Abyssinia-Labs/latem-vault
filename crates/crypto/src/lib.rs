@@ -35,7 +35,7 @@ pub enum Error {
 /// Fills an array from the operating system's random number generator.
 ///
 /// Panics if the OS generator fails: there is no safe way to continue without randomness.
-pub(crate) fn random_bytes<const N: usize>() -> zeroize::Zeroizing<[u8; N]> {
+pub fn random_bytes<const N: usize>() -> zeroize::Zeroizing<[u8; N]> {
     let mut bytes = zeroize::Zeroizing::new([0u8; N]);
     getrandom::fill(bytes.as_mut()).expect("operating system random number generator failed");
     bytes

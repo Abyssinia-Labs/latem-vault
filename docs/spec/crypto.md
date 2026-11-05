@@ -11,7 +11,7 @@ Every format here is versioned by its labels (`openvault v1 …`). A change to a
 | Records | XChaCha20-Poly1305 | `chacha20poly1305` |
 | Wrapping collection keys | HPKE (RFC 9180), base mode | `hpke` |
 | Signatures | Ed25519 (strict verification); ECDSA P-256 with SHA-256 | `ed25519-dalek`, `p256` |
-| Hashing, key derivation | BLAKE3 (`hash`, `derive_key`) | `blake3` |
+| Hashing, key derivation | BLAKE3 (`hash`, `keyed_hash`, `derive_key`) | `blake3` |
 | Recovery phrase | BIP-39, English, 24 words | `bip39` |
 
 Key wrapping uses HPKE, as recommended in design §19.1.
@@ -41,7 +41,7 @@ Decoders reject unknown identifiers, wrong lengths, and public keys that aren't 
 
 ## Records
 
-A record body is sealed with the collection key for its epoch. The AAD is the record's cleartext header, without the signature, so moving a body to another header fails to decrypt. The header encoding is part of the record spec (not written yet).
+A record body is sealed with the collection key for its epoch. The AAD is the record's cleartext header fields, so moving a body to another header fails to decrypt. The header and body encodings are in [records.md](records.md).
 
 Nonces are random. 192 bits makes a repeat under one key negligible for any number of records a vault will hold.
 
@@ -53,7 +53,7 @@ Suite: KEM as above, KDF HKDF-SHA256 (`0x0001`), AEAD ChaCha20-Poly1305 (`0x0003
 - `aad` = empty
 - plaintext = the 32-byte collection key
 
-`context` identifies what is wrapped: vault id, collection id and key epoch. Its encoding is part of the record spec. Binding it into `info` means a wrapped key copied to another collection or epoch doesn't unwrap.
+`context` identifies what is wrapped: vault id, collection id and key epoch, encoded as in [records.md](records.md#collection-keys). Binding it into `info` means a wrapped key copied to another collection or epoch doesn't unwrap.
 
 Devices with a Secure Enclave or TPM use P-256; devices without one, and the recovery key, use X25519.
 

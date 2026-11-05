@@ -16,10 +16,18 @@ pub fn derive_key(context: &'static str, material: &[u8]) -> zeroize::Zeroizing<
     zeroize::Zeroizing::new(blake3::derive_key(context, material))
 }
 
+/// A BLAKE3 keyed hash (a MAC) of `data`.
+pub fn keyed_hash(key: &[u8; 32], data: &[u8]) -> Hash {
+    *blake3::keyed_hash(key, data).as_bytes()
+}
+
 /// Context strings for [`derive_key`]. Changing one changes every key derived from it.
 pub mod contexts {
     pub const RECOVERY_ADMIN_SIGNING: &str = "openvault v1 recovery admin signing key";
     pub const RECOVERY_WRAPPING: &str = "openvault v1 recovery wrapping key";
+    pub const RECORD_ID: &str = "openvault v1 record id";
+    pub const LOCAL_INDEX: &str = "openvault v1 local index key";
+    pub const LOCAL_CACHE: &str = "openvault v1 local cache key";
 }
 
 #[cfg(test)]

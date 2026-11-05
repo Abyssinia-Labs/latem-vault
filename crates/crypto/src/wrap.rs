@@ -5,11 +5,19 @@
 //! The HPKE `info` is `"openvault v1 wrap" || 0x00 || context`, where the caller's context
 //! names what is being wrapped (vault, collection and epoch), so a wrapped key can't be
 //! replayed into another collection or epoch.
+//!
+//! Hardware keys can't hand their private key to the `hpke` crate, so
+//! [`WrappedKey::unwrap_with`] asks the hardware for the ECDH result only and runs the rest of
+//! RFC 9180 here.
 
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{KeyInit, Nonce};
+use hkdf::{Hkdf, HkdfExtract};
 use hpke::aead::ChaCha20Poly1305;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::{DhP256HkdfSha256, X25519HkdfSha256};
 use hpke::{Deserializable, Kem, OpModeR, OpModeS, Serializable};
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::{Error, SymmetricKey};
@@ -41,6 +49,12 @@ impl WrapKey {
         valid
             .then(|| Self(bytes.to_vec()))
             .ok_or(Error::Encoding("wrapping key"))
+    }
+
+    /// A P-256 wrapping key from its uncompressed SEC1 encoding, as hardware keystores
+    /// export it.
+    pub fn from_p256_sec1(public: &[u8]) -> Result<Self, Error> {
+        Self::from_bytes(&[&KEM_P256.to_be_bytes()[..], public].concat())
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -128,11 +142,7 @@ impl UnwrapKey {
             (Self::P256(sk), KEM_P256) => open::<P256>(sk, &info, wrapped)?,
             _ => return Err(Error::Decrypt),
         };
-        let bytes: [u8; 32] = plaintext
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::Decrypt)?;
-        Ok(SymmetricKey::from_bytes(bytes))
+        to_key(&plaintext)
     }
 }
 
@@ -178,10 +188,41 @@ impl WrappedKey {
             ciphertext: ciphertext.to_vec(),
         })
     }
+
+    /// Unwraps with a P-256 key held in hardware (the Secure Enclave or a TPM), whose public
+    /// half is `recipient`. Gives the same result as [`UnwrapKey::unwrap`].
+    ///
+    /// `ecdh` receives the sender's ephemeral public key (uncompressed SEC1, already checked
+    /// to be on the curve) and returns the x-coordinate of the shared point.
+    pub fn unwrap_with<E: From<Error>>(
+        &self,
+        recipient: &WrapKey,
+        context: &[u8],
+        ecdh: impl FnOnce(&[u8; 65]) -> Result<Zeroizing<[u8; 32]>, E>,
+    ) -> Result<SymmetricKey, E> {
+        let (kem_id, public) = split_kem_id(&recipient.0).expect("validated on construction");
+        if kem_id != KEM_P256 || self.kem_id != KEM_P256 {
+            return Err(Error::Decrypt.into());
+        }
+        let plaintext = open_p256_with(
+            public,
+            &self.enc,
+            &info(context),
+            &[],
+            &self.ciphertext,
+            ecdh,
+        )?;
+        Ok(to_key(&plaintext)?)
+    }
 }
 
 fn info(context: &[u8]) -> Vec<u8> {
     [INFO_LABEL, context].concat()
+}
+
+fn to_key(plaintext: &[u8]) -> Result<SymmetricKey, Error> {
+    let bytes: [u8; 32] = plaintext.try_into().map_err(|_| Error::Decrypt)?;
+    Ok(SymmetricKey::from_bytes(bytes))
 }
 
 fn split_kem_id(bytes: &[u8]) -> Result<(u16, &[u8]), Error> {
@@ -222,9 +263,157 @@ fn open<K: Kem>(
     .map_err(|_| Error::Decrypt)
 }
 
+/// HPKE base-mode `Open` for DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and ChaCha20-Poly1305
+/// (RFC 9180 §4.1, §5.1), with the ECDH step done by the caller. `public` is the recipient's
+/// uncompressed SEC1 key. Checked against the RFC's test vector A.5.1.
+fn open_p256_with<E: From<Error>>(
+    public: &[u8],
+    enc: &[u8],
+    info: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+    ecdh: impl FnOnce(&[u8; 65]) -> Result<Zeroizing<[u8; 32]>, E>,
+) -> Result<Zeroizing<Vec<u8>>, E> {
+    const KEM_SUITE: &[u8] = b"KEM\x00\x10";
+    const HPKE_SUITE: &[u8] = b"HPKE\x00\x10\x00\x01\x00\x03";
+
+    let enc: &[u8; 65] = enc.try_into().map_err(|_| Error::Decrypt)?;
+    if <P256 as Kem>::PublicKey::from_bytes(enc).is_err() {
+        return Err(Error::Decrypt.into());
+    }
+    let dh = ecdh(enc)?;
+
+    // Decap: ExtractAndExpand(dh, enc || pkRm).
+    let eae_prk = labeled_extract(KEM_SUITE, &[], b"eae_prk", &*dh);
+    let shared_secret = labeled_expand::<32>(&eae_prk, KEM_SUITE, b"shared_secret", &[enc, public]);
+
+    // KeySchedule in base mode: no PSK.
+    let psk_id_hash = labeled_extract(HPKE_SUITE, &[], b"psk_id_hash", &[]);
+    let info_hash = labeled_extract(HPKE_SUITE, &[], b"info_hash", info);
+    let context: [&[u8]; 3] = [&[0x00], &*psk_id_hash, &*info_hash];
+    let secret = labeled_extract(HPKE_SUITE, &*shared_secret, b"secret", &[]);
+    let key = labeled_expand::<32>(&secret, HPKE_SUITE, b"key", &context);
+    let base_nonce = labeled_expand::<12>(&secret, HPKE_SUITE, b"base_nonce", &context);
+
+    // The first message's nonce is base_nonce itself.
+    chacha20poly1305::ChaCha20Poly1305::new(&(*key).into())
+        .decrypt(
+            &Nonce::from(*base_nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map(Zeroizing::new)
+        .map_err(|_| Error::Decrypt.into())
+}
+
+fn labeled_extract(suite: &[u8], salt: &[u8], label: &[u8], ikm: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut extract = HkdfExtract::<Sha256>::new(Some(salt));
+    for part in [b"HPKE-v1", suite, label, ikm] {
+        extract.input_ikm(part);
+    }
+    Zeroizing::new(extract.finalize().0.into())
+}
+
+fn labeled_expand<const N: usize>(
+    prk: &[u8; 32],
+    suite: &[u8],
+    label: &[u8],
+    info: &[&[u8]],
+) -> Zeroizing<[u8; N]> {
+    let length = u16::try_from(N)
+        .expect("HPKE output lengths fit in u16")
+        .to_be_bytes();
+    let mut parts: Vec<&[u8]> = vec![&length, b"HPKE-v1", suite, label];
+    parts.extend_from_slice(info);
+    let mut okm = Zeroizing::new([0u8; N]);
+    Hkdf::<Sha256>::from_prk(prk)
+        .expect("a 32-byte PRK is valid for SHA-256")
+        .expand_multi_info(&parts, okm.as_mut())
+        .expect("HPKE output lengths are within HKDF's limit");
+    okm
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ECDH with a software P-256 key, standing in for the Secure Enclave.
+    fn software_ecdh(
+        secret: &[u8],
+    ) -> impl FnOnce(&[u8; 65]) -> Result<Zeroizing<[u8; 32]>, Error> {
+        let secret = p256::SecretKey::from_slice(secret).unwrap();
+        move |peer| {
+            let peer = p256::PublicKey::from_sec1_bytes(peer).unwrap();
+            let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+            Ok(Zeroizing::new(
+                shared.raw_secret_bytes().as_slice().try_into().unwrap(),
+            ))
+        }
+    }
+
+    #[test]
+    fn external_ecdh_matches_rfc_9180_vector() {
+        // RFC 9180 A.5.1: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, ChaCha20Poly1305, base mode.
+        let h = |s: &str| hex::decode(s).unwrap();
+        let sk_rm = h("a4d1c55836aa30f9b3fbb6ac98d338c877c2867dd3a77396d13f68d3ab150d3b");
+        let pk_rm = h(concat!(
+            "04a697bffde9405c992883c5c439d6cc358170b51af72812333b015621dc0f",
+            "40bad9bb726f68a5c013806a790ec716ab8669f84f6b694596c2987cf35baba2a006"
+        ));
+        let enc = h(concat!(
+            "04c07836a0206e04e31d8ae99bfd549380b072a1b1b82e563c935c095827824",
+            "fc1559eac6fb9e3c70cd3193968994e7fe9781aa103f5b50e934b5b2f387e381291"
+        ));
+        let info = h("4f6465206f6e2061204772656369616e2055726e");
+        let aad = h("436f756e742d30");
+        let ct = h(concat!(
+            "6469c41c5c81d3aa85432531ecf6460ec945bde1eb428cb2fedf7a29f5a685b4",
+            "ccb0d057f03ea2952a27bb458b"
+        ));
+        let pt = open_p256_with(&pk_rm, &enc, &info, &aad, &ct, software_ecdh(&sk_rm)).unwrap();
+        assert_eq!(
+            *pt,
+            h("4265617574792069732074727574682c20747275746820626561757479")
+        );
+    }
+
+    #[test]
+    fn external_ecdh_unwraps_like_software() {
+        let recipient = UnwrapKey::generate_p256();
+        let secret = &recipient.to_secret_bytes()[2..];
+        let key = SymmetricKey::generate();
+        let wrapped = recipient.wrap_key().wrap(b"epoch 3", &key);
+        let public = WrapKey::from_p256_sec1(&recipient.wrap_key().as_bytes()[2..]).unwrap();
+        assert_eq!(public, recipient.wrap_key());
+
+        let unwrapped = wrapped
+            .unwrap_with(&public, b"epoch 3", software_ecdh(secret))
+            .unwrap();
+        assert_eq!(unwrapped.as_bytes(), key.as_bytes());
+        assert_eq!(
+            wrapped
+                .unwrap_with(&public, b"epoch 4", software_ecdh(secret))
+                .unwrap_err(),
+            Error::Decrypt
+        );
+
+        let x25519 = UnwrapKey::generate_x25519().wrap_key();
+        let other = x25519.wrap(b"epoch 3", &key);
+        assert_eq!(
+            other
+                .unwrap_with(&public, b"epoch 3", software_ecdh(secret))
+                .unwrap_err(),
+            Error::Decrypt
+        );
+        assert_eq!(
+            wrapped
+                .unwrap_with(&x25519, b"epoch 3", software_ecdh(secret))
+                .unwrap_err(),
+            Error::Decrypt
+        );
+    }
 
     fn both() -> [UnwrapKey; 2] {
         [UnwrapKey::generate_x25519(), UnwrapKey::generate_p256()]

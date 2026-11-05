@@ -9,7 +9,7 @@ Every format here is versioned by its labels (`openvault v1 …`). A change to a
 | Purpose | Algorithm | Crate |
 | --- | --- | --- |
 | Records | XChaCha20-Poly1305 | `chacha20poly1305` |
-| Wrapping collection keys | HPKE (RFC 9180), base mode | `hpke` |
+| Wrapping collection keys | HPKE (RFC 9180), base mode | `hpke`; `hkdf` and `sha2` for hardware keys |
 | Signatures | Ed25519 (strict verification); ECDSA P-256 with SHA-256 | `ed25519-dalek`, `p256` |
 | Hashing, key derivation | BLAKE3 (`hash`, `keyed_hash`, `derive_key`) | `blake3` |
 | Recovery phrase | BIP-39, English, 24 words | `bip39` |
@@ -70,6 +70,17 @@ Hardware signers sign exactly these bytes (`signing_input` in the crate). For EC
 
 Ed25519 verification is strict (`verify_strict`). ECDSA verification accepts both `s` and `n − s`, because the Secure Enclave doesn't normalize `s`. Signatures are therefore malleable, so no id or hash may cover signature bytes: record ids and log entry hashes are computed over the unsigned content.
 
+## Hardware keys
+
+Secure Enclave and TPM keys are P-256, and their private keys never leave the hardware. The keystore (keystore.md) uses three things from this crate:
+
+- **Public keys.** Hardware exports them as uncompressed SEC1. `WrapKey::from_p256_sec1` and `VerifyingKey::from_p256_sec1` add the `kem_id` and `alg` prefixes.
+- **Signatures.** Hardware returns DER. `Signature::from_p256_der` converts it to `r ‖ s`.
+- **Unwrapping.**
+  - The hardware computes only the ECDH x-coordinate with the sender's `enc`.
+  - `WrappedKey::unwrap_with` does the rest of RFC 9180 base mode: DHKEM `ExtractAndExpand` with `kem_context = enc ‖ pkRm`, the key schedule, and the ChaCha20-Poly1305 open.
+  - It decrypts RFC 9180's test vector A.5.1, which is our exact suite, and gives the same result as `hpke` for the same key.
+
 ## Recovery key
 
 256 random bits. Shown as the 24-word BIP-39 English phrase of those bits; parsing ignores case and extra whitespace, requires exactly 24 words and checks the BIP-39 checksum. The BIP-39 seed function (PBKDF2) is not used.
@@ -95,5 +106,4 @@ Symmetric keys, the recovery key and private keys are zeroized on drop, and thei
 
 ## Open questions
 
-1. **Unwrapping with a Secure Enclave key.** HPKE decapsulation needs the ECDH step to run inside the Secure Enclave. The `hpke` crate expects the private key in memory, so the keystore needs either CryptoKit's HPKE (if it accepts Secure Enclave keys as recipients) or a decapsulation hook that calls `SecKeyCopyKeyExchangeResult` and runs the rest of RFC 9180 in Rust. To be decided in the keystore crate; the wire format above doesn't change either way.
-2. **Post-quantum wrapping.** Wrapped collection keys pass through the coordinator and relays and live as long as the vault, so they can be recorded now and attacked later with a quantum computer. The `hpke` crate supports hybrid KEMs (X-Wing; ML-KEM-768 with P-256). The `kem_id` prefix leaves room to add one as a second wrapping per device without changing other formats. The Secure Enclave can't hold the ML-KEM half today.
+1. **Post-quantum wrapping.** Wrapped collection keys pass through the coordinator and relays and live as long as the vault, so they can be recorded now and attacked later with a quantum computer. The `hpke` crate supports hybrid KEMs (X-Wing; ML-KEM-768 with P-256). The `kem_id` prefix leaves room to add one as a second wrapping per device without changing other formats. The Secure Enclave can't hold the ML-KEM half today.

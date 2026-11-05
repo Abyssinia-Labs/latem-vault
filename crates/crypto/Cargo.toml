@@ -13,10 +13,13 @@ blake3 = "1.8"
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 ed25519-dalek = { version = "3", features = ["rand_core"] }
 getrandom = "0.4"
+hkdf = "0.13"
 hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "x25519", "nistp", "chacha"] }
 p256 = { version = "0.14", features = ["ecdsa"] }
+sha2 = "0.11"
 thiserror = "2"
 zeroize = { version = "1.9", features = ["derive"] }
 
 [dev-dependencies]
 hex = "0.4"
+p256 = { version = "0.14", features = ["ecdh"] }

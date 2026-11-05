@@ -140,6 +140,12 @@ impl VerifyingKey {
             .ok_or(Error::Encoding("verifying key"))
     }
 
+    /// A P-256 verifying key from its uncompressed SEC1 encoding, as hardware keystores
+    /// export it.
+    pub fn from_p256_sec1(public: &[u8]) -> Result<Self, Error> {
+        Self::from_bytes(&[&[ALG_P256][..], public].concat())
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -185,6 +191,13 @@ impl Signature {
             [ALG_ED25519 | ALG_P256, sig @ ..] if sig.len() == 64 => Ok(Self(bytes.to_vec())),
             _ => Err(Error::Encoding("signature")),
         }
+    }
+
+    /// An ECDSA P-256 signature from the DER encoding hardware signers return.
+    pub fn from_p256_der(der: &[u8]) -> Result<Self, Error> {
+        let sig =
+            p256::ecdsa::Signature::from_der(der).map_err(|_| Error::Encoding("signature"))?;
+        Ok(Self([&[ALG_P256][..], &sig.to_bytes()].concat()))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -305,5 +318,25 @@ mod tests {
         key.verifying_key()
             .verify(SignatureContext::Record, b"m", &flipped)
             .unwrap();
+    }
+
+    #[test]
+    fn hardware_encodings() {
+        // What a hardware signer hands back: an SEC1 public key and a DER signature over
+        // signing_input.
+        let SigningKey::P256(key) = SigningKey::generate_p256() else {
+            unreachable!()
+        };
+        let sec1 = key.verifying_key().to_sec1_point(false);
+        let der: p256::ecdsa::DerSignature =
+            key.sign(&signing_input(SignatureContext::Record, b"m"));
+
+        let verifying = VerifyingKey::from_p256_sec1(sec1.as_bytes()).unwrap();
+        let signature = Signature::from_p256_der(der.as_bytes()).unwrap();
+        verifying
+            .verify(SignatureContext::Record, b"m", &signature)
+            .unwrap();
+        assert!(Signature::from_p256_der(&der.as_bytes()[1..]).is_err());
+        assert!(VerifyingKey::from_p256_sec1(&sec1.as_bytes()[1..]).is_err());
     }
 }

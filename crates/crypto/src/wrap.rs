@@ -57,6 +57,20 @@ impl WrapKey {
         Self::from_bytes(&[&KEM_P256.to_be_bytes()[..], public].concat())
     }
 
+    /// Parses a key at the start of `bytes`, for formats that embed one without a length,
+    /// and returns it with the bytes after it.
+    pub fn split_prefix(bytes: &[u8]) -> Result<(Self, &[u8]), Error> {
+        let len = match split_kem_id(bytes) {
+            Ok((KEM_X25519, _)) => 2 + 32,
+            Ok((KEM_P256, _)) => 2 + 65,
+            _ => return Err(Error::Encoding("wrapping key")),
+        };
+        let (key, rest) = bytes
+            .split_at_checked(len)
+            .ok_or(Error::Encoding("wrapping key"))?;
+        Ok((Self::from_bytes(key)?, rest))
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -497,5 +511,20 @@ mod tests {
         let a = UnwrapKey::derive_x25519(&[1u8; 32]).wrap_key();
         assert_eq!(a, UnwrapKey::derive_x25519(&[1u8; 32]).wrap_key());
         assert_ne!(a, UnwrapKey::derive_x25519(&[2u8; 32]).wrap_key());
+    }
+
+    #[test]
+    fn split_prefix() {
+        for key in [UnwrapKey::generate_x25519(), UnwrapKey::generate_p256()] {
+            let key = key.wrap_key();
+            let bytes = [key.as_bytes(), b"rest"].concat();
+            assert_eq!(
+                WrapKey::split_prefix(&bytes).unwrap(),
+                (key.clone(), &b"rest"[..])
+            );
+            assert!(WrapKey::split_prefix(&key.as_bytes()[..key.as_bytes().len() - 1]).is_err());
+        }
+        assert!(WrapKey::split_prefix(&[0x00, 0x21, 1, 2, 3]).is_err());
+        assert!(WrapKey::split_prefix(&[0x00]).is_err());
     }
 }

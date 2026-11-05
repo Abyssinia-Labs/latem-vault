@@ -146,8 +146,26 @@ impl VerifyingKey {
         Self::from_bytes(&[&[ALG_P256][..], public].concat())
     }
 
+    /// Parses a key at the start of `bytes`, for formats that embed one without a length,
+    /// and returns it with the bytes after it.
+    pub fn split_prefix(bytes: &[u8]) -> Result<(Self, &[u8]), Error> {
+        let len = match bytes.first() {
+            Some(&ALG_ED25519) => 1 + 32,
+            Some(&ALG_P256) => 1 + 65,
+            _ => return Err(Error::Encoding("verifying key")),
+        };
+        let (key, rest) = bytes
+            .split_at_checked(len)
+            .ok_or(Error::Encoding("verifying key"))?;
+        Ok((Self::from_bytes(key)?, rest))
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    pub fn is_ed25519(&self) -> bool {
+        self.0[0] == ALG_ED25519
     }
 
     /// Checks `signature` over `message` in `context`.
@@ -338,5 +356,22 @@ mod tests {
             .unwrap();
         assert!(Signature::from_p256_der(&der.as_bytes()[1..]).is_err());
         assert!(VerifyingKey::from_p256_sec1(&sec1.as_bytes()[1..]).is_err());
+    }
+
+    #[test]
+    fn split_prefix() {
+        for key in [SigningKey::generate_ed25519(), SigningKey::generate_p256()] {
+            let key = key.verifying_key();
+            let bytes = [key.as_bytes(), b"rest"].concat();
+            assert_eq!(
+                VerifyingKey::split_prefix(&bytes).unwrap(),
+                (key.clone(), &b"rest"[..])
+            );
+            assert!(
+                VerifyingKey::split_prefix(&key.as_bytes()[..key.as_bytes().len() - 1]).is_err()
+            );
+        }
+        assert!(VerifyingKey::split_prefix(&[0x03; 40]).is_err());
+        assert!(VerifyingKey::split_prefix(&[]).is_err());
     }
 }

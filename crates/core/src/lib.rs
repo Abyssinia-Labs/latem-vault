@@ -1,10 +1,11 @@
-//! OpenVault's collections, records and local store.
+//! OpenVault's collections, records, membership log and local store.
 //!
-//! Formats are specified in `docs/spec/records.md`. Cryptography comes from
+//! Formats are specified in `docs/spec/records.md` and `docs/spec/membership.md`. Cryptography comes from
 //! `openvault-crypto`; device keys come from whatever implements [`DeviceKeys`].
 
 mod ids;
 mod keys;
+pub mod membership;
 pub mod names;
 pub mod record;
 mod store;
@@ -50,6 +51,8 @@ pub enum Error {
     NoKey(CollectionId),
     #[error("invalid record: {0}")]
     InvalidRecord(&'static str),
+    #[error("invalid log entry: {0}")]
+    InvalidLogEntry(&'static str),
     #[error("store is corrupt: {0}")]
     Corrupt(&'static str),
 }

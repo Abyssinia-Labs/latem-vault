@@ -26,6 +26,7 @@ pub mod contexts {
     pub const RECOVERY_ADMIN_SIGNING: &str = "openvault v1 recovery admin signing key";
     pub const RECOVERY_WRAPPING: &str = "openvault v1 recovery wrapping key";
     pub const RECORD_ID: &str = "openvault v1 record id";
+    pub const LOG_ENTRY_HASH: &str = "openvault v1 log entry hash";
     pub const LOCAL_INDEX: &str = "openvault v1 local index key";
     pub const LOCAL_CACHE: &str = "openvault v1 local cache key";
 }

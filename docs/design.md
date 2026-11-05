@@ -240,8 +240,11 @@ openvault join                                  on a new device: create keys, sh
 openvault approve                               on an admin: enter the code, review, Touch ID
 openvault devices [revoke <device>]
 openvault scope <device> <collection> none|hold|read|write
+openvault collections [create <name>]
 openvault set <collection>/<name> --secret|--var    value read from stdin
 openvault get <collection>/<name>
+openvault list <collection>[/<folder>]          names and kinds, never values
+openvault delete <collection>/<name>
 openvault run --collection <c> --env <e> -- <command>   variables and secrets as env; files as temporary paths
 openvault import <folder> --collection <c>
 openvault open <collection>/<path>

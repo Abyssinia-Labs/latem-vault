@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::time::Duration;
 
 use openvault_crypto::hash::{Hash, contexts, derive_key, keyed_hash};
 use openvault_crypto::{SymmetricKey, VerifyingKey, WrapKey, WrappedKey};
@@ -607,6 +608,8 @@ fn connect(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "foreign_keys", true)?;
     // Overwrite deleted content instead of leaving it in free pages.
     conn.pragma_update(None, "secure_delete", true)?;
+    // Several `openvault run` processes may read while another writes.
+    conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
 }
 

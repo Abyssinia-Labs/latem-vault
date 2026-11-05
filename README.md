@@ -22,7 +22,19 @@ openvault get latem/prod/SENTRY_DSN
 openvault run --collection latem --env prod -- ./deploy.sh
 ```
 
-`openvault run` passes every entry under `prod/` to the command as an environment variable, so `prod/SENTRY_DSN` becomes `SENTRY_DSN`.
+`openvault run` passes every entry under `prod/` to the command as an environment variable, so `prod/SENTRY_DSN` becomes `SENTRY_DSN`. `--prefix` puts a prefix in front of every name. latem reads its secrets from `LATEM_SECRET_<NAME>`, so it runs like this:
+
+```sh
+openvault run --collection latem --env prod --prefix LATEM_SECRET_ -- latem …
+```
+
+To bring in a whole `NAME=value` file, such as latem's `secrets.env`:
+
+```sh
+openvault import-env ~/.latem/secrets.env --collection latem --env prod --var REGION
+```
+
+Every name becomes a secret unless it is given with `--var`. The file is read as latem reads it: no `export`, no `$` expansion, and in double quotes only `\n`, `\r`, `\t`, `\\` and `\"`. Nothing is written if any line fails to parse, or if a name already exists (unless you pass `--overwrite`).
 
 The vault and this device's key file are kept in `~/.openvault`; set `OPENVAULT_HOME` to use another directory. On a Mac with a Secure Enclave, the device keys stay in it. Elsewhere they are kept in the key file, which only you can read.
 

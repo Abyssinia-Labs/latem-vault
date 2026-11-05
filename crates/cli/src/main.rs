@@ -3,6 +3,9 @@
 //! Everything for this device lives in one directory, `~/.openvault` unless `OPENVAULT_HOME`
 //! names another: the key file (`keys`) and the vault database (`vault.db`).
 
+mod env_file;
+
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -70,9 +73,30 @@ enum Command {
         /// The folder to load, such as `prod`: `prod/SENTRY_DSN` becomes `SENTRY_DSN`
         #[arg(long)]
         env: String,
+        /// Put this before every variable name, such as `LATEM_SECRET_` for latem:
+        /// `prod/SENTRY_DSN` becomes `LATEM_SECRET_SENTRY_DSN`
+        #[arg(long, default_value = "", hide_default_value = true)]
+        prefix: String,
         /// The command to run, after `--`
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<OsString>,
+    },
+    /// Import a NAME=value file, such as latem's secrets.env, into a folder. Every name is
+    /// imported as a secret unless given with --var.
+    ImportEnv {
+        /// The file to read, or `-` for stdin
+        file: PathBuf,
+        #[arg(long)]
+        collection: String,
+        /// The folder to import into, such as `prod`: `SENTRY_DSN` becomes `prod/SENTRY_DSN`
+        #[arg(long)]
+        env: String,
+        /// Import NAME as a variable instead of a secret; repeat for each one
+        #[arg(long = "var", value_name = "NAME")]
+        vars: Vec<String>,
+        /// Replace entries that already exist, instead of stopping
+        #[arg(long)]
+        overwrite: bool,
     },
 }
 
@@ -144,8 +168,16 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         Command::Run {
             collection,
             env,
+            prefix,
             command,
-        } => return run(&home, &collection, &env, &command),
+        } => return run(&home, &collection, &env, &prefix, &command),
+        Command::ImportEnv {
+            file,
+            collection,
+            env,
+            vars,
+            overwrite,
+        } => import_env(&home, &file, &collection, &env, &vars, overwrite)?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -268,12 +300,7 @@ fn list(home: &Home, path: &str) -> Result<()> {
             .as_ref()
             .is_none_or(|prefix| info.name.starts_with(prefix))
         {
-            let kind = if info.kind == Kind::Secret {
-                "secret"
-            } else {
-                "var"
-            };
-            println!("{kind:<6}  {}", info.name);
+            println!("{:<6}  {}", kind_label(info.kind), info.name);
         }
     }
     Ok(())
@@ -289,10 +316,19 @@ fn delete(home: &Home, entry: &str) -> Result<()> {
     Ok(())
 }
 
-fn run(home: &Home, collection: &str, folder: &str, command: &[OsString]) -> Result<ExitCode> {
+fn run(
+    home: &Home,
+    collection: &str,
+    folder: &str,
+    prefix: &str,
+    command: &[OsString],
+) -> Result<ExitCode> {
     let folder = folder.trim_end_matches('/');
     names::check_collection(collection)?;
     names::check_entry(folder)?;
+    if !prefix.is_empty() && !is_env_name(prefix) {
+        bail!("--prefix must be letters, digits and '_', not starting with a digit");
+    }
     let entries = {
         let mut vault = home.open()?;
         let id = vault.collection(collection)?;
@@ -306,6 +342,7 @@ fn run(home: &Home, collection: &str, folder: &str, command: &[OsString]) -> Res
     let mut child = process::Command::new(program);
     child.args(args);
     for entry in &entries {
+        // Checked without the prefix, so a name is usable the same way with or without one.
         let var = &entry.name[folder.len() + 1..];
         if !is_env_name(var) {
             bail!(
@@ -315,11 +352,141 @@ fn run(home: &Home, collection: &str, folder: &str, command: &[OsString]) -> Res
             );
         }
         child.env(
-            var,
+            format!("{prefix}{var}"),
             env_value(&entry.value).with_context(|| format!("{collection}/{}", entry.name))?,
         );
     }
     exec(child, program)
+}
+
+fn import_env(
+    home: &Home,
+    file: &Path,
+    collection: &str,
+    folder: &str,
+    vars: &[String],
+    overwrite: bool,
+) -> Result<()> {
+    let folder = folder.trim_end_matches('/');
+    names::check_collection(collection)?;
+    names::check_entry(folder)?;
+    let source = if file == Path::new("-") {
+        "stdin".to_owned()
+    } else {
+        file.display().to_string()
+    };
+    let contents = read_env_file(file).with_context(|| format!("can't read {source}"))?;
+    let lines = env_file::parse(&contents).with_context(|| source.clone())?;
+    drop(contents);
+    if lines.is_empty() {
+        bail!("{source} has no NAME=value lines");
+    }
+    for var in vars {
+        if !lines.iter().any(|line| line.name == *var) {
+            bail!("--var {var}: {source} doesn't set {var}");
+        }
+    }
+    let mut entries = Vec::with_capacity(lines.len());
+    for line in &lines {
+        // `run` couldn't pass it on, so refuse it now rather than then.
+        if line.value.contains(&0) {
+            bail!(
+                "{source}: line {}: the value has a NUL byte, which an environment variable \
+                 can't hold",
+                line.number
+            );
+        }
+        let name = format!("{folder}/{}", line.name);
+        names::check_entry(&name)?;
+        let kind = if vars.contains(&line.name) {
+            Kind::Var
+        } else {
+            Kind::Secret
+        };
+        entries.push((name, kind, line.value.as_slice()));
+    }
+
+    let mut vault = home.open()?;
+    let id = vault.collection(collection)?;
+    let existing: HashMap<String, Kind> = vault
+        .list(id)?
+        .into_iter()
+        .map(|info| (info.name, info.kind))
+        .collect();
+    let taken: Vec<&str> = entries
+        .iter()
+        .filter(|(name, ..)| existing.contains_key(name))
+        .map(|(name, ..)| name.as_str())
+        .collect();
+    if !overwrite && !taken.is_empty() {
+        bail!(
+            "{collection} already has {}; pass --overwrite to replace {}",
+            taken.join(", "),
+            if taken.len() == 1 { "it" } else { "them" }
+        );
+    }
+    // Rewriting a value that hasn't changed would only add a version for no reason.
+    let mut unchanged = 0;
+    let mut writes = Vec::with_capacity(entries.len());
+    for (name, kind, value) in &entries {
+        if existing.get(name) == Some(kind)
+            && vault
+                .get(id, name)?
+                .is_some_and(|entry| entry.value.as_slice() == *value)
+        {
+            unchanged += 1;
+        } else {
+            writes.push((name.as_str(), *kind, *value));
+        }
+    }
+    vault.set_all(id, writes.iter().copied())?;
+
+    for (name, kind, _) in &writes {
+        println!("{:<6}  {name}", kind_label(*kind));
+    }
+    let count = |n: usize| {
+        if n == 1 {
+            "1 entry".to_owned()
+        } else {
+            format!("{n} entries")
+        }
+    };
+    print!(
+        "Imported {} into {collection}/{folder}/",
+        count(writes.len())
+    );
+    match unchanged {
+        0 => println!("."),
+        1 => println!("; 1 entry already had the same value."),
+        n => println!("; {n} entries already had the same value."),
+    }
+    Ok(())
+}
+
+/// Reads the whole file, or stdin for `-`, up to latem's limit for `secrets.env`.
+fn read_env_file(file: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    let reader: Box<dyn Read> = if file == Path::new("-") {
+        Box::new(io::stdin().lock())
+    } else {
+        Box::new(fs::File::open(file)?)
+    };
+    // Sized up front so reading never reallocates and leaves copies behind.
+    let mut contents = Zeroizing::new(Vec::with_capacity(env_file::MAX_LEN + 1));
+    reader
+        .take(env_file::MAX_LEN as u64 + 1)
+        .read_to_end(&mut contents)?;
+    if contents.len() > env_file::MAX_LEN {
+        bail!("it is larger than {} bytes", env_file::MAX_LEN);
+    }
+    Ok(contents)
+}
+
+fn kind_label(kind: Kind) -> &'static str {
+    if kind == Kind::Secret {
+        "secret"
+    } else {
+        "var"
+    }
 }
 
 /// Replaces this process with the command, so it keeps the terminal, signals and exit status,

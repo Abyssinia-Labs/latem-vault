@@ -317,11 +317,30 @@ impl<K: DeviceKeys> Vault<K> {
         kind: Kind,
         value: &[u8],
     ) -> Result<()> {
-        if kind == Kind::Collection {
-            return Err(Error::NotSettable);
+        self.set_all(collection, [(name, kind, value)])
+    }
+
+    /// Sets several secrets and variables in one transaction, so either all of them are
+    /// written or none are.
+    pub fn set_all<'a>(
+        &mut self,
+        collection: CollectionId,
+        entries: impl IntoIterator<Item = (&'a str, Kind, &'a [u8])>,
+    ) -> Result<()> {
+        let bodies = entries
+            .into_iter()
+            .map(|(name, kind, value)| {
+                if kind == Kind::Collection {
+                    return Err(Error::NotSettable);
+                }
+                names::check_entry(name)?;
+                Ok(Body::new(kind, name, value))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if bodies.is_empty() {
+            return Ok(());
         }
-        names::check_entry(name)?;
-        self.write(collection, &Body::new(kind, name, value), false)
+        self.write(collection, &bodies, false)
     }
 
     /// The current value of a secret or variable, or `None` if it doesn't exist or was deleted.
@@ -370,7 +389,7 @@ impl<K: DeviceKeys> Vault<K> {
             return Ok(false);
         };
         let (kind, _) = self.open_entry_label(collection, &tag, &label)?;
-        self.write(collection, &Body::new(kind, name, b""), true)?;
+        self.write(collection, &[Body::new(kind, name, b"")], true)?;
         Ok(true)
     }
 
@@ -413,24 +432,26 @@ impl<K: DeviceKeys> Vault<K> {
         Ok(entries)
     }
 
-    fn write(&mut self, collection: CollectionId, body: &Body, deleted: bool) -> Result<()> {
+    fn write(&mut self, collection: CollectionId, bodies: &[Body], deleted: bool) -> Result<()> {
         let epoch = self.epoch(collection)?;
         let key = self.take_key(collection, epoch)?;
-        let result = self.commit_record(collection, epoch, &key, body, deleted);
+        let result = self.commit_records(collection, epoch, &key, bodies, deleted);
         self.collection_keys.insert((collection, epoch), key);
         result
     }
 
-    fn commit_record(
+    fn commit_records(
         &self,
         collection: CollectionId,
         epoch: u32,
         key: &SymmetricKey,
-        body: &Body,
+        bodies: &[Body],
         deleted: bool,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        self.write_record(&tx, collection, epoch, key, body, deleted)?;
+        for body in bodies {
+            self.write_record(&tx, collection, epoch, key, body, deleted)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -783,6 +804,33 @@ mod tests {
         vault.set(id, "A", Kind::Secret, b"3").unwrap();
         assert_eq!(value(vault.get(id, "A").unwrap()), Some(b"3".to_vec()));
         assert_eq!(vault.list(id).unwrap()[0].kind, Kind::Secret);
+    }
+
+    #[test]
+    fn set_all_writes_everything_or_nothing() {
+        let s = setup();
+        let mut vault = s.create();
+        let id = vault.create_collection("c").unwrap();
+
+        let big = vec![0; crate::record::MAX_VALUE_LEN + 1];
+        assert!(matches!(
+            vault.set_all(
+                id,
+                [("A", Kind::Var, &b"1"[..]), ("B", Kind::Secret, &big[..])]
+            ),
+            Err(Error::ValueTooLarge)
+        ));
+        assert!(vault.list(id).unwrap().is_empty());
+
+        vault
+            .set_all(
+                id,
+                [("A", Kind::Var, &b"1"[..]), ("B", Kind::Secret, &b"2"[..])],
+            )
+            .unwrap();
+        assert_eq!(value(vault.get(id, "A").unwrap()), Some(b"1".to_vec()));
+        assert_eq!(value(vault.get(id, "B").unwrap()), Some(b"2".to_vec()));
+        vault.set_all(id, []).unwrap();
     }
 
     #[test]

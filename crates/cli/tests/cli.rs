@@ -52,20 +52,32 @@ impl Device {
         String::from_utf8(output.stderr).unwrap()
     }
 
-    fn set(&self, entry: &str, kind: &str, value: &[u8]) {
+    fn run_with_stdin(&self, args: &[&str], stdin: &[u8]) -> Output {
         let mut child = self
-            .command(&["set", entry, kind])
+            .command(args)
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(value).unwrap();
-        let output = child.wait_with_output().unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn set(&self, entry: &str, kind: &str, value: &[u8]) {
+        let output = self.run_with_stdin(&["set", entry, kind], value);
         assert!(
             output.status.success(),
             "set {entry} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Writes a file next to the vault and returns its path.
+    fn file(&self, name: &str, contents: &[u8]) -> String {
+        let path = self.home.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        path.to_str().unwrap().to_owned()
     }
 }
 
@@ -237,6 +249,61 @@ fn run_puts_a_folder_in_the_environment() {
 }
 
 #[test]
+fn run_can_prefix_names() {
+    let device = Device::new();
+    device.set("latem/prod/MATCH_PASSWORD", "--secret", b"pw");
+    device.set("latem/prod/REGION", "--var", b"eu");
+
+    let output = device.run(&[
+        "run",
+        "--collection",
+        "latem",
+        "--env",
+        "prod",
+        "--prefix",
+        "LATEM_SECRET_",
+        "--",
+        "sh",
+        "-c",
+        r#"printf '%s|%s|%s' "$LATEM_SECRET_MATCH_PASSWORD" "$LATEM_SECRET_REGION" "${MATCH_PASSWORD-unset}""#,
+    ]);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"pw|eu|unset");
+
+    let prefix = |prefix: &str| {
+        device.fails(&[
+            "run",
+            "--collection",
+            "latem",
+            "--env",
+            "prod",
+            "--prefix",
+            prefix,
+            "--",
+            "true",
+        ])
+    };
+    for bad in ["1X_", "LATEM-SECRET_", "LATEM SECRET_"] {
+        assert!(prefix(bad).contains("--prefix must be"), "{bad}");
+    }
+
+    // The part after the folder is checked by itself, so a prefix doesn't make it usable.
+    device.set("latem/staging/1KEY", "--secret", b"x");
+    let output = device.fails(&[
+        "run",
+        "--collection",
+        "latem",
+        "--env",
+        "staging",
+        "--prefix",
+        "LATEM_SECRET_",
+        "--",
+        "true",
+    ]);
+    assert!(output.contains("can't be an environment variable"));
+}
+
+#[test]
 fn run_rejects_unusable_folders() {
     let device = Device::new();
     let run =
@@ -251,4 +318,142 @@ fn run_rejects_unusable_folders() {
 
     device.set("latem/qa/KEY", "--secret", b"a\0b");
     assert!(run("qa").contains("NUL"));
+}
+
+#[test]
+fn import_env_reads_latem_secrets_files() {
+    let device = Device::new();
+    let file = device.file(
+        "secrets.env",
+        b"# latem\n\
+          SENTRY_DSN=https://sentry # kept\n\
+          \n\
+          REGION = eu-west-1\n\
+          KEY_P8=\"-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----\"\n\
+          LITERAL='$HOME \\n'\n",
+    );
+    let import = [
+        "import-env",
+        &file,
+        "--collection",
+        "latem",
+        "--env",
+        "prod",
+        "--var",
+        "REGION",
+    ];
+    assert_eq!(
+        device.ok(&import),
+        "secret  prod/SENTRY_DSN\nvar     prod/REGION\nsecret  prod/KEY_P8\nsecret  prod/LITERAL\n\
+         Imported 4 entries into latem/prod/.\n"
+    );
+    assert_eq!(
+        device.ok(&["get", "latem/prod/SENTRY_DSN"]),
+        "https://sentry # kept"
+    );
+    assert_eq!(device.ok(&["get", "latem/prod/LITERAL"]), "$HOME \\n");
+    let output = device.run(&[
+        "run",
+        "--collection",
+        "latem",
+        "--env",
+        "prod",
+        "--",
+        "sh",
+        "-c",
+        r#"printf '%s|%s' "$REGION" "$KEY_P8""#,
+    ]);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "eu-west-1|-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
+    );
+
+    let output = device.run_with_stdin(
+        &["import-env", "-", "--collection", "latem", "--env", "dev/"],
+        b"REGION=local\n",
+    );
+    assert!(output.status.success());
+    assert_eq!(device.ok(&["get", "latem/dev/REGION"]), "local");
+}
+
+#[test]
+fn import_env_writes_everything_or_nothing() {
+    let device = Device::new();
+    let import = |contents: &[u8], extra: &[&str]| {
+        let file = device.file("secrets.env", contents);
+        let mut args = vec![
+            "import-env",
+            &file,
+            "--collection",
+            "latem",
+            "--env",
+            "prod",
+        ];
+        args.extend(extra);
+        device.run(&args)
+    };
+    let fails = |contents: &[u8], extra: &[&str], expected: &str| {
+        let output = import(contents, extra);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!output.status.success());
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!stderr.contains("hunter"), "{stderr}");
+        assert_eq!(device.ok(&["list", "latem"]), "");
+    };
+
+    fails(b"A=1\nhunter2\n", &[], "line 2: expected NAME=value");
+    fails(b"A=1\nA=hunter2\n", &[], "A is set on lines 1 and 2");
+    fails(
+        b"A=1\nB=hunter\0\n",
+        &[],
+        "line 2: the value has a NUL byte",
+    );
+    fails(b"A=1\n", &["--var", "B"], "--var B");
+    fails(b"# nothing\n", &[], "has no NAME=value lines");
+    fails(
+        &[b"A=1\nB=".as_slice(), &[b'x'; 1 << 20]].concat(),
+        &[],
+        "larger than",
+    );
+    assert!(
+        device
+            .fails(&[
+                "import-env",
+                "/no/such/file",
+                "--collection",
+                "latem",
+                "--env",
+                "prod"
+            ])
+            .contains("can't read /no/such/file")
+    );
+
+    assert!(import(b"A=1\nB=2\n", &[]).status.success());
+    let output = import(b"A=1\nB=3\nC=4\n", &[]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("latem already has prod/A, prod/B; pass --overwrite")
+    );
+    assert!(
+        device
+            .fails(&["get", "latem/prod/C"])
+            .contains("doesn't exist")
+    );
+
+    let output = import(b"A=1\nB=3\nC=4\n", &["--overwrite", "--var", "C"]);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "secret  prod/B\nvar     prod/C\n\
+         Imported 2 entries into latem/prod/; 1 entry already had the same value.\n"
+    );
+    assert_eq!(device.ok(&["get", "latem/prod/B"]), "3");
+
+    // The same value as a different kind is a change.
+    let output = import(b"A=1\n", &["--overwrite", "--var", "A"]);
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .starts_with("var     prod/A\n")
+    );
 }

@@ -245,7 +245,8 @@ openvault set <collection>/<name> --secret|--var    value read from stdin
 openvault get <collection>/<name>
 openvault list <collection>[/<folder>]          names and kinds, never values
 openvault delete <collection>/<name>
-openvault run --collection <c> --env <e> -- <command>   variables and secrets as env; files as temporary paths
+openvault run --collection <c> --env <e> [--prefix <p>] -- <command>   variables and secrets as env; files as temporary paths
+openvault import-env <file> --collection <c> --env <e> [--var <name>]...   a NAME=value file, such as latem's secrets.env
 openvault import <folder> --collection <c>
 openvault open <collection>/<path>
 openvault service
@@ -267,6 +268,7 @@ To confirm with the latem session.
 - **latem-cloud keeps INV-2.** It still sees only names, and can show "machine X lacks collection Y" by name.
 - **Onboarding.** latem's first-run "copy from which machine?" becomes `openvault join` plus scope approval.
 - **Until then:** `latem secrets copy --to HOST` remains the stopgap until milestone M2 ships.
+- **From M1,** latem can take its secrets from OpenVault without a new store. Bring them in with `openvault import-env ~/.latem/secrets.env --collection latem --env <e>`, then start latem with `openvault run --collection latem --env <e> --prefix LATEM_SECRET_ -- latem …`. latem's environment provider reads `LATEM_SECRET_<NAME>` before its other stores.
 
 ## 16. Repositories and stack
 

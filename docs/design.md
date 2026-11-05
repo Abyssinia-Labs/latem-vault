@@ -365,7 +365,7 @@ The hosted product's plans and running costs are documented in `openvault-cloud`
 | Milestone | Delivers | Done when |
 | --- | --- | --- |
 | M0 Spec | Threat model, protocol spec, ADRs for §19 | Crypto and wire formats are written down |
-| M1 One device | Store, collections, secrets and variables, CLI, `openvault run`, Keychain / Secure Enclave and file keystores | `~/.latem/secrets.env` can be replaced on the MacBook |
+| M1 One device | Store, collections, secrets and variables, CLI, `openvault run`, Secure Enclave and file keystores | `~/.latem/secrets.env` can be replaced on the MacBook |
 | M2 LAN | PAKE join without a coordinator, membership log, admin Touch ID, recovery key, peer sync over iroh, latem store | The Android build runs on the desktop with secrets from the MacBook |
 | M3 Grandfather | Coordinator, relay, `hold` storage, Docker image | The MacBook reaches the mini from outside the house |
 | M4 Files | Chunked encrypted files, import, `open` and `get`, on-demand fetch, local web UI | A signing keystore and a documents folder sync and open on every device |
@@ -376,7 +376,7 @@ Later: native Windows, Android, a Linux FUSE mount, a hardware security key for 
 
 ## 19. Open decisions
 
-1. **Key wrapping: HPKE or age.** I recommend HPKE: one standard that covers P-256 (Secure Enclave, TPM) and X25519. age would need `age-plugin-se` for the Secure Enclave.
+1. **Key wrapping: HPKE or age.** Decided: HPKE, one standard that covers P-256 (Secure Enclave, TPM) and X25519. age would need `age-plugin-se` for the Secure Enclave. See [ADR 0001](adr/0001-hpke-key-wrapping.md).
 2. **Re-encryption on revoke.** I recommend re-encrypting secrets and variables immediately, and files only on request.
 3. **Chunking: fixed size or content-defined.** Content-defined chunking deduplicates better but reveals more about file contents. I recommend fixed 1 MiB chunks.
 4. **Name.** `openvault` and the `openvault-*` names are free on GitHub (Abyssinia-Labs) and crates.io. Small GitHub projects already use "OpenVault" (one is a password manager and file locker), and it is also the name of a broadband data company. Check the trademark before the hosted launch.

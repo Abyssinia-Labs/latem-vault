@@ -9,7 +9,8 @@ set -eu
 cd "$(dirname "$0")/.."
 
 # The Linux image runs the same Rust as this Mac, so both see the same lints.
-rust_version=$(rustc --version | cut -d' ' -f2)
+rust_version=$(rustc --version)
+rust_version=$(echo "$rust_version" | cut -d' ' -f2)
 
 macos() {
     echo "== macOS: rustfmt, clippy, tests"
@@ -39,7 +40,12 @@ linux() {
 case "${1:-all}" in
     macos) macos ;;
     linux) linux ;;
-    all) macos && linux ;;
+    # Not `macos && linux`: set -e is ignored inside a function called before &&, so a failed
+    # check would still end in "All checks passed".
+    all)
+        macos
+        linux
+        ;;
     *)
         echo "usage: $0 [macos|linux]" >&2
         exit 2

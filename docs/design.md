@@ -115,13 +115,13 @@ Entry names are paths within the collection, for example `prod/SENTRY_DSN` or `r
 
 **File manifest.** Size, modification time, the list of chunk hashes, and a per-file key wrapped by the collection key. Files are split into fixed 1 MiB chunks. Each chunk is encrypted with the file key using a nonce derived from the chunk index and file version, and is addressed by the BLAKE3 hash of its ciphertext.
 
-**Device record** (in the membership log). Device id, display name, platform, public keys (see §7), scopes, who enrolled it, and its status.
+**Device record** (in the membership log). Device id, display name, platform, public keys (see §7), scopes, who enrolled it, and its status. The name and platform are sealed with the vault's names key, so the coordinator's copy of the log doesn't show them ([membership.md](spec/membership.md#names-key)).
 
 **Scope** is set per device and collection by an admin and recorded in the log. **Placement** is a local preference that each device advertises so others know where to fetch from.
 
 ## 7. Cryptography
 
-Only audited libraries; no custom primitives.
+Only audited libraries; no custom primitives. The one exception is the PAKE: no Rust PAKE crate has been audited, so OpenVault uses RustCrypto's `spake2`, and the external audit covers it ([join.md](spec/join.md#pake)).
 
 | Purpose | Primitive |
 | --- | --- |
@@ -129,7 +129,7 @@ Only audited libraries; no custom primitives.
 | Wrapping collection keys | HPKE (RFC 9180): DHKEM(P-256) for Secure Enclave and TPM keys, DHKEM(X25519) for file keys |
 | Records and chunks | XChaCha20-Poly1305 |
 | Hashing and content addressing | BLAKE3 |
-| Pairing | A PAKE (CPace or SPAKE2) keyed by a 6-digit code |
+| Pairing | SPAKE2 keyed by a 6-digit code |
 | Secrets in memory | `zeroize` and `secrecy` types |
 
 ### Device keys
@@ -157,7 +157,7 @@ The coordinator distributes the log, and devices also exchange it directly, so a
 
 1. An admin signs `revoke_device`. Every device that sees it stops serving and accepting connections from the revoked device.
 2. Each collection the device could read moves to a new key epoch, and new writes use the new key.
-3. Secrets and variables are re-encrypted under the new epoch right away, since they are small. Files are re-encrypted only on request (see §19).
+3. Versions the revoked device signed under old epochs stop counting, so nothing it signs with its old keys can become current. The remaining writers rewrite the entries it had last written, so its real changes are kept ([sync.md](spec/sync.md#revoking-and-reducing-scopes)). Nothing else is re-encrypted, since the device has already read it; file chunks are re-encrypted only on request (see §19).
 4. OpenVault lists every secret the revoked device could read, so you can rotate them at their providers.
 
 ## 8. Joining
@@ -379,6 +379,10 @@ Later: native Windows, Android, a Linux FUSE mount, a hardware security key for 
 ## 19. Open decisions
 
 1. **Key wrapping: HPKE or age.** Decided: HPKE, one standard that covers P-256 (Secure Enclave, TPM) and X25519. age would need `age-plugin-se` for the Secure Enclave. See [ADR 0001](adr/0001-hpke-key-wrapping.md).
-2. **Re-encryption on revoke.** I recommend re-encrypting secrets and variables immediately, and files only on request.
+2. **Re-encryption on revoke.** Proposed in [sync.md](spec/sync.md#revoking-and-reducing-scopes): no blanket re-encryption, since it wouldn't hide anything the revoked device has already read.
+   - The new epoch protects what is written from then on.
+   - Old-epoch versions by a device that has lost `write` stop counting.
+   - The remaining writers rewrite only the entries that device wrote last, so its real changes are kept.
+   - File chunks are re-encrypted only on request.
 3. **Chunking: fixed size or content-defined.** Content-defined chunking deduplicates better but reveals more about file contents. I recommend fixed 1 MiB chunks.
 4. **Name.** `openvault` and the `openvault-*` names are free on GitHub (Abyssinia-Labs) and crates.io. Small GitHub projects already use "OpenVault" (one is a password manager and file locker), and it is also the name of a broadband data company. Check the trademark before the hosted launch.

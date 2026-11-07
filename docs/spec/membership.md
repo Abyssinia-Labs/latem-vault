@@ -1,6 +1,8 @@
 # Membership log spec, v1
 
-Status: draft, 2026-11-05. Implemented by `crates/core`: the format and rules in `membership`, and keeping the log in the local store in `store`. Receiving entries from other devices comes with sync. Builds on [crypto.md](crypto.md) and [records.md](records.md); the design is in [design §7](../design.md#membership-log) and [§8](../design.md#8-joining).
+Status: draft, 2026-11-05. Implemented by `crates/core`: the format and rules in `membership`, and keeping the log in the local store in `store`. Exchanging entries between devices is in [sync.md](sync.md#log-exchange), and adding a device in [join.md](join.md). Builds on [crypto.md](crypto.md) and [records.md](records.md); the design is in [design §7](../design.md#membership-log) and [§8](../design.md#8-joining).
+
+Changed 2026-11-07: device names and platforms are sealed with the vault's names key (below). The code still writes them in the clear. Vaults created before the change are created again once it is implemented.
 
 The membership log decides who is in a vault:
 
@@ -32,14 +34,16 @@ signature   65          the signer's signature over the unsigned part, context "
 
 Keys inside payloads use the crypto.md encodings, whose first bytes give their length: verifying keys are 33 bytes (Ed25519) or 66 (P-256), wrapping keys 34 (X25519) or 67 (P-256).
 
-Test vector: the genesis entry of vault `01` × 16, made with the crypto.md recovery key test vector (secret = 32 zero bytes), which lists only the recovery admin key and is signed by it, is 228 bytes long and has hash `77b53378f73774df461b6e6444fdaf4a3f796dce377bb13372aeaee33d1d3cc5`. Like the crypto.md vectors, it comes from this implementation and is pinned in its tests.
+**Test vector.** The genesis entry of vault `01` × 16 is made with the crypto.md recovery key test vector (secret = 32 zero bytes). It lists only the recovery admin key and is signed by it.
+- In the format without a names key it is 228 bytes long, with hash `77b53378f73774df461b6e6444fdaf4a3f796dce377bb13372aeaee33d1d3cc5`. Like the crypto.md vectors, it comes from this implementation and is pinned in its tests.
+- Genesis now also carries the wrapped names key, and HPKE wrapping is randomized. The vector will therefore be pinned again with a fixed names key and a fixed HPKE ephemeral key.
 
 ## Types
 
 | Code | Type | Payload |
 | --- | --- | --- |
-| `0x01` | genesis | recovery wrapping key ‖ admin count (u8) ‖ admin verifying keys |
-| `0x02` | add_device | device id (16) ‖ verifying key ‖ wrapping key ‖ transport key ‖ platform (u8 length ‖ ASCII) ‖ name (u8 length ‖ UTF-8) |
+| `0x01` | genesis | recovery wrapping key ‖ admin count (u8) ‖ admin verifying keys ‖ names key wrapped to the recovery key |
+| `0x02` | add_device | device id (16) ‖ verifying key ‖ wrapping key ‖ transport key ‖ sealed name (122) ‖ names key wrapped to this device |
 | `0x03` | set_scope | device id (16) ‖ collection id (16) ‖ scope (u8) |
 | `0x04` | revoke_device | device id (16) |
 | `0x05` | rotate_epoch | collection id (16) ‖ epoch (u32) |
@@ -48,8 +52,37 @@ Test vector: the genesis entry of vault `01` × 16, made with the crypto.md reco
 
 - **Scopes:** `0x00` none, `0x01` hold, `0x02` read, `0x03` write (design §3).
 - **Transport key:** the device's Ed25519 iroh identity (design §7), as a verifying key; it must be Ed25519.
-- **Platform:** 1–16 bytes of `a–z 0–9`, such as `macos`, `ios`, `linux`, `windows`, `wsl` or `docker`. It is shown to people and means nothing to the protocol.
-- **Name:** 1–64 bytes of UTF-8 with no control characters, such as `MacBook`.
+- **Platform**, inside the sealed name: 1–16 bytes of `a–z 0–9`, such as `macos`, `ios`, `linux`, `windows`, `wsl` or `docker`. It is shown to people and means nothing to the protocol.
+- **Name**, inside the sealed name: 1–64 bytes of UTF-8 with no control characters, such as `MacBook`.
+- **Wrapped names key:** 82 bytes (X25519) or 115 (P-256), matching the wrapping key it is wrapped to (names key, below).
+
+## Names key
+
+Device names and platforms are sealed, so that the coordinator's copy of the log (from M3) doesn't show them. Default names are host names, which often contain the owner's name.
+
+**The key.**
+- `openvault init` generates the vault's **names key**: 32 random bytes.
+- Genesis carries it wrapped to the recovery wrapping key, and each add_device carries it wrapped to the device being added.
+- So each device gets the key from its own entry, which an admin signed, and recovery gets it from genesis.
+- Wrapping is crypto.md key wrapping, with context `"names key" ‖ 0x00 ‖ vault id`.
+
+**The sealed name.** It uses XChaCha20-Poly1305 under the names key, with AAD `vault id ‖ device id`, so a sealed name can't be moved to another device's entry.
+
+```
+plaintext  platform (u8 length ‖ ASCII) ‖ name (u8 length ‖ UTF-8), zero-padded to 82 bytes
+sealed     nonce (24) ‖ ciphertext (82) ‖ tag (16): 122 bytes
+```
+
+The padding hides the name's length.
+
+**Reading names.**
+- Accepting an entry doesn't need the names key: the checks below cover lengths and the wrapped key's KEM.
+- A device opens names only to show them.
+- A name that doesn't open, or that breaks the rules above, is shown as the device id.
+
+**What stays visible.**
+- The coordinator still sees how many devices a vault has and their key types: P-256 for hardware keys, Ed25519 and X25519 for key files.
+- The names key isn't rotated when a device is revoked. A revoked device that gets later entries, from the coordinator's copy for example, can read the names of devices added after it.
 
 ## Accepting an entry
 
@@ -63,7 +96,7 @@ A device accepts an entry only if every check passes:
 | Type | Rule |
 | --- | --- |
 | genesis | Only at `seq` 0. 1–8 admins, no repeats. |
-| add_device | The device id is new, revoked devices included. No other device, revoked or not, has the same verifying, wrapping or transport key. |
+| add_device | The device id is new, revoked devices included. No other device, revoked or not, has the same verifying, wrapping or transport key. The wrapped names key's KEM matches the device's wrapping key. |
 | set_scope | The device exists and isn't revoked. The scope differs from its current one, so the log holds no entries that change nothing. |
 | revoke_device | The device exists and isn't already revoked. All its scopes become none. |
 | rotate_epoch | The collection has appeared in a set_scope, and the epoch is its current epoch plus one. |
@@ -71,6 +104,8 @@ A device accepts an entry only if every check passes:
 | remove_admin | The key is an admin and isn't the last one. An admin may remove itself. |
 
 A collection becomes known to the log with its first set_scope, at epoch 0. Creating a collection is therefore an admin action: the admin signs a set_scope that gives the creating device `write`.
+
+Revoking a device, or removing its `read` or `write` on a collection, is followed in the same approval by a rotate_epoch for each collection affected ([sync.md](sync.md#revoking-and-reducing-scopes)).
 
 ## Forks
 
@@ -97,8 +132,8 @@ The log grows with membership changes, not with data. A vault with 10 devices an
 
 `openvault init` generates the recovery key, then signs two entries with the recovery admin key while it is still in memory:
 
-1. genesis, listing the recovery admin key, this device's admin key if it has one (keystore.md, admin key), and the recovery wrapping key;
-2. add_device for this device.
+1. genesis, listing the recovery admin key, this device's admin key if it has one (keystore.md, admin key), the recovery wrapping key, and a new names key wrapped to it;
+2. add_device for this device, with its sealed name and the names key wrapped to it.
 
 The recovery key is then dropped. It's needed again only to recover, or to sign as an admin on a device that has no admin key. So `openvault collections create` asks for Touch ID on a Mac that has an admin key, and for the recovery phrase on any other device, including Macs whose vaults were created before admin keys existed.
 

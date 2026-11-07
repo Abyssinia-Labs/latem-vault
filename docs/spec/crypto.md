@@ -13,6 +13,7 @@ Every format here is versioned by its labels (`openvault v1 …`). A change to a
 | Signatures | Ed25519 (strict verification); ECDSA P-256 with SHA-256 | `ed25519-dalek`, `p256` |
 | Hashing, key derivation | BLAKE3 (`hash`, `keyed_hash`, `derive_key`) | `blake3` |
 | Recovery phrase | BIP-39, English, 24 words | `bip39` |
+| Pairing ([join.md](join.md)) | SPAKE2 over Ed25519 | `spake2` (not audited, see join.md) |
 
 Key wrapping uses HPKE, as recommended in design §19.1.
 
@@ -53,7 +54,7 @@ Suite: KEM as above, KDF HKDF-SHA256 (`0x0001`), AEAD ChaCha20-Poly1305 (`0x0003
 - `aad` = empty
 - plaintext = the 32-byte collection key
 
-`context` identifies what is wrapped: vault id, collection id and key epoch, encoded as in [records.md](records.md#collection-keys). Binding it into `info` means a wrapped key copied to another collection or epoch doesn't unwrap.
+`context` identifies what is wrapped: vault id, collection id and key epoch, encoded as in [records.md](records.md#collection-keys). Binding it into `info` means a wrapped key copied to another collection or epoch doesn't unwrap. The vault's names key uses the context `"names key" ‖ 0x00 ‖ vault id` ([membership.md](membership.md#names-key)). At 26 bytes it can't be confused with a collection context, which is always 36.
 
 Devices with a Secure Enclave or TPM use P-256; devices without one, and the recovery key, use X25519.
 
@@ -65,6 +66,8 @@ The signed bytes are `label ‖ 0x00 ‖ message`:
 | --- | --- |
 | Record | `openvault v1 sig record` |
 | Membership log entry | `openvault v1 sig log entry` |
+| Join request ([join.md](join.md)) | `openvault v1 sig join request` |
+| Key grant ([sync.md](sync.md#grants)) | `openvault v1 sig key grant` |
 
 Hardware signers sign exactly these bytes (`signing_input` in the crate). For ECDSA, the signer hashes them with SHA-256 (`ecdsaSignatureMessageX962SHA256` on Apple platforms).
 

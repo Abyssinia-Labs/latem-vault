@@ -93,6 +93,11 @@ The device that administers the vault, the MacBook in design §12, has an admin 
 
 **What the dialog says.** Each signature restores the key with an `LAContext` passed as `kSecUseAuthenticationContext`. The context's `localizedReason` says what is being signed, such as "create the collection ssh", so a request nobody made stands out (design §4, known limits). Restoring the key and reading its public key don't ask for anything; only signing does.
 
+**One approval, one prompt.**
+- An approval that signs several things asks once. A join, for example, signs add_device and its set_scope entries; a revocation signs rotate_epoch entries and grants too.
+- The `LAContext` is authenticated once, with a reason that names the whole approval, and is then passed to every signature in it.
+- This needs checking on real hardware when it is built.
+
 **The admin key file.** It sits next to the key file, as `admin` in the `openvault` directory, with the same rules: created only if absent, mode 0600, refused if others can read it or if it's over 16 KiB.
 
 ```

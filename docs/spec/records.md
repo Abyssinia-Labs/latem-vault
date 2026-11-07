@@ -22,6 +22,8 @@ Each collection has a key epoch, starting at 0. Each epoch has a random 32-byte 
 vault_id (16) ‖ collection_id (16) ‖ epoch (u32)
 ```
 
+Wrapped keys travel between devices as signed grants ([sync.md](sync.md#grants)).
+
 ## Records
 
 Every entry version, deletion and collection rename is an immutable record:
@@ -58,7 +60,7 @@ A reader rejects a record if any check fails: format, flags, body hash, signatur
 
 ## Versions
 
-A record's version is `(lamport, device)`, compared in that order; the greatest version of a name is current. A device keeps one Lamport clock per vault. A new record gets `clock + 1`, and the clock advances to every version it writes or receives, so a local write is always newer than anything the device has seen. A deleted record stays current until a newer version replaces it, so an older version arriving later can't bring a deleted entry back.
+A record's version is `(lamport, device)`, compared in that order; the greatest version of a name is current. One exception: a version is ignored if its epoch is older than the collection's current epoch and its author no longer has `write` on the collection. Then nothing a revoked or demoted device signs with its old keys can become current ([sync.md](sync.md#revoking-and-reducing-scopes)). A device keeps one Lamport clock per vault. A new record gets `clock + 1`, and the clock advances to every version it writes or receives, so a local write is always newer than anything the device has seen. A deleted record stays current until a newer version replaces it, so an older version arriving later can't bring a deleted entry back.
 
 ## Local store
 
@@ -67,11 +69,14 @@ Each device keeps one SQLite database per vault, readable only by its user (mode
 - the vault id, this device's id, the Lamport clock and the recovery wrapping key;
 - known devices and their public keys;
 - collections, their current epochs and wrapped keys;
+- from sync on, the grants ([sync.md](sync.md#grants)), and each set's item count and id sum;
 - every record, as received;
 - an index of each entry's current version;
 - the membership log and the state it leads to ([membership.md](membership.md#keeping-the-log)).
 
-The database's `user_version` is the store version: 1 in M1, 2 since the membership log. Opening a version 1 store upgrades it by adding the empty log table.
+The database's `user_version` is the store version: 1 in M1, 2 since the membership log. Opening a version 1 store upgrades it by adding the empty log table. The upgrade that adds sync also turns each wrapped key the device already holds into a grant it signs.
+
+A device that is joining (join.md) has a store holding only its device id until the join completes.
 
 The index never stores a name in the clear. Each device has a 32-byte **local key**, kept by its keystore and never shared, from which it derives:
 
@@ -85,4 +90,4 @@ Looking up an entry costs one index read and one record read. Listing a collecti
 
 ## Not in v1
 
-History pruning (N versions or D days), files and chunks, and receiving records from other devices. The format leaves room for each: pruning works on headers alone, files are kind `0x03`, and received records go through the same version rule as local writes.
+History pruning (N versions or D days), and files and chunks. The format leaves room for both: pruning works on headers alone, and files are kind `0x03`. Receiving records from other devices is in [sync.md](sync.md); received records go through the same version rule as local writes.

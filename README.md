@@ -6,12 +6,12 @@ This repository holds the open-source core: the Rust service and CLI, the coordi
 
 ## Status
 
-Milestone M1, one device: secrets and variables work on a single machine, with no sync yet. Devices joining and syncing come in M2. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
+Milestone M1, one device, is done: secrets and variables work on a single machine, with no sync yet. Creating a collection already asks for Touch ID, which was planned for M2. Next is M2: devices joining over the LAN and syncing. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
 
 ## Try it
 
 ```sh
-cargo install --path crates/cli
+cargo install --locked --path crates/cli         # the dependency versions in Cargo.lock
 
 openvault init                                   # shows the recovery phrase once
 openvault collections create latem               # Touch ID; the recovery phrase without a Secure Enclave
@@ -32,6 +32,12 @@ To bring in a whole `NAME=value` file, such as latem's `secrets.env`:
 
 ```sh
 openvault import-env ~/.latem/secrets.env --collection latem --env prod --var REGION
+```
+
+With `-` as the file it reads stdin, so the file can come straight from another machine without a plaintext copy landing on this one:
+
+```sh
+ssh mini 'cat ~/.latem/secrets.env' | openvault import-env - --collection latem --env prod
 ```
 
 Every name becomes a secret unless it is given with `--var`. The file is read as latem reads it: no `export`, no `$` expansion, and in double quotes only `\n`, `\r`, `\t`, `\\` and `\"`. Nothing is written if any line fails to parse, or if a name already exists (unless you pass `--overwrite`).

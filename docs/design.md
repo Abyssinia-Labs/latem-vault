@@ -367,6 +367,8 @@ The hosted product's plans and running costs are documented in `openvault-cloud`
 | M0 Spec | Threat model, protocol spec, ADRs for §19 | Crypto and wire formats are written down |
 | M1 One device | Store, collections, secrets and variables, CLI, `openvault run`, Secure Enclave and file keystores | `~/.latem/secrets.env` can be replaced on the MacBook |
 | M2 LAN | PAKE join without a coordinator, membership log, admin Touch ID, recovery key, peer sync over iroh, latem store | The Android build runs on the desktop with secrets from the MacBook |
+
+**Progress.** M1 was done on 2026-11-07. The MacBook's vault took latem's secrets from the mini, streamed over ssh into `openvault import-env -`, because latem's `secrets.env` files are on the mini and the desktop, not the MacBook. Moving those two machines off `secrets.env` comes with M2's sync. The membership log, admin Touch ID and recovery key from M2 were built during M1.
 | M3 Grandfather | Coordinator, relay, `hold` storage, Docker image | The MacBook reaches the mini from outside the house |
 | M4 Files | Chunked encrypted files, import, `open` and `get`, on-demand fetch, local web UI | A signing keystore and a documents folder sync and open on every device |
 | M5 Apple apps | macOS app with File Provider; iOS app with Face ID approvals | Joins are approved from a notification |

@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use crate::{Backend, Error, Keys, Result};
 
 const MAGIC: &[u8] = b"openvault v1 keys\0";
+const ADMIN_MAGIC: &[u8] = b"openvault v1 admin key\0";
 const KIND_SOFTWARE: u8 = 0x01;
 const KIND_SECURE_ENCLAVE: u8 = 0x02;
 /// Key files are a few hundred bytes; anything much larger isn't one.
@@ -48,6 +49,42 @@ pub(crate) fn create(path: &Path, backend: Backend) -> Result<Keys> {
 }
 
 pub(crate) fn load(path: &Path) -> Result<Keys> {
+    decode(&read_private(path)?)
+}
+
+/// Writes a new admin key file: the magic, the Secure Enclave kind, and the key's blob
+/// (keystore.md, admin key).
+#[cfg(target_os = "macos")]
+pub(crate) fn write_admin(path: &Path, blob: &[u8]) -> Result<()> {
+    let len = u16::try_from(blob.len()).expect("Secure Enclave blobs are a few hundred bytes");
+    let contents = [
+        ADMIN_MAGIC,
+        &[KIND_SECURE_ENCLAVE],
+        &len.to_be_bytes(),
+        blob,
+    ]
+    .concat();
+    write_new(path, &contents)
+}
+
+/// The blob in an admin key file.
+pub(crate) fn read_admin(path: &Path) -> Result<Vec<u8>> {
+    let contents = read_private(path)?;
+    let body = contents
+        .strip_prefix(ADMIN_MAGIC)
+        .ok_or(Error::Format("unknown format"))?;
+    let (&kind, body) = body.split_first().ok_or(Error::Format("truncated"))?;
+    if kind != KIND_SECURE_ENCLAVE {
+        return Err(Error::Format("unknown key kind"));
+    }
+    let mut reader = Reader(body);
+    let blob = reader.field()?.to_vec();
+    reader.finish()?;
+    Ok(blob)
+}
+
+/// Reads a file that only this user can read, refusing one that others can.
+fn read_private(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let file = File::open(path).map_err(|e| match e.kind() {
         ErrorKind::NotFound => Error::NotFound(path.to_owned()),
         _ => e.into(),
@@ -65,7 +102,7 @@ pub(crate) fn load(path: &Path) -> Result<Keys> {
     if contents.len() > MAX_LEN {
         return Err(Error::Format("too large"));
     }
-    decode(&contents)
+    Ok(contents)
 }
 
 fn decode(contents: &[u8]) -> Result<Keys> {

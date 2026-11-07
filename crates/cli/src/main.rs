@@ -14,10 +14,11 @@ use std::process::{self, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use openvault_core::membership::{self, AdminKey as _};
 use openvault_core::record::MAX_VALUE_LEN;
-use openvault_core::{Kind, Vault, membership, names};
+use openvault_core::{Kind, Vault, names};
 use openvault_crypto::RecoveryKey;
-use openvault_keystore::{Backend, Keys};
+use openvault_keystore::{AdminKey, Backend, Keys};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -105,8 +106,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CollectionsAction {
-    /// Create a collection. Asks for the recovery phrase, which signs as admin until this
-    /// device has an admin key of its own.
+    /// Create a collection. Asks for Touch ID when this Mac has an admin key, and for the
+    /// recovery phrase otherwise.
     Create { name: String },
 }
 
@@ -205,6 +206,23 @@ impl Home {
         self.0.join("vault.db")
     }
 
+    fn admin(&self) -> PathBuf {
+        self.0.join("admin")
+    }
+
+    /// This device's admin key, if it has one and the vault lists it as an admin.
+    fn admin_key(&self, vault: &Vault<Keys>) -> Result<Option<AdminKey>> {
+        let key = match AdminKey::load(&self.admin()) {
+            Ok(key) => key,
+            Err(openvault_keystore::Error::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let listed = vault
+            .membership()
+            .is_some_and(|m| m.admins().contains(&key.verifying_key()));
+        Ok(listed.then_some(key))
+    }
+
     fn open(&self) -> Result<Vault<Keys>> {
         if !self.vault().exists() {
             bail!(
@@ -223,20 +241,40 @@ fn init(home: &Home, backend: Backend, name: &str) -> Result<()> {
     }
     create_private_dir(&home.0)?;
     let keys = Keys::create(&home.keys(), backend)?;
-    let recovery = RecoveryKey::generate();
-    let vault = Vault::create(&home.vault(), keys, &recovery, name).inspect_err(|_| {
+    let remove_files = || {
         let _ = fs::remove_file(home.keys());
-    })?;
+        let _ = fs::remove_file(home.admin());
+    };
+    // The device that creates the vault administers it (design §14). A Mac with a Secure
+    // Enclave gets an admin key that asks for Touch ID; anywhere else, the recovery phrase is
+    // the only admin key.
+    let admin = match backend {
+        Backend::SecureEnclave => {
+            Some(AdminKey::create(&home.admin()).inspect_err(|_| remove_files())?)
+        }
+        Backend::Software => None,
+    };
+    let recovery = RecoveryKey::generate();
+    let admin_key = admin.as_ref().map(|admin| admin.verifying_key());
+    let vault = Vault::create(&home.vault(), keys, &recovery, name, admin_key)
+        .inspect_err(|_| remove_files())?;
 
-    let keys = match backend {
-        Backend::SecureEnclave => "Secure Enclave".to_owned(),
-        Backend::Software => format!("software, in {}", home.keys().display()),
+    let (keys, admin) = match backend {
+        Backend::SecureEnclave => (
+            "Secure Enclave".to_owned(),
+            "Secure Enclave, asks for Touch ID or your password",
+        ),
+        Backend::Software => (
+            format!("software, in {}", home.keys().display()),
+            "your recovery phrase only",
+        ),
     };
     println!("Created a vault in {}.", home.0.display());
     println!();
     println!("  Vault   {}", vault.vault_id());
     println!("  Device  {name}, {}", vault.device_id());
     println!("  Keys    {keys}");
+    println!("  Admin   {admin}");
     println!();
     println!("Recovery phrase:");
     println!();
@@ -253,24 +291,32 @@ fn init(home: &Home, backend: Backend, name: &str) -> Result<()> {
     println!();
     println!("Write these 24 words down and keep them offline, on paper or in the Passwords app.");
     println!("They are shown only once. With them you can recover every collection if this");
-    println!("device is lost. Until this device has an admin key of its own, creating a");
-    println!("collection asks for them too.");
+    println!("device is lost.");
+    if backend == Backend::Software {
+        println!("This device has no admin key, so creating a collection asks for them too.");
+    }
     Ok(())
 }
 
-/// Creates a collection. Its set_scope entry needs an admin signature, which for now comes
-/// from the recovery key, since devices don't have admin keys of their own yet. A vault from
-/// before the membership log starts its log first, with the same phrase.
+/// Creates a collection. Its set_scope entry needs an admin signature: this device's admin key
+/// when it has one, otherwise the recovery key. A vault from before the membership log starts
+/// its log first, with the recovery phrase.
 fn create_collection(home: &Home, name: &str) -> Result<()> {
     names::check_collection(name)?;
     let mut vault = home.open()?;
-    // Checked before asking for 24 words.
+    // Checked before asking for Touch ID or 24 words.
     if vault.collection(name).is_ok() {
         bail!("collection {name} already exists");
     }
+    if let Some(admin) = home.admin_key(&vault)? {
+        let reason = format!("create the collection {name}");
+        eprintln!("Confirm with Touch ID or your password to {reason}.");
+        vault.create_collection(name, &admin.with_reason(reason))?;
+        return Ok(());
+    }
     if io::stdin().is_terminal() {
-        eprintln!("Creating a collection needs an admin signature. Until this device has an");
-        eprintln!("admin key of its own, that comes from your recovery phrase.");
+        eprintln!("Creating a collection needs an admin signature. This device has no admin");
+        eprintln!("key, so it comes from your recovery phrase.");
     }
     let recovery = read_recovery_phrase()?;
     if !vault.is_recovery_key(&recovery) {

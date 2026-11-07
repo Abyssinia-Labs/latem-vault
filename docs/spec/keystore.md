@@ -58,7 +58,7 @@ Creating a key file writes it and then loads it back. A key that won't restore i
   - `kSecAttrTokenID` is `kSecAttrTokenIDSecureEnclave`.
   - The key is not permanent.
   - Access control is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` with `privateKeyUsage`.
-- No user presence is required. Device keys are used on every read, and Touch ID is kept for the admin key (M2).
+- No user presence is required. Device keys are used on every read, and Touch ID is kept for the admin key (below).
 - The keys work only after the first unlock since boot. They then keep working while the screen is locked, so `openvault run` works in jobs on a locked Mac mini.
 
 **Storage.**
@@ -82,8 +82,30 @@ Creating a key file writes it and then loads it back. A key that won't restore i
 - The Secure Enclave computes the ECDH x-coordinate (`kSecKeyAlgorithmECDHKeyExchangeStandard`).
 - `openvault-crypto` runs the rest of HPKE (crypto.md, hardware keys).
 
+## Admin key
+
+The device that administers the vault, the MacBook in design §12, has an admin key that signs membership log entries (membership.md). `openvault init` creates one on a Mac with a Secure Enclave, and genesis lists it next to the recovery admin key. Devices without a Secure Enclave get none, and sign as admin with the recovery phrase.
+
+**The key.**
+- A P-256 Secure Enclave key, created and restored as above.
+- Its access control is `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` with `privateKeyUsage` and `userPresence`. Every signature needs Touch ID, an Apple Watch, or the Mac's password, and the Mac must be unlocked.
+- `userPresence` rather than `biometryAny`, so a MacBook used closed, with a keyboard that has no Touch ID, can still sign with the password.
+
+**What the dialog says.** Each signature restores the key with an `LAContext` passed as `kSecUseAuthenticationContext`. The context's `localizedReason` says what is being signed, such as "create the collection ssh", so a request nobody made stands out (design §4, known limits). Restoring the key and reading its public key don't ask for anything; only signing does.
+
+**The admin key file.** It sits next to the key file, as `admin` in the `openvault` directory, with the same rules: created only if absent, mode 0600, refused if others can read it or if it's over 16 KiB.
+
+```
+magic  "openvault v1 admin key" ‖ 0x00   23 bytes
+kind   0x02 (Secure Enclave)              1 byte
+blob   u16 length ‖ bytes
+```
+
+It has its own file because only an administering device has one, and so the key file format stays as it is. Creating the file loads it back, as for key files.
+
 ## Not in v1
 
 - **Passphrase-protected key files** for Linux, Windows and WSL (design §12). This will be a new kind whose body is sealed with a key derived from the passphrase with Argon2id. It comes with the first Linux device in M2.
 - TPM and Windows Hello.
-- The transport key and the admin key, both in M2.
+- Adding an admin key to a vault created without one, or making another device an admin. Both are an add_admin entry (membership.md) and come with joining in M2.
+- The transport key is derived from the local key (records.md, local store), so the key file doesn't hold one.

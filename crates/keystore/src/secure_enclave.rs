@@ -6,11 +6,14 @@
 //! Secure Enclave can use, goes in the key file, and `SecKeyCreateWithData` restores the key
 //! from it. The blob is the same one CryptoKit exposes as `dataRepresentation`.
 
-use core_foundation::base::{CFType, TCFType};
+use core_foundation::base::{CFOptionFlags, CFType, TCFType};
 use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::error::CFError;
 use core_foundation::string::{CFString, CFStringRef};
+use objc2::rc::Retained;
+use objc2_foundation::NSString;
+use objc2_local_authentication::LAContext;
 use openvault_core::DeviceKeys;
 use openvault_crypto::sign::signing_input;
 use openvault_crypto::{
@@ -18,10 +21,13 @@ use openvault_crypto::{
 };
 use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
-use security_framework_sys::access_control::kSecAccessControlPrivateKeyUsage;
+use security_framework_sys::access_control::{
+    kSecAccessControlPrivateKeyUsage, kSecAccessControlUserPresence,
+};
 use security_framework_sys::item::{
     kSecAttrKeyClass, kSecAttrKeyClassPrivate, kSecAttrKeyClassPublic, kSecAttrKeyType,
     kSecAttrKeyTypeECSECPrimeRandom, kSecAttrTokenID, kSecAttrTokenIDSecureEnclave,
+    kSecUseAuthenticationContext,
 };
 use security_framework_sys::key::SecKeyCreateWithData;
 use zeroize::Zeroizing;
@@ -36,6 +42,38 @@ const LOCAL_KEY_CONTEXT: &[u8] = b"device local key";
 
 pub(crate) fn is_available() -> bool {
     EnclaveKey::generate().is_ok()
+}
+
+/// A new admin key: one that needs the user to be present, with Touch ID or the Mac's password,
+/// for every signature, and is usable only while the Mac is unlocked (keystore.md, admin key).
+/// Returns its verifying key and the blob that restores it.
+pub(crate) fn generate_admin() -> Result<(VerifyingKey, Vec<u8>)> {
+    let (key, blob) = EnclaveKey::generate_with(
+        ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly,
+        kSecAccessControlPrivateKeyUsage | kSecAccessControlUserPresence,
+    )?;
+    Ok((VerifyingKey::from_p256_sec1(&key.public)?, blob))
+}
+
+/// The verifying key of the admin key in `blob`. Restoring the key doesn't ask for Touch ID;
+/// only signing does.
+pub(crate) fn admin_verifying_key(blob: &[u8]) -> Result<VerifyingKey> {
+    Ok(VerifyingKey::from_p256_sec1(
+        &EnclaveKey::restore(blob, None)?.public,
+    )?)
+}
+
+/// Signs `input` with the admin key in `blob`. The system asks for Touch ID or the password,
+/// and its dialog shows `reason`, which says what is being signed.
+pub(crate) fn admin_sign(blob: &[u8], reason: &str, input: &[u8]) -> Result<Signature> {
+    // SAFETY: a new LAContext has no preconditions, and the reason is copied when set.
+    let context = unsafe {
+        let context = LAContext::new();
+        context.setLocalizedReason(&NSString::from_str(reason));
+        context
+    };
+    let key = EnclaveKey::restore(blob, Some(&context))?;
+    Ok(Signature::from_p256_der(&key.sign(input)?)?)
 }
 
 /// A device's wrapping and signing keys in the Secure Enclave, plus its local key, which is
@@ -61,8 +99,8 @@ impl SecureEnclaveKeys {
     }
 
     pub(crate) fn restore(blobs: &EnclaveBlobs) -> Result<Self> {
-        let wrapping = EnclaveKey::restore(&blobs.wrapping)?;
-        let signing = EnclaveKey::restore(&blobs.signing)?;
+        let wrapping = EnclaveKey::restore(&blobs.wrapping, None)?;
+        let signing = EnclaveKey::restore(&blobs.signing, None)?;
         let wrap_key = WrapKey::from_p256_sec1(&wrapping.public)?;
         let verifying_key = VerifyingKey::from_p256_sec1(&signing.public)?;
         let local = blobs
@@ -110,14 +148,18 @@ struct EnclaveKey {
 }
 
 impl EnclaveKey {
-    /// A new key, usable after the Mac's first unlock since boot, and the blob that restores
-    /// it.
+    /// A new device key, usable after the Mac's first unlock since boot, and the blob that
+    /// restores it.
     fn generate() -> Result<(Self, Vec<u8>)> {
-        let access = SecAccessControl::create_with_protection(
-            Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
+        Self::generate_with(
+            ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly,
             kSecAccessControlPrivateKeyUsage,
         )
-        .map_err(|e| Error::SecureEnclave(e.to_string()))?;
+    }
+
+    fn generate_with(protection: ProtectionMode, flags: CFOptionFlags) -> Result<(Self, Vec<u8>)> {
+        let access = SecAccessControl::create_with_protection(Some(protection), flags)
+            .map_err(|e| Error::SecureEnclave(e.to_string()))?;
         let mut options = GenerateKeyOptions::default();
         options
             .set_key_type(KeyType::ec_sec_prime_random())
@@ -136,21 +178,26 @@ impl EnclaveKey {
         Ok((Self::from_key(key)?, blob))
     }
 
-    fn restore(blob: &[u8]) -> Result<Self> {
-        let key = create_key(
-            &[],
-            &[
-                (
-                    unsafe { kSecAttrKeyClass },
-                    cf(unsafe { kSecAttrKeyClassPrivate }),
-                ),
-                (
-                    unsafe { kSecAttrTokenID },
-                    cf(unsafe { kSecAttrTokenIDSecureEnclave }),
-                ),
-            ],
-            Some(blob),
-        )?;
+    /// Restores a key from its blob. A `context` is used when the key asks for the user, and
+    /// sets what the dialog says.
+    fn restore(blob: &[u8], context: Option<&Retained<LAContext>>) -> Result<Self> {
+        let mut attributes = vec![
+            (
+                unsafe { kSecAttrKeyClass },
+                cf(unsafe { kSecAttrKeyClassPrivate }).into_CFType(),
+            ),
+            (
+                unsafe { kSecAttrTokenID },
+                cf(unsafe { kSecAttrTokenIDSecureEnclave }).into_CFType(),
+            ),
+        ];
+        if let Some(context) = context {
+            // SAFETY: an LAContext is an Objective-C object, which CFRetain and CFRelease
+            // manage like any CF type; the CFType holds its own reference.
+            let context = unsafe { CFType::wrap_under_get_rule(Retained::as_ptr(context).cast()) };
+            attributes.push((unsafe { kSecUseAuthenticationContext }, context));
+        }
+        let key = create_key(&[], &attributes, Some(blob))?;
         Self::from_key(key)
     }
 
@@ -169,7 +216,7 @@ impl EnclaveKey {
             peer,
             &[(
                 unsafe { kSecAttrKeyClass },
-                cf(unsafe { kSecAttrKeyClassPublic }),
+                cf(unsafe { kSecAttrKeyClassPublic }).into_CFType(),
             )],
             None,
         )?;
@@ -195,7 +242,7 @@ impl EnclaveKey {
 /// object id when restoring a Secure Enclave key.
 fn create_key(
     data: &[u8],
-    attributes: &[(CFStringRef, CFString)],
+    attributes: &[(CFStringRef, CFType)],
     token_object_id: Option<&[u8]>,
 ) -> Result<SecKey> {
     let mut pairs: Vec<(CFString, CFType)> = vec![(
@@ -205,7 +252,7 @@ fn create_key(
     pairs.extend(
         attributes
             .iter()
-            .map(|(name, value)| (cf(*name), value.as_CFType())),
+            .map(|(name, value)| (cf(*name), value.clone())),
     );
     if let Some(blob) = token_object_id {
         pairs.push((

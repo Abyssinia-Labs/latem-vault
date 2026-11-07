@@ -122,6 +122,12 @@ fn init_creates_a_private_vault_and_shows_the_phrase() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Device  Build Mac, "), "{stdout}");
+    // Software keys come without an admin key; the recovery phrase is the only one.
+    assert!(
+        stdout.contains("Admin   your recovery phrase only"),
+        "{stdout}"
+    );
+    assert!(!home.join("admin").exists());
     assert!(stdout.contains("Recovery phrase"));
     phrase(&stdout);
 

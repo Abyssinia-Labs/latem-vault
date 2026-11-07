@@ -97,10 +97,10 @@ The log grows with membership changes, not with data. A vault with 10 devices an
 
 `openvault init` generates the recovery key, then signs two entries with the recovery admin key while it is still in memory:
 
-1. genesis, listing the recovery admin key (and, from M2, this device's admin key) and the recovery wrapping key;
+1. genesis, listing the recovery admin key, this device's admin key if it has one (keystore.md, admin key), and the recovery wrapping key;
 2. add_device for this device.
 
-The recovery key is then dropped. It's needed again only to recover, or to sign as an admin on a device that has no admin key. Until devices have admin keys of their own (M2), that's every device, so `openvault collections create` asks for the recovery phrase.
+The recovery key is then dropped. It's needed again only to recover, or to sign as an admin on a device that has no admin key. So `openvault collections create` asks for Touch ID on a Mac that has an admin key, and for the recovery phrase on any other device, including Macs whose vaults were created before admin keys existed.
 
 Vaults created in M1 have no log. Opening one adds the empty `log` table (store version 2) and nothing else, so reading keeps working. The first time an admin signature is needed, which today means creating a collection, `openvault` asks for the recovery phrase. It checks that the phrase derives the vault's recovery wrapping key, then writes, in one transaction:
 

@@ -139,12 +139,23 @@ impl<K: DeviceKeys> Vault<K> {
     /// Creates a new vault at `path`, with this device, called `name`, as its only member.
     ///
     /// The recovery key signs the log's first entries as admin (membership.md, creating a
-    /// vault), and every collection key is also wrapped to it.
-    pub fn create(path: &Path, keys: K, recovery: &RecoveryKey, name: &str) -> Result<Self> {
+    /// vault), and every collection key is also wrapped to it. `admin` is this device's admin
+    /// key, if it has one; genesis lists it as an admin too.
+    pub fn create(
+        path: &Path,
+        keys: K,
+        recovery: &RecoveryKey,
+        name: &str,
+        admin: Option<VerifyingKey>,
+    ) -> Result<Self> {
         let vault_id = VaultId::random();
         let device_id = DeviceId::random();
-        let (membership, log) =
-            start_membership(vault_id, recovery, device_info(device_id, &keys, name))?;
+        let (membership, log) = start_membership(
+            vault_id,
+            recovery,
+            admin,
+            device_info(device_id, &keys, name),
+        )?;
         let recovery = recovery.unwrap_key().wrap_key();
 
         // Create the file ourselves so it is never readable by others, even briefly.
@@ -285,6 +296,7 @@ impl<K: DeviceKeys> Vault<K> {
         let (mut membership, mut log) = start_membership(
             self.vault_id,
             recovery,
+            None,
             device_info(self.device_id, &self.keys, name),
         )?;
         let admin = recovery.admin_signing_key();
@@ -787,19 +799,20 @@ fn load_membership(
 }
 
 /// The log's first entries, signed by the recovery key's admin key: genesis, listing that key
-/// as the only admin, then add_device for this device (membership.md, creating a vault).
+/// and `device_admin` as the admins, then add_device for this device (membership.md, creating
+/// a vault).
 fn start_membership(
     vault: VaultId,
     recovery: &RecoveryKey,
+    device_admin: Option<VerifyingKey>,
     device: DeviceInfo,
 ) -> Result<(Membership, Vec<LogEntry>)> {
     let admin = recovery.admin_signing_key();
-    let (mut membership, genesis) = Membership::create(
-        vault,
-        recovery.unwrap_key().wrap_key(),
-        vec![admin.verifying_key()],
-        &admin,
-    )?;
+    let admins = std::iter::once(admin.verifying_key())
+        .chain(device_admin)
+        .collect();
+    let (mut membership, genesis) =
+        Membership::create(vault, recovery.unwrap_key().wrap_key(), admins, &admin)?;
     let add = membership.append(Change::AddDevice(device), &admin)?;
     Ok((membership, vec![genesis, add]))
 }
@@ -901,7 +914,7 @@ mod tests {
 
     impl Setup {
         fn create(&self) -> Vault<&SoftwareKeys> {
-            Vault::create(&self.path, &self.keys, &self.recovery, "test").unwrap()
+            Vault::create(&self.path, &self.keys, &self.recovery, "test", None).unwrap()
         }
 
         fn open(&self) -> Vault<&SoftwareKeys> {
@@ -981,13 +994,13 @@ mod tests {
         let s = setup();
         drop(s.create());
         assert!(matches!(
-            Vault::create(&s.path, &s.keys, &s.recovery, "test"),
+            Vault::create(&s.path, &s.keys, &s.recovery, "test", None),
             Err(Error::VaultExists(_))
         ));
         // A name the log refuses leaves no file behind.
         let unnamed = s.path.with_file_name("unnamed.db");
         assert!(matches!(
-            Vault::create(&unnamed, &s.keys, &s.recovery, ""),
+            Vault::create(&unnamed, &s.keys, &s.recovery, "", None),
             Err(Error::InvalidLogEntry(_))
         ));
         assert!(!unnamed.exists());
@@ -1033,6 +1046,30 @@ mod tests {
         assert_eq!(
             Membership::replay(&log).unwrap().to_state_bytes(),
             m.to_state_bytes()
+        );
+    }
+
+    #[test]
+    fn a_device_admin_key_is_an_admin_from_the_start() {
+        let s = setup();
+        // A P-256 key, as a Secure Enclave admin key would be.
+        let device_admin = SigningKey::generate_p256();
+        let mut vault = Vault::create(
+            &s.path,
+            &s.keys,
+            &s.recovery,
+            "test",
+            Some(device_admin.verifying_key()),
+        )
+        .unwrap();
+        assert_eq!(
+            vault.membership().unwrap().admins(),
+            [s.admin().verifying_key(), device_admin.verifying_key()]
+        );
+        let id = vault.create_collection("c", &device_admin).unwrap();
+        assert_eq!(
+            vault.membership().unwrap().scope(vault.device_id(), id),
+            Scope::Write
         );
     }
 

@@ -3,7 +3,11 @@
 //! A device's keys live in one key file, apart from the vault database. The file holds either
 //! the keys themselves ([`Backend::Software`], protected only by the file's 0600 mode) or
 //! Secure Enclave key blobs that only this Mac can use ([`Backend::SecureEnclave`]).
+//!
+//! A Mac that administers the vault also has an [`AdminKey`], in a file of its own: a Secure
+//! Enclave key that asks for Touch ID or the password each time it signs.
 
+mod admin;
 mod file;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
@@ -15,6 +19,7 @@ use openvault_crypto::{
     Signature, SignatureContext, SymmetricKey, VerifyingKey, WrapKey, WrappedKey,
 };
 
+pub use admin::AdminKey;
 #[cfg(target_os = "macos")]
 pub use secure_enclave::SecureEnclaveKeys;
 
@@ -225,7 +230,7 @@ mod tests {
             let vault_path = dir.path().join(format!("{backend:?}.db"));
             let id = {
                 let keys = Keys::create(&keys_path, backend).unwrap();
-                let mut vault = Vault::create(&vault_path, keys, &recovery, "test").unwrap();
+                let mut vault = Vault::create(&vault_path, keys, &recovery, "test", None).unwrap();
                 let id = vault
                     .create_collection("latem", &recovery.admin_signing_key())
                     .unwrap();
@@ -279,6 +284,62 @@ mod tests {
             Keys::load(&path),
             Err(Error::Permissions(_, 0o640))
         ));
+    }
+
+    #[test]
+    fn admin_key_file() {
+        use openvault_core::membership::AdminKey as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin");
+        if !Backend::SecureEnclave.is_available() {
+            assert!(matches!(
+                AdminKey::create(&path),
+                Err(Error::Unavailable(Backend::SecureEnclave))
+            ));
+            eprintln!("skipped the Secure Enclave part: this device has none");
+            return;
+        }
+
+        let key = AdminKey::create(&path).unwrap();
+        let loaded = AdminKey::load(&path).unwrap();
+        assert_eq!(loaded.verifying_key(), key.verifying_key());
+        assert!(!key.verifying_key().is_ed25519());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(matches!(AdminKey::create(&path), Err(Error::Exists(_))));
+
+        // An admin key file and a device key file can't be mistaken for each other.
+        assert!(matches!(Keys::load(&path), Err(Error::Format(_))));
+        let keys = dir.path().join("keys");
+        Keys::create(&keys, Backend::Software).unwrap();
+        assert!(matches!(AdminKey::load(&keys), Err(Error::Format(_))));
+
+        let good = fs::read(&path).unwrap();
+        for damaged in [&good[..good.len() - 1], &[&good[..], &[0]].concat()] {
+            fs::write(&path, damaged).unwrap();
+            assert!(matches!(AdminKey::load(&path), Err(Error::Format(_))));
+        }
+    }
+
+    /// Asks for Touch ID or the password, so it runs only when asked:
+    /// `cargo test -p openvault-keystore -- --ignored`.
+    #[test]
+    #[ignore = "asks for Touch ID"]
+    fn admin_key_signs_after_touch_id() {
+        use openvault_core::membership::AdminKey as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = AdminKey::create(&dir.path().join("admin"))
+            .unwrap()
+            .with_reason("run the openvault admin key test");
+        let signature = key.sign(SignatureContext::LogEntry, b"test").unwrap();
+        key.verifying_key()
+            .verify(SignatureContext::LogEntry, b"test", &signature)
+            .unwrap();
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub enum Scope {
 }
 
 impl Scope {
-    fn code(self) -> u8 {
+    pub fn code(self) -> u8 {
         match self {
             Self::None => 0x00,
             Self::Hold => 0x01,
@@ -55,7 +55,7 @@ impl Scope {
         }
     }
 
-    fn from_code(code: u8) -> Option<Self> {
+    pub fn from_code(code: u8) -> Option<Self> {
         match code {
             0x00 => Some(Self::None),
             0x01 => Some(Self::Hold),
@@ -364,6 +364,17 @@ impl Change {
 pub trait AdminKey {
     fn verifying_key(&self) -> VerifyingKey;
     fn sign(&self, context: SignatureContext, message: &[u8]) -> Result<Signature>;
+}
+
+/// So an admin key can be passed on behind a reference, as `&dyn AdminKey`.
+impl<T: AdminKey + ?Sized> AdminKey for &T {
+    fn verifying_key(&self) -> VerifyingKey {
+        (**self).verifying_key()
+    }
+
+    fn sign(&self, context: SignatureContext, message: &[u8]) -> Result<Signature> {
+        (**self).sign(context, message)
+    }
 }
 
 impl AdminKey for SigningKey {
@@ -720,6 +731,23 @@ impl Membership {
             Scope::Hold | Scope::Read => history.readers.contains(&device),
             Scope::Write => history.writers.contains(&device),
         }
+    }
+
+    /// Whether `device` had at least `scope` on `collection` during `epoch` or a later one: what
+    /// holding or receiving that epoch's key needs. A device that may read a collection gets its
+    /// earlier keys too, since entries written under them can still be current (sync.md,
+    /// accepting grants).
+    pub fn had_scope_from(
+        &self,
+        device: DeviceId,
+        collection: CollectionId,
+        epoch: u32,
+        scope: Scope,
+    ) -> bool {
+        let Some(current) = self.epoch(collection) else {
+            return false;
+        };
+        (epoch..=current).any(|later| self.had_scope(device, collection, later, scope))
     }
 
     /// The admins at the entry that began `epoch` of `collection`: its first set_scope for epoch

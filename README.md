@@ -32,6 +32,14 @@ openvault approve --read latem                   # on the MacBook: the code, a r
 
 The code and the review make sure the device you approve is the one in front of you. The new device gets the vault's membership log and the keys for the collections it may read. With `openvault service` running on both, their secrets follow within seconds, and so does every later change.
 
+To change what a device may do with a collection, such as one created after it joined:
+
+```sh
+openvault scope Desktop ssh read                 # none, hold, read or write; Touch ID
+```
+
+Taking away `read` or `write` gives the collection a new key, as revoking does.
+
 To remove a device, such as one that was lost:
 
 ```sh

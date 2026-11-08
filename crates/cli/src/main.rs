@@ -18,6 +18,7 @@ use std::process::{self, ExitCode};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use openvault_core::membership::AdminKey as _;
+use openvault_core::membership::Scope;
 use openvault_core::record::MAX_VALUE_LEN;
 use openvault_core::{Kind, Vault, names};
 use openvault_crypto::RecoveryKey;
@@ -128,6 +129,16 @@ enum Command {
         #[command(subcommand)]
         action: Option<DevicesAction>,
     },
+    /// Change what a device may do with a collection. Taking away read or write gives the
+    /// collection a new key. Asks for Touch ID when this Mac has an admin key, and for the
+    /// recovery phrase otherwise.
+    Scope {
+        /// The device's name, or the start of its id
+        device: String,
+        collection: String,
+        #[arg(value_enum)]
+        scope: ScopeArg,
+    },
     /// Hold the vault open, find this vault's other devices on the local network, and answer
     /// other commands, so a passphrase is typed once. Runs until Ctrl-C.
     Service,
@@ -155,6 +166,16 @@ enum CollectionsAction {
     /// Create a collection. Asks for Touch ID when this Mac has an admin key, and for the
     /// recovery phrase otherwise.
     Create { name: String },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ScopeArg {
+    /// No access
+    None,
+    /// Store and serve the collection without reading it
+    Hold,
+    Read,
+    Write,
 }
 
 #[derive(Subcommand)]
@@ -222,6 +243,21 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         Command::Devices {
             action: Some(DevicesAction::Revoke { device }),
         } => revoke(&home, &device)?,
+        Command::Scope {
+            device,
+            collection,
+            scope,
+        } => set_scope(
+            &home,
+            &device,
+            &collection,
+            match scope {
+                ScopeArg::None => Scope::None,
+                ScopeArg::Hold => Scope::Hold,
+                ScopeArg::Read => Scope::Read,
+                ScopeArg::Write => Scope::Write,
+            },
+        )?,
         Command::Service => service(&home)?,
         Command::Collections { action: None } => {
             for name in home.access()?.collections()? {
@@ -770,6 +806,77 @@ fn revoke(home: &Home, query: &str) -> Result<()> {
         for secret in secrets {
             println!("  {secret}");
         }
+    }
+    Ok(())
+}
+
+/// Changes a device's scope on a collection (sync.md, revoking and reducing scopes).
+fn set_scope(home: &Home, query: &str, collection: &str, scope: Scope) -> Result<()> {
+    let mut access = home.access()?;
+    let devices = access.devices()?;
+    let device = find_device(&devices, query)?;
+    let name = device
+        .name
+        .as_ref()
+        .map_or_else(|| device.id.to_string(), |(_, name)| name.clone());
+    if device.this {
+        bail!("{name} is this device; change its scope from another one");
+    }
+    if device.revoked {
+        bail!("{name} is revoked");
+    }
+    access.require_collection(collection)?;
+    let label = join::scope_label(scope);
+    if home.admin().exists() {
+        eprintln!("Confirm with Touch ID or your password to give {name} {label} on {collection}.");
+    }
+    let request = |recovery_phrase| Request::SetScope {
+        device: device.id,
+        collection: collection.into(),
+        scope,
+        recovery_phrase,
+    };
+    let mut response = access.call(request(None))?;
+    if let Response::Error {
+        code: ErrorCode::RecoveryPhraseNeeded,
+        ..
+    } = response
+    {
+        if io::stdin().is_terminal() {
+            eprintln!("Changing a scope needs an admin signature. This device has no admin key,");
+            eprintln!("so it comes from your recovery phrase.");
+        }
+        response = access.call(request(Some(read_recovery_phrase()?)))?;
+    }
+    let Response::ScopeSet {
+        rotated,
+        granted,
+        carried,
+    } = response
+    else {
+        return Err(unexpected(&response));
+    };
+    if scope == Scope::None {
+        println!("{name} no longer has a scope on {collection}.");
+    } else {
+        println!("{name} now has {label} on {collection}.");
+    }
+    if granted > 0 {
+        println!("{collection}'s keys reach {name} the next time the two sync.");
+    }
+    if rotated {
+        if scope >= Scope::Read {
+            println!(
+                "{collection} has a new key, so what {name} signs with the old one no longer counts."
+            );
+        } else {
+            println!("{collection} has a new key, so nothing written from now on reaches {name}.");
+        }
+    }
+    if carried > 0 {
+        println!(
+            "Its last changes to {carried} entries were written again with the new key, so they're kept."
+        );
     }
     Ok(())
 }

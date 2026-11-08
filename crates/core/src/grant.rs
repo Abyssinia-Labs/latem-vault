@@ -130,8 +130,10 @@ impl Grant {
         let recipient_key = match self.recipient {
             None => membership.recovery_key(),
             Some(device) => {
-                if !membership.had_scope(device, self.collection, self.epoch, Scope::Read) {
-                    return fail("the recipient couldn't read the collection at that epoch");
+                if !membership.had_scope_from(device, self.collection, self.epoch, Scope::Read) {
+                    return fail(
+                        "the recipient couldn't read the collection at that epoch or later",
+                    );
                 }
                 &membership
                     .device(device)
@@ -145,13 +147,18 @@ impl Grant {
         }
         let signer_could_read = membership.devices().any(|device| {
             device.info.verifying_key == self.signer
-                && membership.had_scope(device.info.id, self.collection, self.epoch, Scope::Read)
+                && membership.had_scope_from(
+                    device.info.id,
+                    self.collection,
+                    self.epoch,
+                    Scope::Read,
+                )
         });
         let signer_was_admin = membership
             .epoch_admins(self.collection, self.epoch)
             .contains(&self.signer);
         if !signer_could_read && !signer_was_admin {
-            return fail("the signer couldn't read the collection at that epoch");
+            return fail("the signer couldn't read the collection at that epoch or later");
         }
         self.signer
             .verify(SignatureContext::KeyGrant, &self.unsigned, &self.signature)

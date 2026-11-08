@@ -185,9 +185,10 @@ fn answer(shared: &Shared, request: Request) -> Response {
         Request::Set { collection, .. } | Request::Delete { collection, .. } => {
             Some(Change::Records(collection.clone()))
         }
-        Request::CreateCollection { .. } | Request::Changed | Request::Revoke { .. } => {
-            Some(Change::Log)
-        }
+        Request::CreateCollection { .. }
+        | Request::Changed
+        | Request::Revoke { .. }
+        | Request::SetScope { .. } => Some(Change::Log),
         _ => None,
     };
     let visible = shared.node.visible();

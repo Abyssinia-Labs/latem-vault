@@ -200,9 +200,11 @@ signature     65          context "key grant"
 **Accepting grants.** A device keeps a grant only if every check passes:
 
 1. The vault is its own, and the collection has reached the grant's epoch in the log.
-2. The recipient is the recovery key, or a device that had `read` or `write` on the collection at that epoch. The wrapped key's KEM matches the recipient's wrapping key.
-3. The signer is the verifying key of a device that had `read` or `write` at that epoch, or an admin key that was an admin at the entry that began the epoch. That entry is the collection's first set_scope for epoch 0, and its rotate_epoch for later epochs.
+2. The recipient is the recovery key, or a device that had `read` or `write` on the collection at that epoch or a later one. The wrapped key's KEM matches the recipient's wrapping key.
+3. The signer is the verifying key of a device that had `read` or `write` at that epoch or a later one, or an admin key that was an admin at the entry that began the epoch. That entry is the collection's first set_scope for epoch 0, and its rotate_epoch for later epochs.
 4. The signature verifies.
+
+**Why later epochs count.** A device that may read a collection needs its earlier keys too: there's no blanket re-encryption (below), so most entries stay sealed with the key they were written under. An earlier key opens only what was written while it was current, which a device allowed to read the collection now may read. Builds before 0.2.1 checked only the grant's own epoch, so they drop these grants, and a device joining a collection whose key had changed couldn't finish its join.
 
 **Who stores grants.**
 - Every member keeps every grant. Grants are small, and only their recipients can open them.
@@ -212,8 +214,8 @@ signature     65          context "key grant"
 **Who writes grants.**
 - **Creating a collection:** the creating device writes grants for itself and for the recovery key, at epoch 0.
 - **Joining:** the approving admin writes grants for the collections the new device may read (join.md).
-- **A new read or write scope:** a device holding the collection's keys sees the set_scope and finds no grant for that device and epoch. It writes grants for every epoch it holds. If two devices both do it, the duplicates are harmless.
-- **A new epoch:** the admin that rotates generates the new key. It signs the grants with its admin key, for every device with `read` or `write` and for the recovery key, in the same Touch ID prompt as the log entries.
+- **A new read or write scope:** a device holding the collection's keys sees the set_scope and finds no grant for that device and epoch. It writes grants for every epoch it holds. If two devices both do it, the duplicates are harmless. In v1, as with joining, only the device that signs the set_scope does this, in the same transaction, so it must hold the collection's keys.
+- **A new epoch:** the device whose admin signs the rotation generates the new key. It signs the grants with its own key, since it can read the collection, for every device with `read` or `write` and for the recovery key, in the same transaction as the log entries.
 
 ## Revoking and reducing scopes
 

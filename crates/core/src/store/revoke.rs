@@ -1,5 +1,6 @@
-//! Revoking a device (sync.md, revoking and reducing scopes): the log entries, a new key for
-//! each collection it could read, and recounting a collection's entries once its key changes.
+//! Revoking a device and changing its scopes (sync.md, revoking and reducing scopes): the log
+//! entries, new keys where it loses `read` or `write`, the keys it gains with `read`, and
+//! recounting a collection's entries once its key changes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -9,6 +10,7 @@ use rusqlite::{Transaction, params};
 
 use super::sync::counts;
 use super::{Vault, insert_grant, save_log, wrap_context};
+use crate::grant::Grant;
 use crate::membership::{AdminKey, Change, Membership, Scope};
 use crate::record::{Body, Kind, Record};
 use crate::{CollectionId, DeviceId, DeviceKeys, Error, Result};
@@ -19,6 +21,17 @@ pub struct Revocation {
     /// The collections that got a new key, because the device could read them.
     pub rotated: Vec<CollectionId>,
     /// Entries the device wrote last that this device wrote again under the new key.
+    pub carried: usize,
+}
+
+/// What changing a device's scope did.
+#[derive(Debug)]
+pub struct ScopeChange {
+    /// Whether the collection got a new key, because the device lost `read` or `write`.
+    pub rotated: bool,
+    /// Keys of the collection given to the device, because it may now read it.
+    pub granted: usize,
+    /// Entries it wrote last that this device wrote again under the new key.
     pub carried: usize,
 }
 
@@ -87,7 +100,7 @@ impl<K: DeviceKeys> Vault<K> {
     /// recovery key. Where both could write, this device writes the entries the device wrote
     /// last again under the new key, so its real changes are kept. All of it is one transaction.
     pub fn revoke_device(&mut self, device: DeviceId, admin: &impl AdminKey) -> Result<Revocation> {
-        let mut membership = self.membership.clone().ok_or(Error::NoLog)?;
+        let membership = self.membership.clone().ok_or(Error::NoLog)?;
         if device == self.device_id {
             return Err(Error::CantRevoke("it's the device doing the revoking"));
         }
@@ -108,14 +121,123 @@ impl<K: DeviceKeys> Vault<K> {
                 "it can read a collection this device can't, so this device can't give out its new key",
             ));
         }
+        let losing_write: Vec<CollectionId> = rotated
+            .iter()
+            .copied()
+            .filter(|&collection| membership.scope(device, collection) == Scope::Write)
+            .collect();
+        let carried = self.commit_change(
+            Change::RevokeDevice(device),
+            device,
+            &rotated,
+            &losing_write,
+            Vec::new(),
+            admin,
+        )?;
+        Ok(Revocation { rotated, carried })
+    }
 
-        // Read before anything changes: what it wrote last where both can write, and the keys
-        // so far, to recount with.
+    /// Gives `device` `scope` on `collection` (membership.md, set_scope). Raising it to `read`
+    /// or `write` grants it every key of the collection this device holds, the earlier epochs
+    /// included. Taking away its `read` or `write` changes the collection's key, as revoking
+    /// does, and where it loses `write` this device writes its last changes again under the new
+    /// key. All of it is one transaction.
+    pub fn set_scope(
+        &mut self,
+        device: DeviceId,
+        collection: CollectionId,
+        scope: Scope,
+        admin: &impl AdminKey,
+    ) -> Result<ScopeChange> {
+        let membership = self.membership.clone().ok_or(Error::NoLog)?;
+        if device == self.device_id {
+            return Err(Error::CantChangeScope(
+                "it's this device; change it from another one",
+            ));
+        }
+        match membership.device(device) {
+            None => return Err(Error::CantChangeScope("no such device")),
+            Some(found) if found.revoked => return Err(Error::CantChangeScope("it's revoked")),
+            Some(_) => {}
+        }
+        let current = membership
+            .epoch(collection)
+            .ok_or_else(|| Error::NoSuchCollection(collection.to_string()))?;
+        let before = membership.scope(device, collection);
+        if before == scope {
+            return Err(Error::CantChangeScope("it already has that scope"));
+        }
+        let gains_read = before < Scope::Read && scope >= Scope::Read;
+        let loses_write = before == Scope::Write && scope < Scope::Write;
+        let rotates = loses_write || (before >= Scope::Read && scope < Scope::Read);
+        if (gains_read || rotates) && membership.scope(self.device_id, collection) < Scope::Read {
+            return Err(Error::CantChangeScope(
+                "this device can't read the collection, so it can't give out its keys",
+            ));
+        }
+
+        // Every key this device holds, for a device that may now read.
+        let mut grants = Vec::new();
+        if gains_read {
+            let wrap_key = membership
+                .device(device)
+                .expect("checked above")
+                .info
+                .wrap_key
+                .clone();
+            for epoch in 0..=current {
+                let key = match self.take_key(collection, epoch) {
+                    Ok(key) => key,
+                    Err(Error::NoKey(_)) => continue,
+                    Err(e) => return Err(e),
+                };
+                let wrapped = wrap_key.wrap(&wrap_context(self.vault_id, collection, epoch), &key);
+                self.collection_keys.insert((collection, epoch), key);
+                grants.push(self.sign_grant(collection, epoch, Some(device), wrapped)?);
+            }
+        }
+        let granted = grants.len();
+        let rotated: &[CollectionId] = if rotates { &[collection] } else { &[] };
+        let losing_write: &[CollectionId] = if loses_write { &[collection] } else { &[] };
+        let carried = self.commit_change(
+            Change::SetScope {
+                device,
+                collection,
+                scope,
+            },
+            device,
+            rotated,
+            losing_write,
+            grants,
+            admin,
+        )?;
+        Ok(ScopeChange {
+            rotated: rotates,
+            granted,
+            carried,
+        })
+    }
+
+    /// Signs `change` and a rotate_epoch for each of `rotate`, makes each rotated collection's
+    /// new key and grants it to every reader the change leaves and the recovery key, and writes
+    /// it all with `grants` in one transaction, recounting each rotated collection. In
+    /// `losing_write`, where this device can write, the entries `device` wrote last are written
+    /// again under the new key. Returns how many were.
+    fn commit_change(
+        &mut self,
+        change: Change,
+        device: DeviceId,
+        rotate: &[CollectionId],
+        losing_write: &[CollectionId],
+        mut grants: Vec<Grant>,
+        admin: &impl AdminKey,
+    ) -> Result<usize> {
+        let mut membership = self.membership.clone().ok_or(Error::NoLog)?;
+        // Read before anything changes: what it wrote last, and the keys so far, to recount
+        // with.
         let mut carry = Vec::new();
-        for &collection in &rotated {
-            if membership.scope(device, collection) != Scope::Write
-                || membership.scope(self.device_id, collection) != Scope::Write
-            {
+        for &collection in losing_write {
+            if membership.scope(self.device_id, collection) != Scope::Write {
                 continue;
             }
             for current in self.written_by(collection, device)? {
@@ -128,17 +250,17 @@ impl<K: DeviceKeys> Vault<K> {
                 carry.push((collection, body, current.deleted));
             }
         }
-        let old_keys = self.epoch_keys(&membership, &rotated)?;
+        let old_keys = self.epoch_keys(&membership, rotate)?;
 
         // Signed before anything is written, so a refused signature leaves nothing behind.
-        let mut entries = vec![membership.append(Change::RevokeDevice(device), admin)?];
-        for &collection in &rotated {
+        let mut entries = vec![membership.append(change, admin)?];
+        for &collection in rotate {
             let epoch = membership.epoch(collection).expect("it could read it") + 1;
             entries.push(membership.append(Change::RotateEpoch { collection, epoch }, admin)?);
         }
-        let mut new_keys = Vec::with_capacity(rotated.len());
-        let mut grants = Vec::new();
-        for &collection in &rotated {
+        let first_new = grants.len();
+        let mut new_keys = Vec::with_capacity(rotate.len());
+        for &collection in rotate {
             let epoch = membership.epoch(collection).expect("rotated");
             let key = SymmetricKey::generate();
             let context = wrap_context(self.vault_id, collection, epoch);
@@ -166,12 +288,13 @@ impl<K: DeviceKeys> Vault<K> {
                 params![&collection.as_bytes()[..], epoch],
             )?;
         }
-        // This device's and the recovery key's grants are also kept as keys to unwrap, as when
-        // a collection is created.
+        // The new keys' grants to this device and the recovery key are also kept as keys to
+        // unwrap, as when a collection is created.
         let own = self.keys.wrap_key();
-        for grant in &grants {
+        for (i, grant) in grants.iter().enumerate() {
             insert_grant(&tx, grant)?;
             let recipient = match grant.recipient() {
+                _ if i < first_new => continue,
                 Some(reader) if reader == self.device_id => own.as_bytes(),
                 Some(_) => continue,
                 None => self.recovery.as_bytes(),
@@ -186,7 +309,7 @@ impl<K: DeviceKeys> Vault<K> {
                 ],
             )?;
         }
-        for &collection in &rotated {
+        for &collection in rotate {
             self.recount(&tx, &membership, collection, &old_keys)?;
         }
         for (collection, body, deleted) in &carry {
@@ -203,10 +326,7 @@ impl<K: DeviceKeys> Vault<K> {
         for (collection, epoch, key) in new_keys {
             self.collection_keys.insert((collection, epoch), key);
         }
-        Ok(Revocation {
-            rotated,
-            carried: carry.len(),
-        })
+        Ok(carry.len())
     }
 
     /// This device's keys to every epoch of `collections` that `membership` has reached, for

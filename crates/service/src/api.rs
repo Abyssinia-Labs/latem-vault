@@ -5,6 +5,7 @@
 
 use std::io::{self, Read, Write};
 
+use openvault_core::membership::Scope;
 use openvault_core::{DeviceId, Kind, Review, Written};
 use zeroize::Zeroizing;
 
@@ -54,6 +55,13 @@ pub enum Request {
         /// Needed only when this device has no admin key.
         recovery_phrase: Option<Zeroizing<String>>,
     },
+    SetScope {
+        device: DeviceId,
+        collection: String,
+        scope: Scope,
+        /// Needed only when this device has no admin key.
+        recovery_phrase: Option<Zeroizing<String>>,
+    },
 }
 
 #[derive(Debug)]
@@ -70,6 +78,14 @@ pub enum Response {
         /// The collections that got a new key.
         rotated: Vec<String>,
         /// Entries the device wrote last, written again under the new keys.
+        carried: u32,
+    },
+    ScopeSet {
+        /// Whether the collection got a new key.
+        rotated: bool,
+        /// Keys of the collection given to the device.
+        granted: u32,
+        /// Entries the device wrote last, written again under the new key.
         carried: u32,
     },
     Error {
@@ -185,13 +201,18 @@ impl Request {
                 recovery_phrase,
             } => frame(0x0b, |w| {
                 w.put(device.as_bytes());
-                match recovery_phrase {
-                    Some(phrase) => {
-                        w.u8(1);
-                        w.str(phrase);
-                    }
-                    None => w.u8(0),
-                }
+                w.phrase(recovery_phrase.as_deref().map(String::as_str));
+            }),
+            Self::SetScope {
+                device,
+                collection,
+                scope,
+                recovery_phrase,
+            } => frame(0x0c, |w| {
+                w.put(device.as_bytes());
+                w.str(collection);
+                w.u8(scope.code());
+                w.phrase(recovery_phrase.as_deref().map(String::as_str));
             }),
         }
     }
@@ -234,11 +255,13 @@ impl Request {
             },
             0x0b => Self::Revoke {
                 device: r.device()?,
-                recovery_phrase: match r.u8()? {
-                    0 => None,
-                    1 => Some(Zeroizing::new(r.string()?)),
-                    _ => return Err(DecodeError::Bad("has phrase")),
-                },
+                recovery_phrase: r.phrase()?,
+            },
+            0x0c => Self::SetScope {
+                device: r.device()?,
+                collection: r.string()?,
+                scope: Scope::from_code(r.u8()?).ok_or(DecodeError::Bad("scope"))?,
+                recovery_phrase: r.phrase()?,
             },
             _ => return Err(DecodeError::Bad("unknown request")),
         };
@@ -323,6 +346,15 @@ impl Response {
                 for name in rotated {
                     w.str(name);
                 }
+                w.put(&carried.to_be_bytes());
+            }),
+            Self::ScopeSet {
+                rotated,
+                granted,
+                carried,
+            } => frame(0x89, |w| {
+                w.u8((*rotated).into());
+                w.put(&granted.to_be_bytes());
                 w.put(&carried.to_be_bytes());
             }),
             Self::Error { code, message } => frame(0x7f, |w| {
@@ -435,6 +467,15 @@ impl Response {
                     carried: u32::from_be_bytes(r.take(4)?.try_into().expect("took 4 bytes")),
                 }
             }
+            0x89 => Self::ScopeSet {
+                rotated: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(DecodeError::Bad("rotated")),
+                },
+                granted: u32::from_be_bytes(r.take(4)?.try_into().expect("took 4 bytes")),
+                carried: u32::from_be_bytes(r.take(4)?.try_into().expect("took 4 bytes")),
+            },
             0x7f => Self::Error {
                 code: match r.u8()? {
                     0x02 => ErrorCode::RecoveryPhraseNeeded,
@@ -526,6 +567,17 @@ impl Writer {
         );
     }
 
+    /// `has phrase (u8) ‖ phrase (str, only if has phrase is 1)`.
+    fn phrase(&mut self, phrase: Option<&str>) {
+        match phrase {
+            Some(phrase) => {
+                self.u8(1);
+                self.str(phrase);
+            }
+            None => self.u8(0),
+        }
+    }
+
     fn str(&mut self, s: &str) {
         let len = u16::try_from(s.len()).expect("names, phrases and messages are short");
         self.put(&len.to_be_bytes());
@@ -565,6 +617,14 @@ impl<'a> Reader<'a> {
 
     fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
+    }
+
+    fn phrase(&mut self) -> Result<Option<Zeroizing<String>>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(Zeroizing::new(self.string()?))),
+            _ => Err(DecodeError::Bad("has phrase")),
+        }
     }
 
     fn device(&mut self) -> Result<DeviceId, DecodeError> {
@@ -719,6 +779,21 @@ mod tests {
             panic!("not a revoke");
         };
         assert_eq!(decoded, device);
+        let Request::SetScope {
+            collection,
+            scope: Scope::Hold,
+            recovery_phrase: Some(_),
+            ..
+        } = round_trip_request(&Request::SetScope {
+            device,
+            collection: "latem".into(),
+            scope: Scope::Hold,
+            recovery_phrase: Some(Zeroizing::new("abandon ability".into())),
+        })
+        else {
+            panic!("not a scope change");
+        };
+        assert_eq!(collection, "latem");
         let Request::Review { device: decoded } = round_trip_request(&Request::Review { device })
         else {
             panic!("not a review");
@@ -788,6 +863,18 @@ mod tests {
         assert_eq!(decoded.secrets[0].1, ["prod/SENTRY_DSN"]);
         assert_eq!(decoded.wrote_last[0].1.len(), 2);
         assert!(decoded.wrote_last[0].1[1].deleted);
+        let Response::ScopeSet {
+            rotated: true,
+            granted: 2,
+            carried: 1,
+        } = round_trip_response(&Response::ScopeSet {
+            rotated: true,
+            granted: 2,
+            carried: 1,
+        })
+        else {
+            panic!("not a scope change");
+        };
         let Response::Revoked { rotated, carried } = round_trip_response(&Response::Revoked {
             rotated: vec!["latem".into()],
             carried: 3,

@@ -408,7 +408,7 @@ fn prompt(question: &str) -> Result<String> {
     Ok(line)
 }
 
-fn scope_label(scope: Scope) -> &'static str {
+pub(crate) fn scope_label(scope: Scope) -> &'static str {
     match scope {
         Scope::Write => "write",
         Scope::Read => "read",

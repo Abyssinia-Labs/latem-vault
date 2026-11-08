@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use openvault_core::{DeviceId, Vault, names};
+use openvault_core::membership::AdminKey as AdminKeyTrait;
+use openvault_core::{DeviceId, Revocation, Vault, names};
 use openvault_crypto::RecoveryKey;
 use openvault_keystore::{AdminKey, Keys};
 use openvault_net::EndpointKey;
@@ -117,39 +118,83 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
         Request::Revoke {
             device,
             recovery_phrase,
-        } => revoke(
-            vault,
-            cx.admin_key,
+        } => {
+            let name = device_name(vault, device);
+            let revocation = as_admin(
+                vault,
+                cx.admin_key,
+                recovery_phrase.as_deref().map(String::as_str),
+                "revoking a device",
+                format!("remove {name} from your vault"),
+                |vault, admin| vault.revoke_device(device, &admin),
+            )?;
+            revoked(vault, &revocation)?
+        }
+        Request::SetScope {
             device,
-            recovery_phrase.as_ref().map(|phrase| phrase.as_str()),
-        )?,
+            collection,
+            scope,
+            recovery_phrase,
+        } => {
+            let id = vault.collection(&collection)?;
+            let name = device_name(vault, device);
+            // Checked before asking for Touch ID or 24 words.
+            if vault
+                .membership()
+                .is_some_and(|m| m.scope(device, id) == scope)
+            {
+                bail!("{name} already has that scope on {collection}");
+            }
+            let change = as_admin(
+                vault,
+                cx.admin_key,
+                recovery_phrase.as_deref().map(String::as_str),
+                "changing a scope",
+                format!("change what {name} may do with {collection}"),
+                |vault, admin| vault.set_scope(device, id, scope, &admin),
+            )?;
+            Response::ScopeSet {
+                rotated: change.rotated,
+                granted: u32::try_from(change.granted).unwrap_or(u32::MAX),
+                carried: u32::try_from(change.carried).unwrap_or(u32::MAX),
+            }
+        }
     })
 }
 
-/// Signs with this device's admin key when it has one, which asks for Touch ID, and with the
-/// recovery key otherwise.
-fn revoke(
+/// Runs `f` with an admin signature: this device's admin key when it has one, which asks for
+/// Touch ID with `reason`, and otherwise the recovery key from `recovery_phrase`. Without a
+/// phrase it fails with [`RecoveryPhraseNeeded`] for `action`.
+fn as_admin<T>(
     vault: &mut Vault<Keys>,
     admin_key: &Path,
-    device: DeviceId,
     recovery_phrase: Option<&str>,
-) -> Result<Response> {
-    let revocation = if let Some(admin) = listed_admin_key(vault, admin_key)? {
-        let name = vault
-            .device_name(device)
-            .ok()
-            .flatten()
-            .map_or_else(|| device.to_string(), |name| name.name);
-        let admin = admin.with_reason(format!("remove {name} from your vault"));
-        vault.revoke_device(device, &admin)?
-    } else {
-        let phrase = recovery_phrase.ok_or(RecoveryPhraseNeeded("revoking a device"))?;
-        let recovery = RecoveryKey::from_phrase(phrase)?;
-        if !vault.is_recovery_key(&recovery) {
-            bail!("that recovery phrase belongs to another vault");
-        }
-        vault.revoke_device(device, &recovery.admin_signing_key())?
-    };
+    action: &'static str,
+    reason: String,
+    f: impl FnOnce(&mut Vault<Keys>, &dyn AdminKeyTrait) -> openvault_core::Result<T>,
+) -> Result<T> {
+    if let Some(admin) = listed_admin_key(vault, admin_key)? {
+        return Ok(f(vault, &admin.with_reason(reason))?);
+    }
+    let phrase = recovery_phrase.ok_or(RecoveryPhraseNeeded(action))?;
+    let recovery = RecoveryKey::from_phrase(phrase)?;
+    if !vault.is_recovery_key(&recovery) {
+        bail!("that recovery phrase belongs to another vault");
+    }
+    Ok(f(vault, &recovery.admin_signing_key())?)
+}
+
+/// A device's name, or its id if the name doesn't open.
+fn device_name(vault: &Vault<Keys>, device: DeviceId) -> String {
+    vault
+        .device_name(device)
+        .ok()
+        .flatten()
+        .map_or_else(|| device.to_string(), |name| name.name)
+}
+
+/// The response to a revocation, with the rotated collections by name.
+fn revoked(vault: &Vault<Keys>, revocation: &Revocation) -> Result<Response> {
     let names: Vec<_> = vault.collections()?;
     let rotated = revocation
         .rotated

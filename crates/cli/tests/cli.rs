@@ -924,6 +924,64 @@ fn join(admin: &Device, joiner: &Device) {
     assert!(joining.0.wait().unwrap().success());
 }
 
+#[test]
+fn scopes_change_with_an_admin_signature() {
+    let admin = Device::new();
+    admin.create_collection("ssh");
+    let joiner = Device::empty();
+    join(&admin, &joiner);
+    let signed = |args: &[&str]| {
+        let output = admin.run_with_stdin(args, format!("{}\n", admin.phrase).as_bytes());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let out = signed(&["scope", "Desktop", "ssh", "read"]);
+    assert!(out.contains("Desktop now has read on ssh."), "{out}");
+    assert!(out.contains("ssh's keys reach Desktop"), "{out}");
+    let out = signed(&["scope", "Desktop", "latem", "write"]);
+    assert_eq!(out, "Desktop now has write on latem.\n");
+    let out = signed(&["scope", "Desktop", "latem", "read"]);
+    assert!(
+        out.contains(
+            "latem has a new key, so what Desktop signs with the old one no longer counts"
+        ),
+        "{out}"
+    );
+    let out = signed(&["scope", "Desktop", "ssh", "none"]);
+    assert!(
+        out.contains("Desktop no longer has a scope on ssh.")
+            && out.contains("nothing written from now on reaches Desktop"),
+        "{out}"
+    );
+
+    // Refused before any phrase is asked for.
+    assert!(
+        admin
+            .fails(&["scope", "Desktop", "ssh", "none"])
+            .contains("already has that scope")
+    );
+    assert!(
+        admin
+            .fails(&["scope", "Nobody", "ssh", "read"])
+            .contains("no device is called Nobody")
+    );
+    assert!(
+        admin
+            .fails(&["scope", "Desktop", "nope", "read"])
+            .contains("no collection nope")
+    );
+    assert!(
+        admin
+            .fails(&["scope", "test", "ssh", "read"])
+            .contains("is this device")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn services_sync_a_joined_device() {

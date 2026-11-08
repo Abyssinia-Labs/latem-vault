@@ -3,7 +3,7 @@
 mod revoke;
 mod sync;
 
-pub use revoke::{Review, Revocation, Written};
+pub use revoke::{Review, Revocation, ScopeChange, Written};
 pub use sync::Received;
 
 use std::collections::HashMap;
@@ -2228,6 +2228,113 @@ mod tests {
                 Err(Error::CantRevoke(_))
             ));
         }
+    }
+
+    #[test]
+    fn scopes_go_up_with_their_keys_and_down_with_new_ones() {
+        let s = setup();
+        let joiner_keys = SoftwareKeys::generate();
+        let (mut admin, mut joined, latem, _) = joined_pair(&s, &joiner_keys);
+        let ssh = admin.collection("ssh").unwrap();
+        admin
+            .set(ssh, "github/KEY", Kind::Secret, b"ssh-ed25519")
+            .unwrap();
+        let device = joined.device_id();
+
+        // Read on ssh brings its key.
+        let change = admin
+            .set_scope(device, ssh, Scope::Read, &s.admin())
+            .unwrap();
+        assert_eq!(
+            (change.rotated, change.granted, change.carried),
+            (false, 1, 0)
+        );
+        send_log(&admin, &mut joined);
+        send_missing(&admin, &mut joined);
+        assert_eq!(
+            value(joined.get(ssh, "github/KEY").unwrap()),
+            Some(b"ssh-ed25519".to_vec())
+        );
+
+        // Write on latem needs no new key.
+        let change = admin
+            .set_scope(device, latem, Scope::Write, &s.admin())
+            .unwrap();
+        assert_eq!((change.rotated, change.granted), (false, 0));
+        send_log(&admin, &mut joined);
+        joined
+            .set(latem, "prod/REGION", Kind::Var, b"from the desktop")
+            .unwrap();
+        send_missing(&joined, &mut admin);
+
+        // Back to read: latem gets a new key, and the admin keeps its last write.
+        let change = admin
+            .set_scope(device, latem, Scope::Read, &s.admin())
+            .unwrap();
+        assert_eq!((change.rotated, change.carried), (true, 1));
+        let region = admin.get(latem, "prod/REGION").unwrap().unwrap();
+        assert_eq!(
+            (&region.value[..], region.version.device),
+            (&b"from the desktop"[..], admin.device_id())
+        );
+        send_log(&admin, &mut joined);
+        send_missing(&admin, &mut joined);
+        assert_eq!(
+            value(joined.get(latem, "prod/REGION").unwrap()),
+            Some(b"from the desktop".to_vec())
+        );
+        assert!(matches!(
+            joined.set(latem, "prod/X", Kind::Var, b"1"),
+            Err(Error::ReadOnly)
+        ));
+
+        // None on ssh: a new key it doesn't get.
+        let change = admin
+            .set_scope(device, ssh, Scope::None, &s.admin())
+            .unwrap();
+        assert!(change.rotated);
+        assert_eq!(admin.membership().unwrap().epoch(ssh), Some(1));
+        assert!(!grants(&admin).iter().any(|grant| {
+            grant.collection() == ssh && grant.epoch() == 1 && grant.recipient() == Some(device)
+        }));
+
+        for (device, scope) in [(device, Scope::None), (admin.device_id(), Scope::Read)] {
+            assert!(matches!(
+                admin.set_scope(device, ssh, scope, &s.admin()),
+                Err(Error::CantChangeScope(_))
+            ));
+        }
+    }
+
+    /// After a key change, a new reader still needs the older keys, since most entries are
+    /// still sealed with them.
+    #[test]
+    fn a_device_that_joins_after_a_key_change_gets_the_older_keys() {
+        let s = setup();
+        let first_keys = SoftwareKeys::generate();
+        let (mut admin, first, latem, _) = joined_pair(&s, &first_keys);
+        admin.revoke_device(first.device_id(), &s.admin()).unwrap();
+        admin.set(latem, "prod/NEW", Kind::Var, b"after").unwrap();
+        assert_eq!(admin.membership().unwrap().epoch(latem), Some(1));
+
+        let second_keys = SoftwareKeys::generate();
+        let (mut second, _) = join_device(
+            &s,
+            &mut admin,
+            &second_keys,
+            "second.db",
+            &[(latem, Scope::Read)],
+        );
+        send_missing(&admin, &mut second);
+        assert_eq!(
+            value(second.get(latem, "prod/SENTRY_DSN").unwrap()),
+            Some(b"https://sentry".to_vec()),
+            "written under the first key"
+        );
+        assert_eq!(
+            value(second.get(latem, "prod/NEW").unwrap()),
+            Some(b"after".to_vec())
+        );
     }
 
     #[test]

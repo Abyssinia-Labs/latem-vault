@@ -18,7 +18,9 @@ use std::path::PathBuf;
 pub use ids::{CollectionId, DeviceId, VaultId};
 pub use keys::{DeviceKeys, SoftwareKeys, transport_seed};
 pub use record::{Kind, Version};
-pub use store::{CollectionInfo, Entry, EntryInfo, Received, Review, Revocation, Vault, Written};
+pub use store::{
+    CollectionInfo, Entry, EntryInfo, Received, Review, Revocation, ScopeChange, Vault, Written,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -68,6 +70,8 @@ pub enum Error {
     NoLog,
     #[error("can't revoke that device: {0}")]
     CantRevoke(&'static str),
+    #[error("can't change that device's scope: {0}")]
+    CantChangeScope(&'static str),
     #[error("this vault already has a membership log")]
     LogExists,
     #[error("that recovery phrase belongs to another vault")]

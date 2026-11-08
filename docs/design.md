@@ -121,7 +121,7 @@ Entry names are paths within the collection, for example `prod/SENTRY_DSN` or `r
 
 ## 7. Cryptography
 
-Only audited libraries; no custom primitives. The one exception is the PAKE: no Rust PAKE crate has been audited, so OpenVault uses RustCrypto's `spake2`, and the external audit covers it ([join.md](spec/join.md#pake)).
+Only audited libraries; no custom primitives. There are two exceptions, because no Rust crate for either has been audited: the PAKE uses RustCrypto's `spake2` ([join.md](spec/join.md#pake)), and passphrases use RustCrypto's `argon2` ([crypto.md](spec/crypto.md#passphrases)). The external audit covers both.
 
 | Purpose | Primitive |
 | --- | --- |
@@ -130,6 +130,7 @@ Only audited libraries; no custom primitives. The one exception is the PAKE: no 
 | Records and chunks | XChaCha20-Poly1305 |
 | Hashing and content addressing | BLAKE3 |
 | Pairing | SPAKE2 keyed by a 6-digit code |
+| Key files protected by a passphrase | Argon2id |
 | Secrets in memory | `zeroize` and `secrecy` types |
 
 ### Device keys

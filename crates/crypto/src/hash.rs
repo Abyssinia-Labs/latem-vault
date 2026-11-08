@@ -30,6 +30,7 @@ pub mod contexts {
     pub const LOCAL_INDEX: &str = "openvault v1 local index key";
     pub const LOCAL_CACHE: &str = "openvault v1 local cache key";
     pub const TRANSPORT: &str = "openvault v1 transport key";
+    pub const PASSPHRASE: &str = "openvault v1 passphrase key";
 }
 
 #[cfg(test)]

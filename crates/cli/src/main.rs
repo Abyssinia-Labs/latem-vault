@@ -36,7 +36,8 @@ struct Cli {
 enum Command {
     /// Create a vault on this device and show its recovery phrase.
     Init {
-        /// Where this device's keys live [default: the Secure Enclave when this Mac has one]
+        /// Where this device's keys live [default: the Secure Enclave when this Mac has one,
+        /// otherwise a key file protected by a passphrase]
         #[arg(long, value_enum)]
         keys: Option<KeysArg>,
         /// This device's name in the vault [default: this computer's host name]
@@ -125,6 +126,10 @@ struct KindArg {
 #[derive(Clone, Copy, ValueEnum)]
 enum KeysArg {
     SecureEnclave,
+    /// A key file protected by a passphrase, asked for by every command
+    Passphrase,
+    /// A key file protected only by its permissions, for devices that open the vault with
+    /// nobody there to type a passphrase
     Software,
 }
 
@@ -145,6 +150,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         Command::Init { keys, name } => {
             let backend = match keys {
                 Some(KeysArg::SecureEnclave) => Backend::SecureEnclave,
+                Some(KeysArg::Passphrase) => Backend::Passphrase,
                 Some(KeysArg::Software) => Backend::Software,
                 None => Backend::best(),
             };
@@ -230,17 +236,79 @@ impl Home {
                 self.0.display()
             );
         }
-        let keys = Keys::load(&self.keys())?;
+        let keys = load_keys(&self.keys())?;
         Ok(Vault::open(&self.vault(), keys)?)
     }
+}
+
+/// Loads this device's keys, asking for the passphrase if the key file is protected by one.
+fn load_keys(path: &Path) -> Result<Keys> {
+    const ATTEMPTS: usize = 3;
+    match Keys::load(path) {
+        Err(openvault_keystore::Error::NeedsPassphrase) => {}
+        keys => return Ok(keys?),
+    }
+    if !has_terminal() {
+        bail!(
+            "this device's keys are protected by a passphrase, and there's no terminal to type \
+             it in"
+        );
+    }
+    for attempt in 1..=ATTEMPTS {
+        let passphrase = prompt_passphrase("Passphrase for this device's keys (hidden): ")?;
+        match Keys::load_with_passphrase(path, &passphrase) {
+            Err(openvault_keystore::Error::WrongPassphrase) if attempt < ATTEMPTS => {
+                eprintln!("Wrong passphrase.");
+            }
+            keys => return Ok(keys?),
+        }
+    }
+    unreachable!("the last attempt returns")
+}
+
+/// Asks for a new passphrase twice, before any keys are made.
+fn read_new_passphrase() -> Result<Zeroizing<String>> {
+    if !has_terminal() {
+        bail!(
+            "there's no terminal to type a passphrase in; `--keys software` makes keys without one"
+        );
+    }
+    let passphrase = prompt_passphrase("New passphrase for this device's keys (hidden): ")?;
+    openvault_keystore::check_passphrase(&passphrase)?;
+    let again = prompt_passphrase("The same passphrase again (hidden): ")?;
+    if *again != *passphrase {
+        bail!("the passphrases don't match");
+    }
+    Ok(passphrase)
+}
+
+/// Asks on the terminal itself rather than stdin, so commands that read stdin, such as
+/// `import-env -`, still work.
+fn prompt_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
+    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
+}
+
+/// Whether there's a terminal to ask for a passphrase on, which jobs and containers lack.
+fn has_terminal() -> bool {
+    #[cfg(unix)]
+    return fs::File::open("/dev/tty").is_ok();
+    #[cfg(not(unix))]
+    return true;
 }
 
 fn init(home: &Home, backend: Backend, name: &str) -> Result<()> {
     if home.vault().exists() {
         bail!("there is already a vault in {}", home.0.display());
     }
+    let passphrase = match backend {
+        Backend::Passphrase => Some(read_new_passphrase()?),
+        _ => None,
+    };
     create_private_dir(&home.0)?;
-    let keys = Keys::create(&home.keys(), backend)?;
+    let keys = match &passphrase {
+        Some(passphrase) => Keys::create_with_passphrase(&home.keys(), passphrase)?,
+        None => Keys::create(&home.keys(), backend)?,
+    };
     let remove_files = || {
         let _ = fs::remove_file(home.keys());
         let _ = fs::remove_file(home.admin());
@@ -252,7 +320,7 @@ fn init(home: &Home, backend: Backend, name: &str) -> Result<()> {
         Backend::SecureEnclave => {
             Some(AdminKey::create(&home.admin()).inspect_err(|_| remove_files())?)
         }
-        Backend::Software => None,
+        Backend::Software | Backend::Passphrase => None,
     };
     let recovery = RecoveryKey::generate();
     let admin_key = admin.as_ref().map(|admin| admin.verifying_key());
@@ -263,6 +331,10 @@ fn init(home: &Home, backend: Backend, name: &str) -> Result<()> {
         Backend::SecureEnclave => (
             "Secure Enclave".to_owned(),
             "Secure Enclave, asks for Touch ID or your password",
+        ),
+        Backend::Passphrase => (
+            format!("protected by a passphrase, in {}", home.keys().display()),
+            "your recovery phrase only",
         ),
         Backend::Software => (
             format!("software, in {}", home.keys().display()),
@@ -292,8 +364,11 @@ fn init(home: &Home, backend: Backend, name: &str) -> Result<()> {
     println!("Write these 24 words down and keep them offline, on paper or in the Passwords app.");
     println!("They are shown only once. With them you can recover every collection if this");
     println!("device is lost.");
-    if backend == Backend::Software {
+    if backend != Backend::SecureEnclave {
         println!("This device has no admin key, so creating a collection asks for them too.");
+    }
+    if backend == Backend::Passphrase {
+        println!("If you forget this device's passphrase, treat the device as lost.");
     }
     Ok(())
 }

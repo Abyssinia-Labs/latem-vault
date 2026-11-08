@@ -13,7 +13,7 @@ Milestone M1, one device, is done: secrets and variables work on a single machin
 ```sh
 cargo install --locked --path crates/cli         # the dependency versions in Cargo.lock
 
-openvault init                                   # shows the recovery phrase once
+openvault init                                   # shows the recovery phrase once; asks for a passphrase without a Secure Enclave
 openvault collections create latem               # Touch ID; the recovery phrase without a Secure Enclave
 openvault set latem/prod/SENTRY_DSN --secret     # value from stdin; hidden when typed
 openvault set latem/prod/REGION --var
@@ -42,7 +42,7 @@ ssh mini 'cat ~/.latem/secrets.env' | openvault import-env - --collection latem 
 
 Every name becomes a secret unless it is given with `--var`. The file is read as latem reads it: no `export`, no `$` expansion, and in double quotes only `\n`, `\r`, `\t`, `\\` and `\"`. Nothing is written if any line fails to parse, or if a name already exists (unless you pass `--overwrite`).
 
-The vault and this device's key file are kept in `~/.openvault`; set `OPENVAULT_HOME` to use another directory. On a Mac with a Secure Enclave, the device keys stay in it. Elsewhere they are kept in the key file, which only you can read.
+The vault and this device's key file are kept in `~/.openvault`; set `OPENVAULT_HOME` to use another directory. On a Mac with a Secure Enclave, the device keys stay in it. Elsewhere they are kept in the key file, which only you can read, sealed with a passphrase that every command asks for on the terminal. `init --keys software` leaves the passphrase out, for a device that opens the vault with nobody there to type one, such as a container.
 
 ## Development
 

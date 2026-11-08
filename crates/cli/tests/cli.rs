@@ -1,8 +1,14 @@
 //! Runs the `openvault` binary against a temporary `OPENVAULT_HOME`. Keys are software keys,
-//! so these tests run anywhere; the keystore crate tests the Secure Enclave.
+//! so these tests run anywhere; the keystore crate tests the Secure Enclave and passphrases.
 
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
+
+use openvault_core::Vault;
+use openvault_crypto::RecoveryKey;
+use openvault_keystore::Keys;
 
 struct Device {
     home: tempfile::TempDir,
@@ -41,6 +47,16 @@ impl Device {
             .args(args)
             .env("OPENVAULT_HOME", self.home.path())
             .stdin(Stdio::null());
+        // No controlling terminal, as in CI, so a command that asks for a passphrase fails
+        // instead of waiting for someone to type it.
+        #[cfg(unix)]
+        // SAFETY: setsid is async-signal-safe, and nothing else runs before exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
         command
     }
 
@@ -185,6 +201,36 @@ fn creating_a_collection_asks_for_the_recovery_phrase() {
     );
     assert!(!bad_name.home.path().join("vault.db").exists());
     assert!(!bad_name.home.path().join("keys").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn passphrase_keys_need_a_terminal() {
+    let device = Device::empty();
+    let error = device.fails(&["init", "--keys", "passphrase", "--name", "test"]);
+    assert!(error.contains("no terminal"), "{error}");
+    assert!(!device.home.path().join("keys").exists());
+
+    // The vault `init` makes on a terminal.
+    let keys = Keys::create_with_passphrase(
+        &device.home.path().join("keys"),
+        "correct horse battery staple",
+    )
+    .unwrap();
+    let recovery = RecoveryKey::generate();
+    Vault::create(
+        &device.home.path().join("vault.db"),
+        keys,
+        &recovery,
+        "test",
+        None,
+    )
+    .unwrap();
+    let error = device.fails(&["collections"]);
+    assert!(
+        error.contains("protected by a passphrase") && error.contains("no terminal"),
+        "{error}"
+    );
 }
 
 #[test]

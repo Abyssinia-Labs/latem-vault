@@ -70,7 +70,7 @@ Let `K` be the 32-byte key that `finish` returns. From it:
 
 **Audit.**
 - No Rust PAKE crate has had an independent audit, including this one.
-- It is the one exception to the audited-libraries rule in design §7.
+- It is one of two exceptions to the audited-libraries rule in design §7. The other is `argon2`, for passphrases (crypto.md, passphrases).
 - The external audit planned before the hosted launch covers it.
 
 ## Messages

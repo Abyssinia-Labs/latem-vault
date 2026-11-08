@@ -13,6 +13,7 @@ Every format here is versioned by its labels (`openvault v1 …`). A change to a
 | Signatures | Ed25519 (strict verification); ECDSA P-256 with SHA-256 | `ed25519-dalek`, `p256` |
 | Hashing, key derivation | BLAKE3 (`hash`, `keyed_hash`, `derive_key`) | `blake3` |
 | Recovery phrase | BIP-39, English, 24 words | `bip39` |
+| Passphrases ([keystore.md](keystore.md#passphrases)) | Argon2id (RFC 9106) | `argon2` (not audited, below) |
 | Pairing ([join.md](join.md)) | SPAKE2 over Ed25519 | `spake2` (not audited, see join.md) |
 
 Key wrapping uses HPKE, as recommended in design §19.1.
@@ -57,6 +58,30 @@ Suite: KEM as above, KDF HKDF-SHA256 (`0x0001`), AEAD ChaCha20-Poly1305 (`0x0003
 `context` identifies what is wrapped: vault id, collection id and key epoch, encoded as in [records.md](records.md#collection-keys). Binding it into `info` means a wrapped key copied to another collection or epoch doesn't unwrap. The vault's names key uses the context `"names key" ‖ 0x00 ‖ vault id` ([membership.md](membership.md#names-key)). At 26 bytes it can't be confused with a collection context, which is always 36.
 
 Devices with a Secure Enclave or TPM use P-256; devices without one, and the recovery key, use X25519.
+
+## Passphrases
+
+A passphrase-protected key file (keystore.md, key file) is sealed with:
+
+```
+key = BLAKE3.derive_key("openvault v1 passphrase key", Argon2id(passphrase, salt, cost))
+```
+
+- Argon2id is version `0x13`, with a 32-byte output and no secret or associated data.
+- The salt is 16 random bytes.
+- The cost is stored with the salt, so that new files can use a higher one.
+  - New files use RFC 9106's second recommended option: 64 MiB of memory, 3 passes and 4 lanes.
+  - Readers refuse more than 1 GiB, 16 passes or 16 lanes before running Argon2id, so a damaged file can't make opening it use unbounded memory or time.
+  - On an M-series MacBook, one derivation takes about 70 ms.
+- The memory Argon2id fills is wiped afterwards.
+
+**Test vector.** Passphrase `correct horse battery staple`, salt `02` × 16 and the default cost give the key `2882f895c36955f501c6b434ce888dff79310a1fa7dce2a8b4f8292d0ba2b107`. Like the other vectors, it comes from this implementation and is pinned in its tests.
+
+**Audit.**
+- No Rust Argon2 crate has had an independent audit.
+- RustCrypto's `argon2` is the second exception to the audited-libraries rule (design §7), after `spake2`, and the external audit covers it too.
+- Its Argon2id output is checked against RFC 9106's test vector (§5.3).
+- A flaw in it would weaken only how well a passphrase protects a copied key file.
 
 ## Signatures
 

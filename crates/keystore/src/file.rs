@@ -7,7 +7,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use openvault_core::SoftwareKeys;
-use openvault_crypto::{SigningKey, SymmetricKey, UnwrapKey, WrappedKey};
+use openvault_crypto::passphrase::SALT_LEN;
+use openvault_crypto::{
+    PassphraseCost, SigningKey, SymmetricKey, UnwrapKey, WrappedKey, passphrase_key, random_bytes,
+};
 use zeroize::Zeroizing;
 
 use crate::{Backend, Error, Keys, Result};
@@ -16,6 +19,14 @@ const MAGIC: &[u8] = b"openvault v1 keys\0";
 const ADMIN_MAGIC: &[u8] = b"openvault v1 admin key\0";
 const KIND_SOFTWARE: u8 = 0x01;
 const KIND_SECURE_ENCLAVE: u8 = 0x02;
+const KIND_PASSPHRASE: u8 = 0x03;
+/// A software body: wrapping private key, signing private key and local key.
+const SOFTWARE_LEN: usize = 34 + 33 + 32;
+/// The software body sealed with XChaCha20-Poly1305: nonce, ciphertext and tag.
+const SEALED_SOFTWARE_LEN: usize = 24 + SOFTWARE_LEN + 16;
+/// The shortest passphrase a new key file accepts, in characters.
+const MIN_PASSPHRASE_CHARS: usize = 12;
+const MAX_PASSPHRASE_LEN: usize = 1024;
 /// Key files are a few hundred bytes; anything much larger isn't one.
 const MAX_LEN: usize = 16 * 1024;
 
@@ -34,6 +45,7 @@ pub(crate) fn create(path: &Path, backend: Backend) -> Result<Keys> {
     }
     let contents = match backend {
         Backend::Software => encode_software(&SoftwareKeys::generate()),
+        Backend::Passphrase => return Err(Error::NeedsPassphrase),
         #[cfg(target_os = "macos")]
         Backend::SecureEnclave => {
             encode_enclave(&crate::secure_enclave::SecureEnclaveKeys::generate()?)
@@ -43,13 +55,37 @@ pub(crate) fn create(path: &Path, backend: Backend) -> Result<Keys> {
     };
     write_new(path, &contents)?;
     // Loading the file back proves the keys restore before anything is encrypted to them.
-    load(path).inspect_err(|_| {
+    load(path, None).inspect_err(|_| {
         let _ = fs::remove_file(path);
     })
 }
 
-pub(crate) fn load(path: &Path) -> Result<Keys> {
-    decode(&read_private(path)?)
+pub(crate) fn create_with_passphrase(path: &Path, passphrase: &str) -> Result<Keys> {
+    check_passphrase(passphrase)?;
+    let contents = encode_passphrase(&SoftwareKeys::generate(), passphrase)?;
+    write_new(path, &contents)?;
+    load(path, Some(passphrase)).inspect_err(|_| {
+        let _ = fs::remove_file(path);
+    })
+}
+
+/// Loads the keys in `path`, using `passphrase` if the file is protected by one.
+pub(crate) fn load(path: &Path, passphrase: Option<&str>) -> Result<Keys> {
+    decode(&read_private(path)?, passphrase)
+}
+
+pub(crate) fn check_passphrase(passphrase: &str) -> Result<()> {
+    if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(Error::Passphrase(
+            "the passphrase must be at least 12 characters",
+        ));
+    }
+    if passphrase.len() > MAX_PASSPHRASE_LEN {
+        return Err(Error::Passphrase(
+            "the passphrase must be at most 1024 bytes",
+        ));
+    }
+    Ok(())
 }
 
 /// Writes a new admin key file: the magic, the Secure Enclave kind, and the key's blob
@@ -105,7 +141,7 @@ fn read_private(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     Ok(contents)
 }
 
-fn decode(contents: &[u8]) -> Result<Keys> {
+fn decode(contents: &[u8], passphrase: Option<&str>) -> Result<Keys> {
     let body = contents
         .strip_prefix(MAGIC)
         .ok_or(Error::Format("unknown format"))?;
@@ -113,13 +149,29 @@ fn decode(contents: &[u8]) -> Result<Keys> {
     let mut reader = Reader(body);
     match kind {
         KIND_SOFTWARE => {
-            let unwrap = UnwrapKey::from_secret_bytes(reader.take(34)?)?;
-            let signing = SigningKey::from_secret_bytes(reader.take(33)?)?;
-            let local = SymmetricKey::from_bytes(reader.take(32)?.try_into().expect("took 32"));
+            let keys = decode_software(reader.take(SOFTWARE_LEN)?)?;
             reader.finish()?;
-            Ok(Keys::Software(SoftwareKeys::from_parts(
-                unwrap, signing, local,
-            )))
+            Ok(Keys::Software(keys))
+        }
+        KIND_PASSPHRASE => {
+            let cost = PassphraseCost {
+                memory_kib: reader.u32()?,
+                passes: reader.u32()?,
+                lanes: reader.u32()?,
+            };
+            let salt: [u8; SALT_LEN] = reader.take(SALT_LEN)?.try_into().expect("took 16");
+            let sealed = reader.take(SEALED_SOFTWARE_LEN)?;
+            reader.finish()?;
+            // Checked before asking for the passphrase, which a damaged file can't use.
+            cost.check()
+                .map_err(|_| Error::Format("unsupported passphrase cost"))?;
+            let passphrase = passphrase.ok_or(Error::NeedsPassphrase)?;
+            let key = passphrase_key(passphrase.as_bytes(), &salt, cost)?;
+            let header = &contents[..contents.len() - sealed.len()];
+            let body = key
+                .open(header, sealed)
+                .map_err(|_| Error::WrongPassphrase)?;
+            Ok(Keys::Passphrase(decode_software(&body)?))
         }
         KIND_SECURE_ENCLAVE => {
             let blobs = EnclaveBlobs {
@@ -146,15 +198,48 @@ fn restore_enclave(_: &EnclaveBlobs) -> Result<Keys> {
     Err(Error::Unavailable(Backend::SecureEnclave))
 }
 
-fn encode_software(keys: &SoftwareKeys) -> Zeroizing<Vec<u8>> {
+/// Decodes a software body: the kind `0x01` body, or the plaintext of a kind `0x03` one.
+fn decode_software(body: &[u8]) -> Result<SoftwareKeys> {
+    let mut reader = Reader(body);
+    let unwrap = UnwrapKey::from_secret_bytes(reader.take(34)?)?;
+    let signing = SigningKey::from_secret_bytes(reader.take(33)?)?;
+    let local = SymmetricKey::from_bytes(reader.take(32)?.try_into().expect("took 32"));
+    reader.finish()?;
+    Ok(SoftwareKeys::from_parts(unwrap, signing, local))
+}
+
+fn encode_software_body(keys: &SoftwareKeys) -> Zeroizing<Vec<u8>> {
     let (unwrap, signing, local) = keys.parts();
-    let mut out = Zeroizing::new(Vec::with_capacity(MAGIC.len() + 1 + 34 + 33 + 32));
-    out.extend_from_slice(MAGIC);
-    out.push(KIND_SOFTWARE);
+    let mut out = Zeroizing::new(Vec::with_capacity(SOFTWARE_LEN));
     out.extend_from_slice(&unwrap.to_secret_bytes());
     out.extend_from_slice(&signing.to_secret_bytes());
     out.extend_from_slice(local.as_bytes());
     out
+}
+
+fn encode_software(keys: &SoftwareKeys) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(MAGIC.len() + 1 + SOFTWARE_LEN));
+    out.extend_from_slice(MAGIC);
+    out.push(KIND_SOFTWARE);
+    out.extend_from_slice(&encode_software_body(keys));
+    out
+}
+
+/// The software body sealed under a key derived from `passphrase`, with everything before it
+/// as the AAD (keystore.md, key file).
+fn encode_passphrase(keys: &SoftwareKeys, passphrase: &str) -> Result<Vec<u8>> {
+    let cost = PassphraseCost::DEFAULT;
+    let salt = random_bytes::<SALT_LEN>();
+    let mut out = MAGIC.to_vec();
+    out.push(KIND_PASSPHRASE);
+    for value in [cost.memory_kib, cost.passes, cost.lanes] {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+    out.extend_from_slice(salt.as_ref());
+    let key = passphrase_key(passphrase.as_bytes(), &salt, cost)?;
+    let sealed = key.seal(&out, &encode_software_body(keys));
+    out.extend_from_slice(&sealed);
+    Ok(out)
 }
 
 #[cfg(target_os = "macos")]
@@ -196,6 +281,12 @@ impl<'a> Reader<'a> {
         let (field, rest) = self.0.split_at(len);
         self.0 = rest;
         Ok(field)
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("took 4"),
+        ))
     }
 
     /// A field with a 2-byte big-endian length prefix.

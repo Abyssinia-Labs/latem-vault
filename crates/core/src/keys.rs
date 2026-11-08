@@ -1,9 +1,17 @@
+use openvault_crypto::hash::{contexts, derive_key};
 use openvault_crypto::{
     Signature, SignatureContext, SigningKey, SymmetricKey, UnwrapKey, VerifyingKey, WrapKey,
     WrappedKey,
 };
+use zeroize::Zeroizing;
 
 use crate::Result;
+
+/// The Ed25519 seed of the device's transport key, its iroh identity, derived from the local
+/// key (records.md, local store).
+pub fn transport_seed(keys: &(impl DeviceKeys + ?Sized)) -> Zeroizing<[u8; 32]> {
+    derive_key(contexts::TRANSPORT, keys.local_key().as_bytes())
+}
 
 /// A device's keys, wherever they live: in memory, a file, the Secure Enclave or a TPM.
 ///

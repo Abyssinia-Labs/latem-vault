@@ -1,0 +1,23 @@
+[package]
+name = "openvault-service"
+description = "The OpenVault service: holds the vault open, runs the endpoint, and answers the CLI on a local socket."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+libc = "0.2.191"
+openvault-core = { path = "../core" }
+openvault-crypto = { path = "../crypto" }
+openvault-keystore = { path = "../keystore" }
+openvault-net = { path = "../net" }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+tracing = "0.1"
+zeroize = "1.9"
+
+[dev-dependencies]
+tempfile = "3.27.0"

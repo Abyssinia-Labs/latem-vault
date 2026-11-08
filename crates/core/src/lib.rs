@@ -13,7 +13,7 @@ mod store;
 use std::path::PathBuf;
 
 pub use ids::{CollectionId, DeviceId, VaultId};
-pub use keys::{DeviceKeys, SoftwareKeys};
+pub use keys::{DeviceKeys, SoftwareKeys, transport_seed};
 pub use record::{Kind, Version};
 pub use store::{CollectionInfo, Entry, EntryInfo, Vault};
 

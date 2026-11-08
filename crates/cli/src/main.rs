@@ -1,7 +1,9 @@
 //! The `openvault` command (design §14).
 //!
 //! Everything for this device lives in one directory, `~/.openvault` unless `OPENVAULT_HOME`
-//! names another: the key file (`keys`) and the vault database (`vault.db`).
+//! names another: the key file (`keys`), the vault database (`vault.db`) and, while
+//! `openvault service` runs, its socket (`service.sock`). Commands go through the service when
+//! it runs, and open the vault themselves otherwise.
 
 mod env_file;
 
@@ -14,11 +16,14 @@ use std::process::{self, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use openvault_core::membership::{self, AdminKey as _};
+use openvault_core::membership::AdminKey as _;
 use openvault_core::record::MAX_VALUE_LEN;
 use openvault_core::{Kind, Vault, names};
 use openvault_crypto::RecoveryKey;
 use openvault_keystore::{AdminKey, Backend, Keys};
+use openvault_service::api::{DeviceSummary, ErrorCode, Item, Listed, Request, Response, Value};
+use openvault_service::handler::{self, unexpected};
+use openvault_service::{ADMIN_KEY, KEYS, SOCKET, VAULT, default_device_name};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -86,6 +91,11 @@ enum Command {
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<OsString>,
     },
+    /// List this vault's devices, and which of them are on this network.
+    Devices,
+    /// Hold the vault open, find this vault's other devices on the local network, and answer
+    /// other commands, so a passphrase is typed once. Runs until Ctrl-C.
+    Service,
     /// Import a NAME=value file, such as latem's secrets.env, into a folder. Every name is
     /// imported as a secret unless given with --var.
     ImportEnv {
@@ -156,9 +166,11 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             };
             init(&home, backend, &name.unwrap_or_else(default_device_name))?;
         }
+        Command::Devices => devices(&home)?,
+        Command::Service => service(&home)?,
         Command::Collections { action: None } => {
-            for collection in home.open()?.collections()? {
-                println!("{}", collection.name);
+            for name in home.access()?.collections()? {
+                println!("{name}");
             }
         }
         Command::Collections {
@@ -205,39 +217,147 @@ impl Home {
     }
 
     fn keys(&self) -> PathBuf {
-        self.0.join("keys")
+        self.0.join(KEYS)
     }
 
     fn vault(&self) -> PathBuf {
-        self.0.join("vault.db")
+        self.0.join(VAULT)
     }
 
     fn admin(&self) -> PathBuf {
-        self.0.join("admin")
+        self.0.join(ADMIN_KEY)
     }
 
-    /// This device's admin key, if it has one and the vault lists it as an admin.
-    fn admin_key(&self, vault: &Vault<Keys>) -> Result<Option<AdminKey>> {
-        let key = match AdminKey::load(&self.admin()) {
-            Ok(key) => key,
-            Err(openvault_keystore::Error::NotFound(_)) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let listed = vault
-            .membership()
-            .is_some_and(|m| m.admins().contains(&key.verifying_key()));
-        Ok(listed.then_some(key))
-    }
-
-    fn open(&self) -> Result<Vault<Keys>> {
+    fn require_vault(&self) -> Result<()> {
         if !self.vault().exists() {
             bail!(
                 "no vault in {}; run `openvault init` first",
                 self.0.display()
             );
         }
+        Ok(())
+    }
+
+    /// The running service if there is one, or the vault opened in this process.
+    fn access(&self) -> Result<Access> {
+        self.require_vault()?;
+        #[cfg(unix)]
+        {
+            let socket = self.0.join(SOCKET);
+            if openvault_service::client::is_running(&socket) {
+                return Ok(Access::Service(socket));
+            }
+        }
         let keys = load_keys(&self.keys())?;
-        Ok(Vault::open(&self.vault(), keys)?)
+        Ok(Access::Local {
+            vault: Box::new(Vault::open(&self.vault(), keys)?),
+            admin_key: self.admin(),
+        })
+    }
+}
+
+/// Where requests go: to the running service, or to the vault in this process. Both run the
+/// same handler (service.md, the CLI).
+enum Access {
+    #[cfg(unix)]
+    Service(PathBuf),
+    Local {
+        vault: Box<Vault<Keys>>,
+        admin_key: PathBuf,
+    },
+}
+
+impl Access {
+    fn call(&mut self, request: Request) -> Result<Response> {
+        Ok(match self {
+            #[cfg(unix)]
+            Self::Service(socket) => openvault_service::client::call(socket, &request)
+                .context("can't reach the service")?
+                .context("the service stopped")?,
+            Self::Local { vault, admin_key } => handler::handle(
+                &mut handler::Context {
+                    vault,
+                    admin_key,
+                    visible: None,
+                },
+                request,
+            ),
+        })
+    }
+
+    fn is_service(&self) -> bool {
+        !matches!(self, Self::Local { .. })
+    }
+
+    fn collections(&mut self) -> Result<Vec<String>> {
+        match self.call(Request::Collections)? {
+            Response::Names(names) => Ok(names),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Fails unless `collection` exists, before anything is typed or read for it.
+    fn require_collection(&mut self, collection: &str) -> Result<()> {
+        if !self.collections()?.iter().any(|name| name == collection) {
+            bail!("no collection {collection}");
+        }
+        Ok(())
+    }
+
+    fn get(&mut self, collection: &str, name: &str) -> Result<Option<Value>> {
+        match self.call(Request::Get {
+            collection: collection.into(),
+            name: name.into(),
+        })? {
+            Response::Entry(value) => Ok(value),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    fn set(&mut self, collection: &str, entries: Vec<Item>) -> Result<()> {
+        match self.call(Request::Set {
+            collection: collection.into(),
+            entries,
+        })? {
+            Response::Done => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    fn delete(&mut self, collection: &str, name: &str) -> Result<bool> {
+        match self.call(Request::Delete {
+            collection: collection.into(),
+            name: name.into(),
+        })? {
+            Response::Deleted(existed) => Ok(existed),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    fn list(&mut self, collection: &str) -> Result<Vec<Listed>> {
+        match self.call(Request::List {
+            collection: collection.into(),
+        })? {
+            Response::Listing(listed) => Ok(listed),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    fn folder(&mut self, collection: &str, folder: &str) -> Result<Vec<Item>> {
+        match self.call(Request::Folder {
+            collection: collection.into(),
+            folder: folder.into(),
+        })? {
+            Response::Entries(items) => Ok(items),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    fn devices(&mut self) -> Result<Vec<DeviceSummary>> {
+        match self.call(Request::Devices)? {
+            Response::Devices(devices) => Ok(devices),
+            other => Err(unexpected(&other)),
+        }
     }
 }
 
@@ -374,39 +494,48 @@ fn init(home: &Home, backend: Backend, name: &str) -> Result<()> {
 }
 
 /// Creates a collection. Its set_scope entry needs an admin signature: this device's admin key
-/// when it has one, otherwise the recovery key. A vault from before the membership log starts
-/// its log first, with the recovery phrase.
+/// when it has one, which asks for Touch ID, otherwise the recovery key. A vault from before the
+/// membership log starts its log first, with the recovery phrase.
 fn create_collection(home: &Home, name: &str) -> Result<()> {
     names::check_collection(name)?;
-    let mut vault = home.open()?;
+    let mut access = home.access()?;
     // Checked before asking for Touch ID or 24 words.
-    if vault.collection(name).is_ok() {
+    if access
+        .collections()?
+        .iter()
+        .any(|existing| existing == name)
+    {
         bail!("collection {name} already exists");
     }
-    if let Some(admin) = home.admin_key(&vault)? {
-        let reason = format!("create the collection {name}");
-        eprintln!("Confirm with Touch ID or your password to {reason}.");
-        vault.create_collection(name, &admin.with_reason(reason))?;
-        return Ok(());
+    if home.admin().exists() {
+        eprintln!("Confirm with Touch ID or your password to create the collection {name}.");
     }
-    if io::stdin().is_terminal() {
-        eprintln!("Creating a collection needs an admin signature. This device has no admin");
-        eprintln!("key, so it comes from your recovery phrase.");
+    let mut response = access.call(Request::CreateCollection {
+        name: name.into(),
+        recovery_phrase: None,
+    })?;
+    if let Response::Error {
+        code: ErrorCode::RecoveryPhraseNeeded,
+        ..
+    } = response
+    {
+        if io::stdin().is_terminal() {
+            eprintln!("Creating a collection needs an admin signature. This device has no admin");
+            eprintln!("key, so it comes from your recovery phrase.");
+        }
+        response = access.call(Request::CreateCollection {
+            name: name.into(),
+            recovery_phrase: Some(read_recovery_phrase()?),
+        })?;
     }
-    let recovery = read_recovery_phrase()?;
-    if !vault.is_recovery_key(&recovery) {
-        bail!("that recovery phrase belongs to another vault");
+    match response {
+        Response::Done => Ok(()),
+        other => Err(unexpected(&other)),
     }
-    if vault.membership().is_none() {
-        vault.start_log(&recovery, &default_device_name())?;
-        println!("Started this vault's membership log.");
-    }
-    vault.create_collection(name, &recovery.admin_signing_key())?;
-    Ok(())
 }
 
 /// Reads a recovery phrase: typed at a hidden prompt, or the first line of stdin.
-fn read_recovery_phrase() -> Result<RecoveryKey> {
+fn read_recovery_phrase() -> Result<Zeroizing<String>> {
     // 24 words of at most 8 letters, with room for extra spaces.
     const MAX_LEN: usize = 1024;
     let stdin = io::stdin();
@@ -418,58 +547,99 @@ fn read_recovery_phrase() -> Result<RecoveryKey> {
         stdin.lock().take(MAX_LEN as u64 + 1).read_line(&mut line)?;
         line
     };
-    Ok(RecoveryKey::from_phrase(&phrase)?)
+    Ok(phrase)
 }
 
-/// This computer's host name without `.local`, as the device's name in the membership log.
-fn default_device_name() -> String {
-    let host = hostname().unwrap_or_default();
-    let host = host.strip_suffix(".local").unwrap_or(&host);
-    let mut name = String::new();
-    for c in host.chars().filter(|c| !c.is_control()) {
-        if name.len() + c.len_utf8() > membership::MAX_NAME_LEN {
-            break;
-        }
-        name.push(c);
+/// Lists the log's devices. Only the service knows which are on this network.
+fn devices(home: &Home) -> Result<()> {
+    let mut access = home.access()?;
+    let devices = access.devices()?;
+    if devices.is_empty() {
+        println!("This vault has no membership log yet. Creating a collection starts it.");
+        return Ok(());
     }
-    if name.is_empty() {
-        "device".to_owned()
-    } else {
-        name
+    let rows: Vec<(String, String, &str, String)> = devices
+        .iter()
+        .map(|device| {
+            let (platform, name) = device
+                .name
+                .clone()
+                .unwrap_or_else(|| ("?".into(), device.id.to_string()));
+            let keys = if device.hardware { "hardware" } else { "file" };
+            let mut notes = Vec::new();
+            if device.this {
+                notes.push("this device");
+            }
+            if device.revoked {
+                notes.push("revoked");
+            } else if device.visible {
+                notes.push("visible");
+            }
+            (name, platform, keys, notes.join(", "))
+        })
+        .collect();
+    let width = rows
+        .iter()
+        .map(|row| row.0.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (name, platform, keys, notes) in &rows {
+        let line = format!("{name:<width$}  {platform:<8}  {keys:<8}  {notes}");
+        println!("{}", line.trim_end());
     }
+    if !access.is_service() {
+        println!();
+        println!("Run `openvault service` to see which of them are on this network.");
+    }
+    Ok(())
 }
 
+/// Runs the service in the foreground until Ctrl-C (service.md).
 #[cfg(unix)]
-fn hostname() -> Option<String> {
-    let mut buf = [0u8; 256];
-    // SAFETY: the pointer and length describe `buf`, which gethostname writes into.
-    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
-        return None;
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+fn service(home: &Home) -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+
+    home.require_vault()?;
+    let keys = load_keys(&home.keys())?;
+    let filter = EnvFilter::try_from_env("OPENVAULT_LOG").unwrap_or_else(|_| {
+        EnvFilter::new("info,iroh=warn,iroh_mdns_address_lookup=warn,swarm_discovery=warn")
+    });
+    tracing_subscriber::fmt()
+        .with_writer(io::stderr)
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(openvault_service::run(&home.0, keys))
 }
 
 #[cfg(not(unix))]
-fn hostname() -> Option<String> {
-    std::env::var("COMPUTERNAME").ok()
+fn service(_: &Home) -> Result<()> {
+    bail!("`openvault service` doesn't run on Windows yet")
 }
 
 fn set(home: &Home, entry: &str, kind: Kind) -> Result<()> {
     let (collection, name) = split_entry(entry)?;
-    let mut vault = home.open()?;
-    let id = vault.collection(collection)?;
+    let mut access = home.access()?;
+    access.require_collection(collection)?;
     let value = read_value(kind)?;
-    vault.set(id, name, kind, &value)?;
-    Ok(())
+    access.set(
+        collection,
+        vec![Item {
+            name: name.into(),
+            kind,
+            value,
+        }],
+    )
 }
 
 fn get(home: &Home, entry: &str) -> Result<()> {
     let (collection, name) = split_entry(entry)?;
-    let mut vault = home.open()?;
-    let id = vault.collection(collection)?;
-    let entry = vault
-        .get(id, name)?
+    let entry = home
+        .access()?
+        .get(collection, name)?
         .ok_or_else(|| anyhow!("{collection}/{name} doesn't exist"))?;
     let mut stdout = io::stdout().lock();
     stdout.write_all(&entry.value)?;
@@ -490,10 +660,9 @@ fn list(home: &Home, path: &str) -> Result<()> {
     if let Some(folder) = folder {
         names::check_entry(folder)?;
     }
-    let vault = home.open()?;
-    let id = vault.collection(collection)?;
+    let listed = home.access()?.list(collection)?;
     let prefix = folder.map(|folder| format!("{folder}/"));
-    for info in vault.list(id)? {
+    for info in listed {
         if prefix
             .as_ref()
             .is_none_or(|prefix| info.name.starts_with(prefix))
@@ -506,9 +675,7 @@ fn list(home: &Home, path: &str) -> Result<()> {
 
 fn delete(home: &Home, entry: &str) -> Result<()> {
     let (collection, name) = split_entry(entry)?;
-    let mut vault = home.open()?;
-    let id = vault.collection(collection)?;
-    if !vault.delete(id, name)? {
+    if !home.access()?.delete(collection, name)? {
         bail!("{collection}/{name} doesn't exist");
     }
     Ok(())
@@ -527,11 +694,7 @@ fn run(
     if !prefix.is_empty() && !is_env_name(prefix) {
         bail!("--prefix must be letters, digits and '_', not starting with a digit");
     }
-    let entries = {
-        let mut vault = home.open()?;
-        let id = vault.collection(collection)?;
-        vault.entries_in(id, folder)?
-    };
+    let entries = home.access()?.folder(collection, folder)?;
     if entries.is_empty() {
         bail!("{collection}/{folder}/ has no secrets or variables");
     }
@@ -604,10 +767,9 @@ fn import_env(
         entries.push((name, kind, line.value.as_slice()));
     }
 
-    let mut vault = home.open()?;
-    let id = vault.collection(collection)?;
-    let existing: HashMap<String, Kind> = vault
-        .list(id)?
+    let mut access = home.access()?;
+    let existing: HashMap<String, Kind> = access
+        .list(collection)?
         .into_iter()
         .map(|info| (info.name, info.kind))
         .collect();
@@ -628,18 +790,26 @@ fn import_env(
     let mut writes = Vec::with_capacity(entries.len());
     for (name, kind, value) in &entries {
         if existing.get(name) == Some(kind)
-            && vault
-                .get(id, name)?
+            && access
+                .get(collection, name)?
                 .is_some_and(|entry| entry.value.as_slice() == *value)
         {
             unchanged += 1;
         } else {
-            writes.push((name.as_str(), *kind, *value));
+            writes.push(Item {
+                name: name.clone(),
+                kind: *kind,
+                value: Zeroizing::new(value.to_vec()),
+            });
         }
     }
-    vault.set_all(id, writes.iter().copied())?;
+    let written: Vec<(String, Kind)> = writes
+        .iter()
+        .map(|item| (item.name.clone(), item.kind))
+        .collect();
+    access.set(collection, writes)?;
 
-    for (name, kind, _) in &writes {
+    for (name, kind) in &written {
         println!("{:<6}  {name}", kind_label(*kind));
     }
     let count = |n: usize| {
@@ -651,7 +821,7 @@ fn import_env(
     };
     print!(
         "Imported {} into {collection}/{folder}/",
-        count(writes.len())
+        count(written.len())
     );
     match unchanged {
         0 => println!("."),

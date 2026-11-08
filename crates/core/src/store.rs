@@ -137,6 +137,9 @@ pub struct Vault<K: DeviceKeys> {
     /// `None` for a vault created before the membership log, until
     /// [`start_log`](Self::start_log).
     membership: Option<Membership>,
+    /// SQLite's `data_version` when `membership` was last loaded, which changes when another
+    /// connection writes.
+    data_version: i64,
 }
 
 impl<K: DeviceKeys> Vault<K> {
@@ -197,14 +200,7 @@ impl<K: DeviceKeys> Vault<K> {
             Ok(conn)
         };
         match init() {
-            Ok(conn) => Ok(Self::new(
-                conn,
-                keys,
-                vault_id,
-                device_id,
-                recovery,
-                Some(membership),
-            )),
+            Ok(conn) => Self::new(conn, keys, vault_id, device_id, recovery, Some(membership)),
             Err(e) => {
                 let _ = std::fs::remove_file(path);
                 Err(e)
@@ -236,9 +232,7 @@ impl<K: DeviceKeys> Vault<K> {
             return Err(Error::WrongKeys);
         }
         let membership = load_membership(&conn, vault_id, device_id, &keys)?;
-        Ok(Self::new(
-            conn, keys, vault_id, device_id, recovery, membership,
-        ))
+        Self::new(conn, keys, vault_id, device_id, recovery, membership)
     }
 
     fn new(
@@ -248,11 +242,12 @@ impl<K: DeviceKeys> Vault<K> {
         device_id: DeviceId,
         recovery: WrapKey,
         membership: Option<Membership>,
-    ) -> Self {
+    ) -> Result<Self> {
         let local = keys.local_key().as_bytes();
         let index_key = derive_key(contexts::LOCAL_INDEX, local);
         let cache_key = SymmetricKey::from_bytes(*derive_key(contexts::LOCAL_CACHE, local));
-        Self {
+        let data_version = data_version(&conn)?;
+        Ok(Self {
             conn,
             keys,
             vault_id,
@@ -262,7 +257,20 @@ impl<K: DeviceKeys> Vault<K> {
             cache_key,
             collection_keys: HashMap::new(),
             membership,
+            data_version,
+        })
+    }
+
+    /// Reloads the membership this vault keeps in memory if another process has written to
+    /// the store since it was loaded (service.md, the store). Returns whether it had.
+    pub fn refresh(&mut self) -> Result<bool> {
+        let version = data_version(&self.conn)?;
+        if version == self.data_version {
+            return Ok(false);
         }
+        self.membership = load_membership(&self.conn, self.vault_id, self.device_id, &self.keys)?;
+        self.data_version = version;
+        Ok(true)
     }
 
     pub fn vault_id(&self) -> VaultId {
@@ -784,6 +792,10 @@ fn upgrade(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn data_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.pragma_query_value(None, "data_version", |row| row.get(0))?)
+}
+
 fn user_version(conn: &Connection) -> Result<i64> {
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
@@ -867,7 +879,7 @@ fn device_info(
     name: &str,
     names_key: &SymmetricKey,
 ) -> Result<DeviceInfo> {
-    let transport = derive_key(contexts::TRANSPORT, keys.local_key().as_bytes());
+    let transport = crate::transport_seed(keys);
     let name = DeviceName {
         platform: std::env::consts::OS.into(),
         name: name.into(),
@@ -993,6 +1005,31 @@ mod tests {
 
     fn value(entry: Option<Entry>) -> Option<Vec<u8>> {
         entry.map(|e| e.value.to_vec())
+    }
+
+    #[test]
+    fn refresh_picks_up_log_entries_from_another_connection() {
+        let s = setup();
+        let mut first = s.create();
+        let mut second = s.open();
+        assert!(!second.refresh().unwrap(), "nothing has been written yet");
+
+        first.create_collection("latem", &s.admin()).unwrap();
+        assert!(second.refresh().unwrap());
+        assert!(!second.refresh().unwrap());
+        assert_eq!(
+            second.membership().unwrap().head(),
+            first.membership().unwrap().head()
+        );
+
+        // Without the refresh, this would sign an entry at a seq the log already has.
+        second.create_collection("ssh", &s.admin()).unwrap();
+        assert!(first.refresh().unwrap());
+        assert_eq!(first.collections().unwrap().len(), 2);
+        assert_eq!(
+            first.membership().unwrap().head(),
+            second.membership().unwrap().head()
+        );
     }
 
     #[test]

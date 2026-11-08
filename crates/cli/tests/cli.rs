@@ -568,3 +568,194 @@ fn import_env_writes_everything_or_nothing() {
             .starts_with("var     prod/A\n")
     );
 }
+
+/// `openvault service` running in the background for a device. Stopped with SIGTERM when
+/// dropped, as Ctrl-C would.
+#[cfg(unix)]
+struct Service {
+    child: std::process::Child,
+    log: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Service {
+    fn start(device: &Device) -> Self {
+        let log = device.home.path().join("service.log");
+        let child = device
+            .command(&["service"])
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let service = Self { child, log };
+        let socket = device.home.path().join("service.sock");
+        let started = std::time::Instant::now();
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the service didn't start: {}",
+                service.log()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        service
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Stops it with SIGTERM and returns whether it exited cleanly.
+    fn stop(mut self) -> bool {
+        self.terminate()
+    }
+
+    fn terminate(&mut self) -> bool {
+        // SAFETY: kill has no memory-safety preconditions; the pid is our own child's.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        self.child.wait().unwrap().success()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Service {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            self.terminate();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn commands_go_through_the_service() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let device = Device::new();
+    device.set("latem/prod/SENTRY_DSN", "--secret", b"https://sentry");
+    let service = Service::start(&device);
+
+    // With the key file readable by others, a command that opened the vault itself would
+    // refuse it, so these can only work through the service.
+    let keys = device.home.path().join("keys");
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    device.set("latem/prod/REGION", "--var", b"eu west");
+    assert_eq!(
+        device.ok(&["get", "latem/prod/SENTRY_DSN"]),
+        "https://sentry"
+    );
+    assert_eq!(
+        device.ok(&["list", "latem"]),
+        "var     prod/REGION\nsecret  prod/SENTRY_DSN\n"
+    );
+    let output = device.run(&[
+        "run",
+        "--collection",
+        "latem",
+        "--env",
+        "prod",
+        "--",
+        "sh",
+        "-c",
+        r#"printf '%s|%s' "$SENTRY_DSN" "$REGION""#,
+    ]);
+    assert_eq!(
+        output.stdout,
+        b"https://sentry|eu west",
+        "{}",
+        service.log()
+    );
+    let file = device.file("secrets.env", b"TOKEN=abc\nREGION=eu west\n");
+    let imported = device.ok(&[
+        "import-env",
+        &file,
+        "--collection",
+        "latem",
+        "--env",
+        "prod",
+        "--var",
+        "REGION",
+        "--overwrite",
+    ]);
+    assert!(
+        imported.contains("1 entry already had the same value"),
+        "{imported}"
+    );
+    device.ok(&["delete", "latem/prod/TOKEN"]);
+    assert!(
+        device
+            .fails(&["get", "latem/prod/TOKEN"])
+            .contains("doesn't exist")
+    );
+
+    // No admin key here, so the service asks for the recovery phrase through the CLI.
+    let output = device.run_with_stdin(&["collections", "create", "ssh"], device.phrase.as_bytes());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(device.ok(&["collections"]), "latem\nssh\n");
+    let wrong = RecoveryKey::generate().to_phrase();
+    let output = device.run_with_stdin(&["collections", "create", "other"], wrong.as_bytes());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("belongs to another vault"));
+
+    let devices = device.ok(&["devices"]);
+    assert!(devices.contains("this device"), "{devices}");
+    assert!(!devices.contains("openvault service"), "{devices}");
+
+    assert!(service.stop(), "the service didn't exit cleanly");
+    assert!(!device.home.path().join("service.sock").exists());
+    // Without the service, commands open the vault themselves again.
+    assert!(device.fails(&["collections"]).contains("0600"));
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(device.ok(&["get", "latem/prod/REGION"]), "eu west");
+}
+
+#[cfg(unix)]
+#[test]
+fn one_service_per_vault() {
+    let device = Device::new();
+    let _service = Service::start(&device);
+    let error = device.fails(&["service"]);
+    assert!(error.contains("already running"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_service_sees_writes_by_other_processes() {
+    let device = Device::new();
+    let service = Service::start(&device);
+
+    // A collection created by another process, as a command run while the service was
+    // starting could. The service's next log entry must follow it.
+    let keys = Keys::load(&device.home.path().join("keys")).unwrap();
+    let mut vault = Vault::open(&device.home.path().join("vault.db"), keys).unwrap();
+    let recovery = RecoveryKey::from_phrase(&device.phrase).unwrap();
+    vault
+        .create_collection("elsewhere", &recovery.admin_signing_key())
+        .unwrap();
+    drop(vault);
+
+    device.create_collection("ssh");
+    assert_eq!(
+        device.ok(&["collections"]),
+        "elsewhere\nlatem\nssh\n",
+        "{}",
+        service.log()
+    );
+}
+
+#[test]
+fn devices_lists_this_device() {
+    let device = Device::new();
+    let devices = device.ok(&["devices"]);
+    let first = devices.lines().next().unwrap();
+    assert!(first.starts_with("test "), "{devices}");
+    assert!(
+        first.contains("file") && first.ends_with("this device"),
+        "{devices}"
+    );
+    assert!(devices.contains("Run `openvault service`"), "{devices}");
+}

@@ -35,6 +35,7 @@ pub mod contexts {
     pub const JOIN_CONFIRM_ADMIN: &str = "openvault v1 join confirm admin";
     pub const JOIN_SESSION: &str = "openvault v1 join session";
     pub const GRANT_ID: &str = "openvault v1 grant id";
+    pub const SYNC_FINGERPRINT: &str = "openvault v1 sync fingerprint";
 }
 
 #[cfg(test)]

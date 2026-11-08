@@ -25,7 +25,7 @@ Each device runs one iroh endpoint (design §10):
 - **Identity.** Its secret key is the transport key (records.md, local store), so its endpoint id is the transport key in the device's add_device entry.
 - **No relays.** It uses no relay, so it never connects to n0's relays. The grandfather's relay comes in M3.
 - **No publishing.** It uses no DNS or pkarr address lookup and no port mapping. Nothing outside the local network learns the endpoint id or addresses.
-- **Protocols.** It accepts no connections yet. Joining adds ALPN `openvault/join/1` and sync adds `openvault/sync/1`.
+- **Protocols.** It accepts connections with ALPN `openvault/sync/1` (sync.md) and runs a session on each. Joining uses `openvault/join/1` on endpoints of its own (join.md, commands).
 
 ### Discovery
 
@@ -66,9 +66,11 @@ Each device runs one iroh endpoint (design §10):
 | `0x06` | list | collection (str) |
 | `0x07` | folder | collection (str) ‖ folder (str) |
 | `0x08` | devices | — |
+| `0x09` | changed | — |
 
 - **set** writes every entry in one transaction, as `import-env` needs.
 - **folder** returns the current values under `folder/`, for `openvault run`.
+- **changed** says that something wrote to the vault without the service, as `approve` does. The service reloads what it keeps, as before every request, and starts sessions as after a log entry (sync.md, starting a session).
 - **create collection** signs with this device's admin key when it has one, which asks for Touch ID. Otherwise it needs the recovery phrase. Without one in the request, it fails with "recovery phrase needed", and the CLI asks for the phrase and sends the request again.
 
 ### Responses

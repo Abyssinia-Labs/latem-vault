@@ -42,6 +42,9 @@ pub enum Request {
         folder: String,
     },
     Devices,
+    /// Something wrote to the vault without the service, such as `openvault approve`: the
+    /// service reloads what it keeps and tells the other devices.
+    Changed,
 }
 
 #[derive(Debug)]
@@ -156,6 +159,7 @@ impl Request {
                 w.str(folder);
             }),
             Self::Devices => frame(0x08, |_| {}),
+            Self::Changed => frame(0x09, |_| {}),
         }
     }
 
@@ -191,6 +195,7 @@ impl Request {
                 folder: r.string()?,
             },
             0x08 => Self::Devices,
+            0x09 => Self::Changed,
             _ => return Err(DecodeError::Bad("unknown request")),
         };
         r.finish()?;

@@ -7,6 +7,8 @@
 pub mod api;
 #[cfg(unix)]
 pub mod client;
+#[cfg(unix)]
+mod engine;
 pub mod handler;
 #[cfg(unix)]
 mod server;

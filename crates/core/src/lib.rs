@@ -10,6 +10,7 @@ mod keys;
 pub mod membership;
 pub mod names;
 pub mod record;
+pub mod sets;
 mod store;
 
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ use std::path::PathBuf;
 pub use ids::{CollectionId, DeviceId, VaultId};
 pub use keys::{DeviceKeys, SoftwareKeys, transport_seed};
 pub use record::{Kind, Version};
-pub use store::{CollectionInfo, Entry, EntryInfo, Vault};
+pub use store::{CollectionInfo, Entry, EntryInfo, Received, Vault};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -51,6 +52,8 @@ pub enum Error {
     NoSuchCollection(String),
     #[error("this device has no key for collection {0}")]
     NoKey(CollectionId),
+    #[error("this device can't write to that collection")]
+    ReadOnly,
     #[error("invalid record: {0}")]
     InvalidRecord(&'static str),
     #[error("invalid log entry: {0}")]
@@ -59,6 +62,8 @@ pub enum Error {
     InvalidGrant(&'static str),
     #[error("invalid join: {0}")]
     InvalidJoin(&'static str),
+    #[error("the membership log has forked; an admin must choose a side")]
+    Fork,
     #[error("this vault has no membership log yet")]
     NoLog,
     #[error("this vault already has a membership log")]

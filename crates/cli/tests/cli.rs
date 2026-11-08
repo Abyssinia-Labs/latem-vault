@@ -760,20 +760,43 @@ fn devices_lists_this_device() {
     assert!(devices.contains("Run `openvault service`"), "{devices}");
 }
 
+/// A joining device announces itself to the whole network, so two tests joining at once would
+/// each find the other's device. Tests take turns while they join.
+#[cfg(unix)]
+static JOINING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A child process that is killed if the test fails before it exits, so a waiting
+/// `openvault join` doesn't go on announcing itself.
+#[cfg(unix)]
+struct Child(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for Child {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_device_joins_with_a_code() {
     use std::io::{BufRead, BufReader};
 
+    let _turn = JOINING.lock().unwrap_or_else(|e| e.into_inner());
     let admin = Device::new();
     let joiner = Device::empty();
-    let mut joining = joiner
-        .command(&["join", "--keys", "software", "--name", "Desktop"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut lines = BufReader::new(joining.stdout.take().unwrap()).lines();
+    let mut joining = Child(
+        joiner
+            .command(&["join", "--keys", "software", "--name", "Desktop"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut lines = BufReader::new(joining.0.stdout.take().unwrap()).lines();
     // The code is the indented line of six digits.
     let code = loop {
         let line = lines
@@ -812,12 +835,8 @@ fn a_device_joins_with_a_code() {
     );
 
     let rest: Vec<String> = lines.map(Result::unwrap).collect();
-    let output = joining.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let status = joining.0.wait().unwrap();
+    assert!(status.success(), "join failed");
     assert!(
         rest.iter().any(|line| line.starts_with("Joined the vault")),
         "{rest:?}"
@@ -834,4 +853,87 @@ fn a_device_joins_with_a_code() {
     }
     let error = joiner.fails(&["join"]);
     assert!(error.contains("already in a vault"), "{error}");
+}
+
+/// Runs `args` until it prints `expected`, or fails after 60 seconds.
+#[cfg(unix)]
+fn eventually(device: &Device, args: &[&str], expected: &str) {
+    let started = std::time::Instant::now();
+    loop {
+        let output = device.run(args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() && stdout.contains(expected) {
+            return;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "{args:?} never printed {expected:?}; last: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Joins `joiner` to `admin`'s vault with read on latem, through the CLI.
+#[cfg(unix)]
+fn join(admin: &Device, joiner: &Device) {
+    use std::io::{BufRead, BufReader};
+
+    let _turn = JOINING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut joining = Child(
+        joiner
+            .command(&["join", "--keys", "software", "--name", "Desktop"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut lines = BufReader::new(joining.0.stdout.take().unwrap()).lines();
+    let code = loop {
+        let line = lines
+            .next()
+            .expect("join exited before showing a code")
+            .unwrap();
+        let digits: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        if line.starts_with("    ") && digits.len() == 6 {
+            break digits;
+        }
+    };
+    let answers = format!("{code}\ny\n{}\n", admin.phrase);
+    let output = admin.run_with_stdin(&["approve", "--read", "latem"], answers.as_bytes());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    lines.for_each(drop);
+    assert!(joining.0.wait().unwrap().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn services_sync_a_joined_device() {
+    let admin = Device::new();
+    admin.set("latem/prod/SENTRY_DSN", "--secret", b"https://sentry");
+    let joiner = Device::empty();
+    join(&admin, &joiner);
+    assert_eq!(joiner.ok(&["collections"]), "", "nothing before sync");
+
+    let admin_service = Service::start(&admin);
+    let joiner_service = Service::start(&joiner);
+    // The services find each other with mDNS and sync.
+    eventually(&joiner, &["get", "latem/prod/SENTRY_DSN"], "https://sentry");
+    assert_eq!(joiner.ok(&["collections"]), "latem\n");
+    eventually(&admin, &["devices"], "visible");
+
+    // A write on the admin reaches the joined device while both run.
+    admin.set("latem/prod/REGION", "--var", b"eu west");
+    eventually(&joiner, &["get", "latem/prod/REGION"], "eu west");
+    // It can read but not write.
+    let output = joiner.run_with_stdin(&["set", "latem/prod/X", "--var"], b"1");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("can't write"));
+
+    assert!(admin_service.stop());
+    let log = joiner_service.log();
+    assert!(log.contains("synced with test"), "{log}");
 }

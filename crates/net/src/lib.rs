@@ -6,11 +6,14 @@
 
 pub mod frame;
 pub mod join;
+pub mod sync;
+pub mod wire;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use iroh::endpoint::Connection;
 use iroh::endpoint::presets;
 use iroh::endpoint_info::UserData;
 pub use iroh::{Endpoint, EndpointId};
@@ -189,7 +192,7 @@ impl Node {
     }
 
     /// Stops discovery and closes the endpoint.
-    pub async fn close(self) {
+    pub async fn close(&self) {
         self.discovery.abort();
         self.endpoint.close().await;
     }

@@ -1,6 +1,6 @@
 # Sync spec, v1
 
-Status: draft, 2026-11-07. Grants are implemented in `crates/core` (format, checks and storage) and sent during joins (join.md). Sessions, sets and reconciliation are not implemented yet. Builds on [records.md](records.md) and [membership.md](membership.md). The design is in [design §9](../design.md#9-sync) and [§10](../design.md#10-networking).
+Status: draft, 2026-11-07. Implemented on the local network: the sets, grants and accepting records in `crates/core` (`sets`, `grant`, the store's `sync` module), sessions and reconciliation in `crates/net` (`sync`), and starting sessions in `crates/service`. Builds on [records.md](records.md) and [membership.md](membership.md). The design is in [design §9](../design.md#9-sync) and [§10](../design.md#10-networking).
 
 Devices in a vault exchange three things directly, over iroh:
 - **the membership log;**
@@ -22,7 +22,7 @@ All integers are big-endian.
 **Who connects.**
 - Either device may connect.
 - iroh authenticates the transport keys at both ends (OV-7), and the log decides what each device may do.
-- If two devices connect to each other at the same time, they keep the connection opened by the device with the smaller device id, compared bytewise, and close the other.
+- If two devices connect to each other at the same time, they keep the connection opened by the device with the smaller endpoint id, compared bytewise, and close the other. Endpoint ids are known before the logs are exchanged, which device ids aren't always.
 
 **Lifetime.** A device opens a connection when there is something to sync (below) and closes it after 60 seconds without a message. It keeps no idle connections.
 
@@ -54,12 +54,13 @@ A message that is too long, has an unknown type or doesn't decode ends the sessi
 There are no timers and no periodic scans.
 
 **Starting a session.** A device starts one with a peer:
-- when it starts, or when its network changes, with every member it can see;
-- when mDNS shows a member that wasn't visible before;
+- when mDNS shows a member that wasn't visible before, which includes every member visible when it starts;
 - after a local write, with every visible member that shares the collection;
 - after appending a log entry, with every visible member.
 
-**During a session.** A device sends a new local record immediately (items), and announces a new log head by sending hello again.
+`openvault service` starts them (service.md). A write made through the service is a local write. So is a log entry `approve` appends, which it reports to the service with a changed request.
+
+**During a session.** After a local write, a device sends the changed set's root at once (roots), and the opener reconciles that set again; the new records follow as items. A device announces a new log head by sending hello again. That costs one extra round trip compared with pushing the records themselves, and sends nothing a reconciliation wouldn't.
 
 **Retries.**
 - If a session with a visible peer fails, the device logs why and retries after 30 seconds, doubling up to an hour.
@@ -95,6 +96,7 @@ The answer to a log request is the entries from that seq on, in order, at most `
 **Checking entries.**
 - Each entry is checked as it arrives, as membership.md says.
 - An entry that doesn't extend the chain means the logs have diverged. The device requests earlier entries, 64 at a time, to find the first seq where they differ, then applies the fork rule (membership.md, forks).
+- In v1, an entry with a seq the device already has is checked against its own: the same entry is skipped, and a different one is a fork if it would have been accepted in that place. An entry after the head that doesn't follow it ends the session as a bad message; finding where the logs diverged is not in v1 yet.
 - A fork stops all sync until an admin resolves it.
 
 ## Sets
@@ -149,7 +151,7 @@ mode    0x00 skip           settled
 | ids | It now knows both sides of the range: it sends the items the peer lacks (items), asks for the ones it lacks (want), and answers skip. |
 
 **Settling.**
-- A set is settled when a reconcile has only skips.
+- A set is settled when a reconcile has only skips. Such a reconcile is never sent: a side that would answer with only skips sends nothing.
 - Adjacent skips may be merged into one range.
 - Each round splits the unsettled ranges sixteen ways. A set of n items with d differences therefore settles in about log₁₆ n rounds, using O(d log n) bytes.
 
@@ -261,3 +263,5 @@ Revoking a device, or removing its `read` or `write` on a collection, rotates th
 - **Deleting a collection's records** from a device whose scope becomes none. It stops syncing the collection but keeps its copy.
 - **Two connections to the same peer.** Sets are reconciled one after another on one stream.
 - **History pruning** (records.md).
+- **Finding where diverged logs part**, described under checking entries.
+- **Sessions on a network change.** iroh notices one, but nothing starts sessions on it yet; mDNS shows peers again after the change.

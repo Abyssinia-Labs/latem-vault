@@ -111,6 +111,8 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
             )
         }
         Request::Devices => Response::Devices(devices(vault, cx.visible)),
+        // The service reloaded before handling it; nothing else to do here.
+        Request::Changed => Response::Done,
     })
 }
 

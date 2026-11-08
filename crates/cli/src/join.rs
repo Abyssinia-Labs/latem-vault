@@ -287,6 +287,12 @@ fn approve_with(
         "{} joined the vault, with scopes {scope_list}.",
         request.name.name
     );
+    // A running service reloads the log and tells the other devices (service.md, the store).
+    #[cfg(unix)]
+    let _ = openvault_service::client::call(
+        &home.0.join(openvault_service::SOCKET),
+        &openvault_service::api::Request::Changed,
+    );
     Ok(())
 }
 

@@ -1,5 +1,9 @@
 //! The local store: one SQLite database per vault (records.md, local store).
 
+mod sync;
+
+pub use sync::Received;
+
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -18,15 +22,18 @@ use crate::membership::{
     AdminKey, Change, DeviceInfo, DeviceName, LogEntry, Membership, Scope, names_key_context,
 };
 use crate::record::{Body, Kind, Record, Version};
+use crate::sets::{ItemId, SetId, Summary};
 use crate::{CollectionId, DeviceId, DeviceKeys, Error, Result, VaultId, names, transport_seed};
 
 /// Version 2 added the membership log, version 3 sealed the device names in it (membership.md,
 /// names key), and version 4 added grants (sync.md, grants) and the epoch history to the kept
-/// membership. Opening a version 1 store adds the (empty) log and grants tables. A version 2
-/// store opens only if its log is empty, since its entries are in the old format. Opening a
-/// version 3 store rebuilds the kept membership from the log and signs a grant for each
-/// collection key the device holds.
-const SCHEMA_VERSION: i64 = 4;
+/// membership, and version 5 added set summaries and collections known before their name
+/// arrives (sync.md). Opening a version 1 store adds the (empty) log and grants tables. A
+/// version 2 store opens only if its log is empty, since its entries are in the old format.
+/// Opening a version 3 store rebuilds the kept membership from the log and signs a grant for
+/// each collection key the device holds. Opening a version 4 store rebuilds the collections
+/// table and adds up its sets.
+const SCHEMA_VERSION: i64 = 5;
 
 /// Every grant this device knows of, its own and other devices' (sync.md, who stores grants).
 const GRANTS_SCHEMA: &str = "
@@ -70,11 +77,13 @@ CREATE TABLE devices (
     wrap_key BLOB NOT NULL
 ) STRICT;
 
+-- A collection's name tag and label are NULL until its collection record has arrived and
+-- opened, as on a device that has just joined.
 CREATE TABLE collections (
     collection_id BLOB PRIMARY KEY,
     epoch INTEGER NOT NULL,
-    name_tag BLOB NOT NULL UNIQUE,
-    label BLOB NOT NULL
+    name_tag BLOB UNIQUE,
+    label BLOB
 ) STRICT;
 
 CREATE TABLE collection_keys (
@@ -89,6 +98,15 @@ CREATE TABLE records (
     record_id BLOB PRIMARY KEY,
     collection_id BLOB NOT NULL REFERENCES collections,
     record BLOB NOT NULL
+) STRICT;
+
+CREATE INDEX records_by_collection ON records (collection_id, record_id);
+
+-- Each set's item count and id sum (sync.md, sets), updated with every insert.
+CREATE TABLE sets (
+    set_id BLOB PRIMARY KEY,
+    count INTEGER NOT NULL,
+    sum BLOB NOT NULL
 ) STRICT;
 
 -- The current version of each name, including deletions.
@@ -468,6 +486,11 @@ impl<K: DeviceKeys> Vault<K> {
             save_log(&tx, log, &membership)?;
             for grant in grants {
                 insert_grant(&tx, grant)?;
+                let epoch = membership
+                    .epoch(grant.collection())
+                    .expect("checked by the grant");
+                ensure_collection(&tx, grant.collection(), epoch)?;
+                keep_own_key(&tx, grant, &keys.wrap_key())?;
             }
             tx.commit()?;
             Ok(conn)
@@ -632,7 +655,7 @@ impl<K: DeviceKeys> Vault<K> {
     pub fn collections(&self) -> Result<Vec<CollectionInfo>> {
         let mut statement = self
             .conn
-            .prepare("SELECT collection_id, label FROM collections")?;
+            .prepare("SELECT collection_id, label FROM collections WHERE label IS NOT NULL")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
@@ -775,6 +798,12 @@ impl<K: DeviceKeys> Vault<K> {
 
     fn write(&mut self, collection: CollectionId, bodies: &[Body], deleted: bool) -> Result<()> {
         let epoch = self.epoch(collection)?;
+        // Other devices would refuse its records (sync.md, accepting records).
+        if let Some(membership) = &self.membership
+            && membership.scope(self.device_id, collection) != Scope::Write
+        {
+            return Err(Error::ReadOnly);
+        }
         let key = self.take_key(collection, epoch)?;
         let result = self.commit_records(collection, epoch, &key, bodies, deleted);
         self.collection_keys.insert((collection, epoch), key);
@@ -829,6 +858,7 @@ impl<K: DeviceKeys> Vault<K> {
                 record.to_bytes()
             ],
         )?;
+        add_to_set(tx, SetId::records(collection), &record_id)?;
 
         let tag = self.entry_tag(collection, &body.name);
         let label = self.cache_key.seal(
@@ -920,6 +950,10 @@ impl<K: DeviceKeys> Vault<K> {
     }
 
     fn device_key(&self, device: DeviceId) -> Result<VerifyingKey> {
+        if let Some(device) = self.membership.as_ref().and_then(|m| m.device(device)) {
+            return Ok(device.info.verifying_key.clone());
+        }
+        // A vault from before the membership log knows only this device.
         let bytes: Vec<u8> = self
             .conn
             .query_row(
@@ -980,9 +1014,18 @@ fn connect(path: &Path) -> Result<Connection> {
 fn upgrade(conn: &mut Connection, keys: &impl DeviceKeys) -> Result<()> {
     match user_version(conn)? {
         SCHEMA_VERSION => return Ok(()),
-        1..=3 => {}
+        1..=4 => {}
         other => return Err(Error::UnsupportedStore(other)),
     }
+    // Rebuilding the collections table needs foreign keys off, which can only change outside a
+    // transaction.
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = upgrade_in_transaction(conn, keys);
+    conn.pragma_update(None, "foreign_keys", true)?;
+    result
+}
+
+fn upgrade_in_transaction(conn: &mut Connection, keys: &impl DeviceKeys) -> Result<()> {
     // Immediate, so two processes opening the same old store don't both upgrade it.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version = user_version(&tx)?;
@@ -998,9 +1041,12 @@ fn upgrade(conn: &mut Connection, keys: &impl DeviceKeys) -> Result<()> {
             return Err(Error::LogBeforeSealedNames);
         }
     }
-    tx.execute_batch(GRANTS_SCHEMA)?;
+    if version < 4 {
+        tx.execute_batch(GRANTS_SCHEMA)?;
+    }
+    tx.execute_batch(V5_SCHEMA)?;
     let log = read_log(&tx)?;
-    if !log.is_empty() {
+    if version < 4 && !log.is_empty() {
         // The kept membership gained the epoch history, so it's rebuilt from the log.
         let membership = Membership::replay(&log)?;
         save_log(&tx, &[], &membership)?;
@@ -1009,8 +1055,65 @@ fn upgrade(conn: &mut Connection, keys: &impl DeviceKeys) -> Result<()> {
         let recovery = WrapKey::from_bytes(&meta(&tx, "recovery_wrap_key")?)?;
         write_own_grants(&tx, vault, device, &recovery, keys)?;
     }
+    // After any grants the step above signs.
+    sum_sets(&tx)?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Version 5: collections whose name hasn't arrived yet, the sets, and the index that reads a
+/// collection's record ids in order. The collections table is rebuilt to make its name columns
+/// nullable, which needs foreign keys off: `upgrade` turns them off around the transaction.
+const V5_SCHEMA: &str = "
+CREATE TABLE collections_v5 (
+    collection_id BLOB PRIMARY KEY,
+    epoch INTEGER NOT NULL,
+    name_tag BLOB UNIQUE,
+    label BLOB
+) STRICT;
+INSERT INTO collections_v5 SELECT collection_id, epoch, name_tag, label FROM collections;
+DROP TABLE collections;
+ALTER TABLE collections_v5 RENAME TO collections;
+CREATE INDEX IF NOT EXISTS records_by_collection ON records (collection_id, record_id);
+CREATE TABLE IF NOT EXISTS sets (
+    set_id BLOB PRIMARY KEY,
+    count INTEGER NOT NULL,
+    sum BLOB NOT NULL
+) STRICT;
+";
+
+/// Adds up every set from the records and grants already stored.
+fn sum_sets(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute("DELETE FROM sets", [])?;
+    let mut sets: HashMap<SetId, Summary> = HashMap::new();
+    {
+        let mut statement = tx.prepare("SELECT collection_id, record_id FROM records")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (collection, id) = row?;
+            let collection = CollectionId::try_from(collection.as_slice())?;
+            let id: ItemId = id.try_into().map_err(|_| Error::Corrupt("record id"))?;
+            sets.entry(SetId::records(collection)).or_default().add(&id);
+        }
+        let mut statement = tx.prepare("SELECT grant_id FROM grants")?;
+        for id in statement.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
+            let id: ItemId = id?.try_into().map_err(|_| Error::Corrupt("grant id"))?;
+            sets.entry(SetId::GRANTS).or_default().add(&id);
+        }
+    }
+    for (set, summary) in sets {
+        tx.execute(
+            "INSERT INTO sets VALUES (?1, ?2, ?3)",
+            params![
+                &set.as_bytes()[..],
+                i64::try_from(summary.count).map_err(|_| Error::Corrupt("set count"))?,
+                &summary.sum[..]
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -1069,18 +1172,80 @@ fn read_log(conn: &Connection) -> Result<Vec<LogEntry>> {
         .collect::<Result<_>>()
 }
 
-fn insert_grant(tx: &Transaction<'_>, grant: &Grant) -> Result<()> {
+/// Keeps a grant, and adds it to the grants set if it's new. Returns whether it was.
+fn insert_grant(tx: &Transaction<'_>, grant: &Grant) -> Result<bool> {
     let recipient = grant
         .recipient()
         .map_or([0; 16], |device| *device.as_bytes());
-    tx.execute(
+    let id = grant.id();
+    let inserted = tx.execute(
         "INSERT OR IGNORE INTO grants VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
-            &grant.id()[..],
+            &id[..],
             &grant.collection().as_bytes()[..],
             grant.epoch(),
             &recipient[..],
             grant.to_bytes()
+        ],
+    )? == 1;
+    if inserted {
+        add_to_set(tx, SetId::GRANTS, &id)?;
+    }
+    Ok(inserted)
+}
+
+/// Adds an item to a set's count and id sum.
+fn add_to_set(tx: &Transaction<'_>, set: SetId, id: &ItemId) -> Result<()> {
+    let mut summary = set_summary(tx, set)?;
+    summary.add(id);
+    tx.execute(
+        "INSERT INTO sets VALUES (?1, ?2, ?3)
+         ON CONFLICT (set_id) DO UPDATE SET count = excluded.count, sum = excluded.sum",
+        params![
+            &set.as_bytes()[..],
+            i64::try_from(summary.count).map_err(|_| Error::Corrupt("set count"))?,
+            &summary.sum[..]
+        ],
+    )?;
+    Ok(())
+}
+
+fn set_summary(conn: &Connection, set: SetId) -> Result<Summary> {
+    let row: Option<(i64, Vec<u8>)> = conn
+        .query_row(
+            "SELECT count, sum FROM sets WHERE set_id = ?1",
+            [&set.as_bytes()[..]],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((count, sum)) = row else {
+        return Ok(Summary::default());
+    };
+    Ok(Summary {
+        count: u64::try_from(count).map_err(|_| Error::Corrupt("set count"))?,
+        sum: sum.try_into().map_err(|_| Error::Corrupt("set sum"))?,
+    })
+}
+
+/// A row for a collection this device knows from the log but whose name hasn't arrived, so its
+/// grants and records have something to belong to.
+fn ensure_collection(tx: &Transaction<'_>, collection: CollectionId, epoch: u32) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO collections VALUES (?1, ?2, NULL, NULL)",
+        params![&collection.as_bytes()[..], epoch],
+    )?;
+    Ok(())
+}
+
+/// Keeps a grant to this device as the wrapped key it unwraps.
+fn keep_own_key(tx: &Transaction<'_>, grant: &Grant, wrap_key: &WrapKey) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO collection_keys VALUES (?1, ?2, ?3, ?4)",
+        params![
+            &grant.collection().as_bytes()[..],
+            grant.epoch(),
+            wrap_key.as_bytes(),
+            grant.wrapped().to_bytes()
         ],
     )?;
     Ok(())
@@ -1643,6 +1808,227 @@ mod tests {
         for grant in &grants {
             grant.check(m).unwrap();
         }
+    }
+
+    /// The admin's vault with `latem` (two entries) and `ssh`, and a device that joined it with
+    /// read on `latem`.
+    fn joined_pair<'a>(
+        s: &'a Setup,
+        joiner_keys: &SoftwareKeys,
+    ) -> (
+        Vault<&'a SoftwareKeys>,
+        Vault<SoftwareKeys>,
+        CollectionId,
+        PathBuf,
+    ) {
+        let mut admin = s.create();
+        let latem = admin.create_collection("latem", &s.admin()).unwrap();
+        admin.create_collection("ssh", &s.admin()).unwrap();
+        admin
+            .set(latem, "prod/SENTRY_DSN", Kind::Secret, b"https://sentry")
+            .unwrap();
+        admin
+            .set(latem, "prod/REGION", Kind::Var, b"eu-west")
+            .unwrap();
+        let device = DeviceId::random();
+        let request = JoinRequest::sign(&[1; 32], device, joiner_keys, desktop()).unwrap();
+        let approval = admin
+            .approve_join(&request, &[(latem, Scope::Read)], &s.admin())
+            .unwrap();
+        let path = s.path.with_file_name("joined.db");
+        let head = admin.membership().unwrap().head();
+        let keys = SoftwareKeys::from_parts(
+            openvault_crypto::UnwrapKey::from_secret_bytes(
+                &joiner_keys.parts().0.to_secret_bytes(),
+            )
+            .unwrap(),
+            SigningKey::from_secret_bytes(&joiner_keys.parts().1.to_secret_bytes()).unwrap(),
+            SymmetricKey::from_bytes(*joiner_keys.local_key().as_bytes()),
+        );
+        let joined = Vault::join(
+            &path,
+            keys,
+            device,
+            &desktop(),
+            head,
+            &approval.log,
+            &approval.grants,
+        )
+        .unwrap();
+        (admin, joined, latem, path)
+    }
+
+    /// Sends `from` everything in each set they share that `to` lacks, as reconciliation would.
+    fn send_missing<A: DeviceKeys, B: DeviceKeys>(from: &Vault<A>, to: &mut Vault<B>) -> usize {
+        let mut sent = 0;
+        for set in to.shared_sets(from.device_id()) {
+            let theirs: std::collections::HashSet<ItemId> = to
+                .set_ids(set, &[0; 32], None)
+                .unwrap()
+                .into_iter()
+                .collect();
+            let missing: Vec<ItemId> = from
+                .set_ids(set, &[0; 32], None)
+                .unwrap()
+                .into_iter()
+                .filter(|id| !theirs.contains(id))
+                .collect();
+            for item in from.set_items(set, &missing).unwrap() {
+                assert_eq!(to.receive(set, &item).unwrap(), Received::New);
+                sent += 1;
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn a_joined_device_takes_in_records_and_grants() {
+        let s = setup();
+        let joiner_keys = SoftwareKeys::generate();
+        let (admin, mut joined, latem, _) = joined_pair(&s, &joiner_keys);
+        assert!(joined.collections().unwrap().is_empty(), "no records yet");
+        let shared = joined.shared_sets(admin.device_id());
+        assert_eq!(shared, admin.shared_sets(joined.device_id()));
+        assert_eq!(
+            shared,
+            [SetId::records(latem), SetId::GRANTS],
+            "not ssh: no scope on it"
+        );
+
+        // The collection record and two entries, and the admin's and recovery key's grants.
+        assert_eq!(send_missing(&admin, &mut joined), 3 + 4);
+        assert_eq!(send_missing(&admin, &mut joined), 0);
+        for set in &shared {
+            assert_eq!(
+                joined.set_summary(*set).unwrap(),
+                admin.set_summary(*set).unwrap()
+            );
+        }
+        let names: Vec<String> = joined
+            .collections()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["latem"]);
+        assert_eq!(joined.collection("latem").unwrap(), latem);
+        assert_eq!(
+            value(joined.get(latem, "prod/SENTRY_DSN").unwrap()),
+            Some(b"https://sentry".to_vec())
+        );
+        assert_eq!(joined.list(latem).unwrap().len(), 2);
+
+        // Sending something again is harmless.
+        let id = admin
+            .set_ids(SetId::records(latem), &[0; 32], None)
+            .unwrap()[0];
+        let item = admin
+            .set_items(SetId::records(latem), &[id])
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            joined.receive(SetId::records(latem), &item).unwrap(),
+            Received::Known
+        );
+        // Its clock moved past everything it took in, so its writes would be newer.
+        assert_eq!(
+            meta(&joined.conn, "clock").unwrap(),
+            meta(&admin.conn, "clock").unwrap()
+        );
+        // A reader can't write.
+        assert!(matches!(
+            joined.set(latem, "prod/X", Kind::Var, b"1"),
+            Err(Error::ReadOnly)
+        ));
+    }
+
+    #[test]
+    fn records_and_grants_are_checked_before_they_are_kept() {
+        let s = setup();
+        let joiner_keys = SoftwareKeys::generate();
+        let (mut admin, joined, latem, _) = joined_pair(&s, &joiner_keys);
+        let records = SetId::records(latem);
+        let id = admin.set_ids(records, &[0; 32], None).unwrap()[0];
+        let mut item = admin.set_items(records, &[id]).unwrap().remove(0);
+
+        // A record under another collection's set, or changed in transit.
+        let ssh = admin.collection("ssh").unwrap();
+        assert!(admin.receive(SetId::records(ssh), &item).is_err());
+        item[50] ^= 1;
+        assert!(admin.receive(records, &item).is_err());
+
+        // A record signed by a device that can only read the collection.
+        let key = SymmetricKey::generate();
+        let version = Version {
+            lamport: 99,
+            device: joined.device_id(),
+        };
+        let forged = Record::seal(
+            latem,
+            0,
+            version,
+            false,
+            &Body::new(Kind::Var, "prod/X", b"1"),
+            &key,
+            &joiner_keys,
+        )
+        .unwrap();
+        assert!(matches!(
+            admin.receive(records, &forged.to_bytes()),
+            Err(Error::InvalidRecord(
+                "the author couldn't write at that epoch"
+            ))
+        ));
+        assert!(admin.receive(SetId::GRANTS, b"not a grant").is_err());
+    }
+
+    #[test]
+    fn log_entries_arrive_in_order_and_forks_are_found() {
+        let s = setup();
+        let joiner_keys = SoftwareKeys::generate();
+        let (mut admin, mut joined, _, _) = joined_pair(&s, &joiner_keys);
+        let head = joined.membership().unwrap().head().0;
+        admin.create_collection("new", &s.admin()).unwrap();
+        let more = admin.log_from(head + 1, 64).unwrap();
+        assert_eq!(more.len(), 1);
+        // Entries it already has are skipped.
+        let all = admin.log_from(0, 64).unwrap();
+        assert_eq!(joined.append_log(&all).unwrap(), 1);
+        assert_eq!(joined.append_log(&more).unwrap(), 0);
+        assert_eq!(
+            joined.membership().unwrap().head(),
+            admin.membership().unwrap().head()
+        );
+
+        // Two admins signing different entries at the same seq.
+        let at = admin.membership().unwrap().head().0 + 1;
+        admin.create_collection("one", &s.admin()).unwrap();
+        joined.create_collection("two", &s.admin()).unwrap();
+        let theirs = joined.log_from(at, 1).unwrap();
+        assert!(matches!(admin.append_log(&theirs), Err(Error::Fork)));
+    }
+
+    #[test]
+    fn version_4_stores_get_their_sets_added_up() {
+        let s = setup();
+        let latem = {
+            let mut vault = s.create();
+            let latem = vault.create_collection("latem", &s.admin()).unwrap();
+            vault.set(latem, "A", Kind::Var, b"1").unwrap();
+            vault
+                .conn
+                .execute_batch("DELETE FROM sets; PRAGMA user_version = 4;")
+                .unwrap();
+            latem
+        };
+        let vault = s.open();
+        assert_eq!(user_version(&vault.conn).unwrap(), SCHEMA_VERSION);
+        for set in [SetId::records(latem), SetId::GRANTS] {
+            let ids = vault.set_ids(set, &[0; 32], None).unwrap();
+            assert_eq!(vault.set_summary(set).unwrap(), Summary::of(&ids));
+        }
+        assert_eq!(vault.set_summary(SetId::records(latem)).unwrap().count, 2);
+        assert_eq!(vault.collections().unwrap().len(), 1);
     }
 
     #[test]

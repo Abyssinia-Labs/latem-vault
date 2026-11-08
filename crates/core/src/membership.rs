@@ -690,6 +690,19 @@ impl Membership {
         self.epochs.get(&collection).copied()
     }
 
+    /// Every collection a set_scope has named.
+    pub fn collections(&self) -> impl Iterator<Item = CollectionId> + '_ {
+        self.epochs.keys().copied()
+    }
+
+    /// The device, revoked or not, whose transport key is the Ed25519 key `endpoint`.
+    pub fn device_by_endpoint(&self, endpoint: &[u8; 32]) -> Option<&Device> {
+        self.devices.values().find(|device| {
+            device.info.transport_key.is_ed25519()
+                && device.info.transport_key.as_bytes()[1..] == endpoint[..]
+        })
+    }
+
     /// Whether `device` had at least `scope` on `collection` at some point during `epoch`, which
     /// is what signing a grant (`Read`) or a record (`Write`) under that epoch needs.
     pub fn had_scope(

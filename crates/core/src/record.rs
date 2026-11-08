@@ -249,13 +249,20 @@ impl Record {
         &self.header
     }
 
+    /// Checks the author's signature over the header.
+    pub fn verify(&self, author: &VerifyingKey) -> Result<()> {
+        author
+            .verify(
+                SignatureContext::Record,
+                &self.header_bytes,
+                &self.signature,
+            )
+            .map_err(|_| Error::InvalidRecord("the signature doesn't verify"))
+    }
+
     /// Checks the author's signature, then decrypts and checks the body.
     pub fn open(&self, author: &VerifyingKey, key: &SymmetricKey) -> Result<Body> {
-        author.verify(
-            SignatureContext::Record,
-            &self.header_bytes,
-            &self.signature,
-        )?;
+        self.verify(author)?;
         let plaintext = key.open(&self.header_bytes[..AAD_LEN], &self.sealed)?;
         let body = Body::decode(&plaintext)?;
         body.check(self.header.deleted)?;

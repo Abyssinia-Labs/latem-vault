@@ -1,0 +1,979 @@
+//! Sync sessions (sync.md): on one stream of a connection with ALPN `openvault/sync/1`, two
+//! members exchange hellos, bring their logs level, then reconcile every set they share.
+//!
+//! A session runs until 60 seconds pass without a message. While it runs, the device tells it of
+//! local writes and log changes through [`Notice`]s, so they reach the peer straight away.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use iroh::endpoint::{Connection, RecvStream, SendStream};
+use openvault_core::membership::LogEntry;
+use openvault_core::sets::{Fingerprint, ItemId, SetId, Summary};
+use openvault_core::{DeviceId, DeviceKeys, Received, Vault, VaultId};
+use openvault_crypto::hash::Hash;
+use tokio::sync::mpsc;
+use tokio::time::{Instant, timeout_at};
+use tracing::{debug, warn};
+
+use crate::EndpointKey;
+use crate::frame::{self, FrameError, Reason};
+use crate::wire::{
+    self, HELLO, ITEMS, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST, RECONCILE, ROOTS, Reader, WANT,
+};
+
+pub const ALPN: &[u8] = b"openvault/sync/1";
+
+/// How long a session waits for a message before it closes (sync.md, lifetime).
+pub const IDLE: Duration = Duration::from_secs(60);
+/// A range with at most this many items is sent as ids rather than a fingerprint.
+const IDS_LIMIT: usize = 32;
+/// How many ranges a fingerprint that differs splits into.
+const SPLIT: usize = 16;
+/// The most log entries one session takes (sync.md, who may request).
+const MAX_LOG: usize = 4096;
+/// The most ranges or ids one message may carry.
+const MAX_LIST: u16 = 1024;
+
+/// What a session needs from the device's store. Every call may wait on the database, so a
+/// session makes them from blocking sections.
+pub trait SyncStore: Send + Sync + 'static {
+    /// The vault id and this device's log head.
+    fn hello(&self) -> openvault_core::Result<(VaultId, u64, Hash)>;
+    fn log_from(&self, from: u64, max: u16) -> openvault_core::Result<Vec<LogEntry>>;
+    fn append_log(&self, entries: &[LogEntry]) -> openvault_core::Result<usize>;
+    /// The member, not revoked, whose transport key is `endpoint`.
+    fn member(&self, endpoint: &EndpointKey) -> Option<DeviceId>;
+    fn shared_sets(&self, peer: DeviceId) -> Vec<SetId>;
+    fn summary(&self, set: SetId) -> openvault_core::Result<Summary>;
+    fn ids(
+        &self,
+        set: SetId,
+        lower: &ItemId,
+        upper: Option<&ItemId>,
+    ) -> openvault_core::Result<Vec<ItemId>>;
+    fn items(&self, set: SetId, ids: &[ItemId]) -> openvault_core::Result<Vec<Vec<u8>>>;
+    fn receive(&self, set: SetId, item: &[u8]) -> openvault_core::Result<Received>;
+}
+
+/// What the device tells a running session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notice {
+    /// A local write changed this set.
+    Changed(SetId),
+    /// The log has new entries.
+    Log,
+}
+
+/// Which side opened the connection. The opener starts each set's reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Opener,
+    Accepter,
+}
+
+/// What a session did, for the device's log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Outcome {
+    pub log_entries: usize,
+    /// New records and grants this device took in.
+    pub received: usize,
+    /// Items the peer sent that failed their checks and were dropped.
+    pub dropped: usize,
+    pub sent: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    #[error(transparent)]
+    Frame(#[from] FrameError),
+    #[error("can't connect: {0}")]
+    Connect(String),
+    #[error("{0}")]
+    Refused(Reason),
+    #[error(transparent)]
+    Store(#[from] openvault_core::Error),
+}
+
+/// A range's upper bound, exclusive; `None` is the end of the id space.
+type Upper = Option<ItemId>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Mode {
+    Skip,
+    Fingerprint {
+        count: u64,
+        fingerprint: Fingerprint,
+    },
+    Ids(Vec<ItemId>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Range {
+    upper: Upper,
+    mode: Mode,
+}
+
+struct Session<S: SyncStore> {
+    store: Arc<S>,
+    send: SendStream,
+    role: Role,
+    peer_endpoint: EndpointKey,
+    vault: VaultId,
+    peer_head: Option<(u64, Hash)>,
+    /// Set once the logs are level and the peer is known to be a member.
+    peer: Option<DeviceId>,
+    shared: Vec<SetId>,
+    roots_sent: bool,
+    peer_roots: HashMap<SetId, (u64, Fingerprint)>,
+    reconciled: HashSet<SetId>,
+    log_requested: bool,
+    outcome: Outcome,
+}
+
+/// Runs a session on `connection` until `idle` passes without a message ([`IDLE`] outside
+/// tests), the peer closes it, or it fails.
+pub async fn run<S: SyncStore>(
+    connection: Connection,
+    role: Role,
+    store: Arc<S>,
+    mut notices: mpsc::Receiver<Notice>,
+    idle: Duration,
+) -> Result<Outcome, SyncError> {
+    let peer_endpoint = *connection.remote_id().as_bytes();
+    let (send, mut recv) = match role {
+        Role::Opener => connection.open_bi().await,
+        Role::Accepter => connection.accept_bi().await,
+    }
+    .map_err(|e| SyncError::Connect(e.to_string()))?;
+    let (vault, ..) = blocking(|| store.hello())?;
+    let mut session = Session {
+        store,
+        send,
+        role,
+        peer_endpoint,
+        vault,
+        peer_head: None,
+        peer: None,
+        shared: Vec::new(),
+        roots_sent: false,
+        peer_roots: HashMap::new(),
+        reconciled: HashSet::new(),
+        log_requested: false,
+        outcome: Outcome::default(),
+    };
+    let result = session.drive(&mut recv, &mut notices, idle).await;
+    if let Err(error) = &result {
+        let reason = match error {
+            SyncError::Refused(reason) => Some(*reason),
+            SyncError::Frame(FrameError::Bad(_)) => Some(Reason::BadMessage),
+            SyncError::Store(openvault_core::Error::Fork) => Some(Reason::Fork),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            frame::send_error(&mut session.send, reason, &error.to_string()).await;
+        }
+    } else {
+        let _ = session.send.finish();
+    }
+    connection.close(0u32.into(), b"done");
+    result.map(|()| session.outcome)
+}
+
+impl<S: SyncStore> Session<S> {
+    async fn drive(
+        &mut self,
+        recv: &mut RecvStream,
+        notices: &mut mpsc::Receiver<Notice>,
+        idle: Duration,
+    ) -> Result<(), SyncError> {
+        self.send_hello().await?;
+        let mut deadline = Instant::now() + idle;
+        loop {
+            tokio::select! {
+                message = timeout_at(deadline, frame::read(recv)) => {
+                    let Ok(message) = message else {
+                        return Ok(());
+                    };
+                    let (kind, body) = match message {
+                        Ok(message) => message,
+                        // The peer went idle first and closed.
+                        Err(FrameError::Connection(_)) if self.peer.is_some() => return Ok(()),
+                        Err(FrameError::Peer { reason, .. }) => return Err(SyncError::Refused(reason)),
+                        Err(e) => return Err(e.into()),
+                    };
+                    deadline = Instant::now() + idle;
+                    self.handle(kind, &body).await?;
+                }
+                Some(notice) = notices.recv() => self.notice(notice).await?,
+            }
+        }
+    }
+
+    async fn handle(&mut self, kind: u8, body: &[u8]) -> Result<(), SyncError> {
+        match kind {
+            HELLO => {
+                let mut reader = Reader(body);
+                let vault = VaultId::from_bytes(reader.array()?);
+                let head = (reader.u64()?, reader.array()?);
+                reader.finish()?;
+                if vault != self.vault {
+                    return Err(SyncError::Refused(Reason::WrongVault));
+                }
+                self.peer_head = Some(head);
+                self.progress().await
+            }
+            LOG_REQUEST => {
+                let (from, max) = wire::parse_log_request(body)?;
+                // Only members are answered; a revoked peer gets nothing (sync.md).
+                let endpoint = self.peer_endpoint;
+                if blocking(|| self.store.member(&endpoint)).is_none() {
+                    return Err(SyncError::Refused(Reason::NotAMember));
+                }
+                let entries = blocking(|| self.store.log_from(from, max.min(LOG_BATCH)))?;
+                frame::write(&mut self.send, LOG_ENTRIES, &wire::log_entries(&entries)).await?;
+                Ok(())
+            }
+            LOG_ENTRIES => {
+                self.log_requested = false;
+                let entries = wire::parse_log_entries(body)?;
+                if entries.is_empty() {
+                    return Err(FrameError::Bad("no log entries").into());
+                }
+                self.outcome.log_entries += entries.len();
+                if self.outcome.log_entries > MAX_LOG {
+                    return Err(FrameError::Bad("too many log entries").into());
+                }
+                let new = blocking(|| self.store.append_log(&entries))?;
+                if new > 0 {
+                    // The log changed, so what the devices share may have: start the roots over.
+                    self.reset_roots();
+                    self.send_hello().await?;
+                }
+                self.progress().await
+            }
+            ROOTS => {
+                let mut reader = Reader(body);
+                for _ in 0..reader.u16()? {
+                    let set = reader.set()?;
+                    let root = (reader.u64()?, reader.array()?);
+                    self.peer_roots.insert(set, root);
+                    // A changed root starts that set over.
+                    self.reconciled.remove(&set);
+                }
+                reader.finish()?;
+                self.progress().await
+            }
+            RECONCILE => {
+                let (set, ranges) = parse_reconcile(body)?;
+                self.require_shared(set)?;
+                self.answer(set, ranges).await
+            }
+            WANT => {
+                let mut reader = Reader(body);
+                let set = reader.set()?;
+                let count = reader.u16()?;
+                if count > MAX_LIST {
+                    return Err(FrameError::Bad("too many ids").into());
+                }
+                let ids: Vec<ItemId> = (0..count)
+                    .map(|_| reader.array())
+                    .collect::<Result<_, _>>()?;
+                reader.finish()?;
+                self.require_shared(set)?;
+                self.send_items(set, &ids).await
+            }
+            ITEMS => {
+                let (set, items) = wire::parse_items(body)?;
+                self.require_shared(set)?;
+                for item in items {
+                    match blocking(|| self.store.receive(set, item)) {
+                        Ok(Received::New) => self.outcome.received += 1,
+                        Ok(Received::Known) => {}
+                        Ok(Received::Unreadable) => {
+                            self.outcome.received += 1;
+                            warn!("a record from the peer didn't open; it's kept but not used");
+                        }
+                        // Dropped; reconciliation offers it again, and it may pass once the
+                        // log has grown (sync.md, dropped records).
+                        Err(error) => {
+                            self.outcome.dropped += 1;
+                            debug!("dropped an item from the peer: {error}");
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(FrameError::Bad("unexpected message").into()),
+        }
+    }
+
+    /// Requests log entries while the peer is ahead, then checks membership and sends roots once
+    /// the logs are level, then, on the opening side, starts reconciling the sets that differ.
+    async fn progress(&mut self) -> Result<(), SyncError> {
+        let Some(peer_head) = self.peer_head else {
+            return Ok(());
+        };
+        let (_, seq, hash) = blocking(|| self.store.hello())?;
+        if peer_head.0 > seq {
+            if !self.log_requested {
+                let max = LOG_BATCH.min(u16::try_from(peer_head.0 - seq).unwrap_or(LOG_BATCH));
+                frame::write(
+                    &mut self.send,
+                    LOG_REQUEST,
+                    &wire::log_request(seq + 1, max),
+                )
+                .await?;
+                self.log_requested = true;
+            }
+            return Ok(());
+        }
+        if peer_head.0 < seq {
+            // The peer is behind and will ask.
+            return Ok(());
+        }
+        if peer_head.1 != hash {
+            return Err(SyncError::Store(openvault_core::Error::Fork));
+        }
+        if self.peer.is_none() {
+            let endpoint = self.peer_endpoint;
+            let peer = blocking(|| self.store.member(&endpoint))
+                .ok_or(SyncError::Refused(Reason::NotAMember))?;
+            self.peer = Some(peer);
+        }
+        if !self.roots_sent {
+            let peer = self.peer.expect("set above");
+            self.shared = blocking(|| self.store.shared_sets(peer));
+            let sets = self.shared.clone();
+            self.send_roots(&sets).await?;
+            self.roots_sent = true;
+        }
+        if self.role == Role::Opener {
+            for set in self.shared.clone() {
+                if self.reconciled.contains(&set) {
+                    continue;
+                }
+                let Some(&(count, fingerprint)) = self.peer_roots.get(&set) else {
+                    continue;
+                };
+                self.reconciled.insert(set);
+                let summary = blocking(|| self.store.summary(set))?;
+                if (summary.count, summary.fingerprint()) == (count, fingerprint) {
+                    continue;
+                }
+                // One range over everything, as ids if there are few.
+                let mode = if summary.count as usize <= IDS_LIMIT {
+                    Mode::Ids(blocking(|| self.store.ids(set, &[0; 32], None))?)
+                } else {
+                    Mode::Fingerprint {
+                        count: summary.count,
+                        fingerprint: summary.fingerprint(),
+                    }
+                };
+                let range = Range { upper: None, mode };
+                frame::write(&mut self.send, RECONCILE, &encode_reconcile(set, &[range])).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn notice(&mut self, notice: Notice) -> Result<(), SyncError> {
+        match notice {
+            Notice::Log => {
+                self.reset_roots();
+                self.send_hello().await?;
+                self.progress().await
+            }
+            Notice::Changed(set) if self.roots_sent && self.shared.contains(&set) => {
+                // The peer learns the new root; the opener also starts the set over itself.
+                self.send_roots(&[set]).await?;
+                self.reconciled.remove(&set);
+                self.progress().await
+            }
+            Notice::Changed(_) => Ok(()),
+        }
+    }
+
+    /// Answers a reconcile range by range (sync.md, answering).
+    async fn answer(&mut self, set: SetId, ranges: Vec<Range>) -> Result<(), SyncError> {
+        let mut lower: ItemId = [0; 32];
+        let mut reply: Vec<Range> = Vec::new();
+        let mut to_send: Vec<ItemId> = Vec::new();
+        let mut to_want: Vec<ItemId> = Vec::new();
+        for range in ranges {
+            match range.mode {
+                Mode::Skip => reply.push(range.clone()),
+                Mode::Fingerprint { count, fingerprint } => {
+                    let mine = blocking(|| self.store.ids(set, &lower, range.upper.as_ref()))?;
+                    let summary = Summary::of(&mine);
+                    if (summary.count, summary.fingerprint()) == (count, fingerprint) {
+                        reply.push(Range {
+                            upper: range.upper,
+                            mode: Mode::Skip,
+                        });
+                    } else if mine.len() <= IDS_LIMIT {
+                        reply.push(Range {
+                            upper: range.upper,
+                            mode: Mode::Ids(mine),
+                        });
+                    } else {
+                        reply.extend(split(&mine, range.upper));
+                    }
+                }
+                Mode::Ids(theirs) => {
+                    let mine = blocking(|| self.store.ids(set, &lower, range.upper.as_ref()))?;
+                    let theirs_set: HashSet<&ItemId> = theirs.iter().collect();
+                    let mine_set: HashSet<&ItemId> = mine.iter().collect();
+                    to_send.extend(mine.iter().filter(|id| !theirs_set.contains(id)));
+                    to_want.extend(theirs.iter().filter(|id| !mine_set.contains(id)));
+                    reply.push(Range {
+                        upper: range.upper,
+                        mode: Mode::Skip,
+                    });
+                }
+            }
+            if let Some(upper) = range.upper {
+                lower = upper;
+            }
+        }
+        if !to_send.is_empty() {
+            self.send_items(set, &to_send).await?;
+        }
+        for ids in to_want.chunks(usize::from(MAX_LIST)) {
+            let mut body = set.as_bytes().to_vec();
+            body.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+            for id in ids {
+                body.extend_from_slice(id);
+            }
+            frame::write(&mut self.send, WANT, &body).await?;
+        }
+        let reply = merge_skips(reply);
+        // A reply of only skips means the set is settled, and needs no answer.
+        if reply.iter().any(|range| range.mode != Mode::Skip) {
+            frame::write(&mut self.send, RECONCILE, &encode_reconcile(set, &reply)).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_items(&mut self, set: SetId, ids: &[ItemId]) -> Result<(), SyncError> {
+        let items = blocking(|| self.store.items(set, ids))?;
+        self.outcome.sent += items.len();
+        for message in wire::items(set, &items) {
+            frame::write(&mut self.send, ITEMS, &message).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_hello(&mut self) -> Result<(), SyncError> {
+        let (vault, seq, hash) = blocking(|| self.store.hello())?;
+        let body = [&vault.as_bytes()[..], &seq.to_be_bytes(), &hash].concat();
+        frame::write(&mut self.send, HELLO, &body).await?;
+        Ok(())
+    }
+
+    async fn send_roots(&mut self, sets: &[SetId]) -> Result<(), SyncError> {
+        let mut body = (sets.len() as u16).to_be_bytes().to_vec();
+        for &set in sets {
+            let summary = blocking(|| self.store.summary(set))?;
+            body.extend_from_slice(set.as_bytes());
+            body.extend_from_slice(&summary.count.to_be_bytes());
+            body.extend_from_slice(&summary.fingerprint());
+        }
+        frame::write(&mut self.send, ROOTS, &body).await?;
+        Ok(())
+    }
+
+    fn reset_roots(&mut self) {
+        self.roots_sent = false;
+        self.peer_roots.clear();
+        self.reconciled.clear();
+    }
+
+    fn require_shared(&self, set: SetId) -> Result<(), SyncError> {
+        if self.roots_sent && self.shared.contains(&set) {
+            Ok(())
+        } else {
+            // Only sets both devices may hold are served (design §9, serving).
+            Err(FrameError::Bad("a set this device doesn't share with the peer").into())
+        }
+    }
+}
+
+/// A vault behind a mutex is a sync store. `hello` also picks up writes by other processes
+/// (service.md, the store).
+impl<K: DeviceKeys + Send + 'static> SyncStore for Mutex<Vault<K>> {
+    fn hello(&self) -> openvault_core::Result<(VaultId, u64, Hash)> {
+        let mut vault = self.lock().expect("poisoned");
+        vault.refresh()?;
+        let (seq, hash) = vault
+            .membership()
+            .ok_or(openvault_core::Error::NoLog)?
+            .head();
+        Ok((vault.vault_id(), seq, hash))
+    }
+
+    fn log_from(&self, from: u64, max: u16) -> openvault_core::Result<Vec<LogEntry>> {
+        self.lock().expect("poisoned").log_from(from, max)
+    }
+
+    fn append_log(&self, entries: &[LogEntry]) -> openvault_core::Result<usize> {
+        self.lock().expect("poisoned").append_log(entries)
+    }
+
+    fn member(&self, endpoint: &EndpointKey) -> Option<DeviceId> {
+        self.lock().expect("poisoned").member_by_endpoint(endpoint)
+    }
+
+    fn shared_sets(&self, peer: DeviceId) -> Vec<SetId> {
+        self.lock().expect("poisoned").shared_sets(peer)
+    }
+
+    fn summary(&self, set: SetId) -> openvault_core::Result<Summary> {
+        self.lock().expect("poisoned").set_summary(set)
+    }
+
+    fn ids(
+        &self,
+        set: SetId,
+        lower: &ItemId,
+        upper: Option<&ItemId>,
+    ) -> openvault_core::Result<Vec<ItemId>> {
+        self.lock().expect("poisoned").set_ids(set, lower, upper)
+    }
+
+    fn items(&self, set: SetId, ids: &[ItemId]) -> openvault_core::Result<Vec<Vec<u8>>> {
+        self.lock().expect("poisoned").set_items(set, ids)
+    }
+
+    fn receive(&self, set: SetId, item: &[u8]) -> openvault_core::Result<Received> {
+        self.lock().expect("poisoned").receive(set, item)
+    }
+}
+
+/// Splits `ids` (in order, more than [`IDS_LIMIT`]) into [`SPLIT`] ranges of nearly equal count,
+/// each with its fingerprint. The last one runs to `upper`.
+fn split(ids: &[ItemId], upper: Upper) -> Vec<Range> {
+    let n = ids.len();
+    (0..SPLIT)
+        .map(|k| {
+            let (start, end) = (k * n / SPLIT, (k + 1) * n / SPLIT);
+            let summary = Summary::of(&ids[start..end]);
+            Range {
+                upper: if k + 1 == SPLIT {
+                    upper
+                } else {
+                    Some(ids[end])
+                },
+                mode: Mode::Fingerprint {
+                    count: summary.count,
+                    fingerprint: summary.fingerprint(),
+                },
+            }
+        })
+        .collect()
+}
+
+/// Adjacent skips become one range.
+fn merge_skips(ranges: Vec<Range>) -> Vec<Range> {
+    let mut merged: Vec<Range> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if range.mode == Mode::Skip
+            && let Some(last) = merged.last_mut()
+            && last.mode == Mode::Skip
+        {
+            last.upper = range.upper;
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+/// `set id (17) ‖ range count (u16) ‖ ranges`, each `upper ‖ mode ‖ payload` (sync.md, ranges).
+fn encode_reconcile(set: SetId, ranges: &[Range]) -> Vec<u8> {
+    let mut out = set.as_bytes().to_vec();
+    out.extend_from_slice(&(ranges.len() as u16).to_be_bytes());
+    for range in ranges {
+        match &range.upper {
+            Some(id) => {
+                out.push(0x00);
+                out.extend_from_slice(id);
+            }
+            None => out.push(0x01),
+        }
+        match &range.mode {
+            Mode::Skip => out.push(0x00),
+            Mode::Fingerprint { count, fingerprint } => {
+                out.push(0x01);
+                out.extend_from_slice(&count.to_be_bytes());
+                out.extend_from_slice(fingerprint);
+            }
+            Mode::Ids(ids) => {
+                out.push(0x02);
+                out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+                for id in ids {
+                    out.extend_from_slice(id);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Decodes a reconcile and checks its ranges cover the id space, in order.
+fn parse_reconcile(body: &[u8]) -> Result<(SetId, Vec<Range>), FrameError> {
+    let mut reader = Reader(body);
+    let set = reader.set()?;
+    let count = reader.u16()?;
+    if count == 0 || count > MAX_LIST {
+        return Err(FrameError::Bad("range count"));
+    }
+    let mut ranges = Vec::with_capacity(usize::from(count));
+    let mut last: Option<ItemId> = None;
+    for i in 0..count {
+        let upper = match reader.u8()? {
+            0x00 => Some(reader.array()?),
+            0x01 if i + 1 == count => None,
+            _ => return Err(FrameError::Bad("range bound")),
+        };
+        if let (Some(previous), Some(upper)) = (last, upper)
+            && upper <= previous
+        {
+            return Err(FrameError::Bad("ranges out of order"));
+        }
+        if upper.is_some() && i + 1 == count {
+            return Err(FrameError::Bad("the ranges don't reach the end"));
+        }
+        last = upper;
+        let mode = match reader.u8()? {
+            0x00 => Mode::Skip,
+            0x01 => Mode::Fingerprint {
+                count: reader.u64()?,
+                fingerprint: reader.array()?,
+            },
+            0x02 => {
+                let n = reader.u16()?;
+                if n > MAX_LIST {
+                    return Err(FrameError::Bad("too many ids"));
+                }
+                Mode::Ids((0..n).map(|_| reader.array()).collect::<Result<_, _>>()?)
+            }
+            _ => return Err(FrameError::Bad("range mode")),
+        };
+        ranges.push(Range { upper, mode });
+    }
+    reader.finish()?;
+    Ok((set, ranges))
+}
+
+/// Runs a store call that may wait on the database without holding up the runtime's other
+/// tasks. Sessions run on a multi-threaded runtime.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    tokio::task::block_in_place(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconciles_round_trip_and_are_checked() {
+        let ranges = vec![
+            Range {
+                upper: Some([1; 32]),
+                mode: Mode::Skip,
+            },
+            Range {
+                upper: Some([2; 32]),
+                mode: Mode::Fingerprint {
+                    count: 40,
+                    fingerprint: [9; 16],
+                },
+            },
+            Range {
+                upper: None,
+                mode: Mode::Ids(vec![[3; 32], [4; 32]]),
+            },
+        ];
+        let body = encode_reconcile(SetId::GRANTS, &ranges);
+        assert_eq!(
+            parse_reconcile(&body).unwrap(),
+            (SetId::GRANTS, ranges.clone())
+        );
+
+        let out_of_order = [ranges[1].clone(), ranges[0].clone(), ranges[2].clone()];
+        assert!(parse_reconcile(&encode_reconcile(SetId::GRANTS, &out_of_order)).is_err());
+        assert!(parse_reconcile(&encode_reconcile(SetId::GRANTS, &ranges[..2])).is_err());
+    }
+
+    #[test]
+    fn splits_cover_the_range_in_nearly_equal_parts() {
+        let ids: Vec<ItemId> = (0..100u8).map(|i| [i; 32]).collect();
+        let ranges = split(&ids, None);
+        assert_eq!(ranges.len(), SPLIT);
+        assert_eq!(ranges.last().unwrap().upper, None);
+        let total: u64 = ranges
+            .iter()
+            .map(|range| match range.mode {
+                Mode::Fingerprint { count, .. } => count,
+                _ => panic!("not a fingerprint"),
+            })
+            .sum();
+        assert_eq!(total, 100);
+        assert_eq!(ranges[0].upper, Some(ids[6]));
+        assert_eq!(
+            merge_skips(vec![
+                Range {
+                    upper: Some([1; 32]),
+                    mode: Mode::Skip
+                },
+                Range {
+                    upper: None,
+                    mode: Mode::Skip
+                },
+            ]),
+            [Range {
+                upper: None,
+                mode: Mode::Skip
+            }]
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use openvault_core::join::JoinRequest;
+    use openvault_core::membership::{DeviceName, Scope};
+    use openvault_core::{CollectionId, Kind, SoftwareKeys, transport_seed};
+    use openvault_crypto::RecoveryKey;
+
+    use super::*;
+    use crate::{Node, Options};
+
+    type Store = Mutex<Vault<SoftwareKeys>>;
+
+    struct Pair {
+        _dir: tempfile::TempDir,
+        admin: Arc<Store>,
+        joined: Arc<Store>,
+        admin_node: Node,
+        joined_node: Node,
+        latem: CollectionId,
+    }
+
+    /// An admin vault with `latem` and `ssh`, and a device that joined it with read on `latem`,
+    /// each with an endpoint that accepts sync.
+    async fn pair(entries: usize) -> Pair {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery = RecoveryKey::generate();
+        let admin_keys = SoftwareKeys::generate();
+        let admin_seed = transport_seed(&admin_keys);
+        let mut admin = Vault::create(
+            &dir.path().join("admin.db"),
+            admin_keys,
+            &recovery,
+            "MacBook",
+            None,
+        )
+        .unwrap();
+        let latem = admin
+            .create_collection("latem", &recovery.admin_signing_key())
+            .unwrap();
+        admin
+            .create_collection("ssh", &recovery.admin_signing_key())
+            .unwrap();
+        for i in 0..entries {
+            admin
+                .set(
+                    latem,
+                    &format!("prod/KEY_{i}"),
+                    Kind::Secret,
+                    format!("value {i}").as_bytes(),
+                )
+                .unwrap();
+        }
+        let joiner_keys = SoftwareKeys::generate();
+        let joiner_seed = transport_seed(&joiner_keys);
+        let device = DeviceId::random();
+        let name = DeviceName {
+            platform: "linux".into(),
+            name: "Desktop".into(),
+        };
+        let request = JoinRequest::sign(&[1; 32], device, &joiner_keys, name.clone()).unwrap();
+        let approval = admin
+            .approve_join(
+                &request,
+                &[(latem, Scope::Read)],
+                &recovery.admin_signing_key(),
+            )
+            .unwrap();
+        let head = admin.membership().unwrap().head();
+        let joined = Vault::join(
+            &dir.path().join("joined.db"),
+            joiner_keys,
+            device,
+            &name,
+            head,
+            &approval.log,
+            &approval.grants,
+        )
+        .unwrap();
+        let options = || Options {
+            alpns: vec![ALPN.to_vec()],
+            ..Options::default()
+        };
+        Pair {
+            _dir: dir,
+            admin: Arc::new(Mutex::new(admin)),
+            joined: Arc::new(Mutex::new(joined)),
+            admin_node: Node::start(&admin_seed, options()).await.unwrap().0,
+            joined_node: Node::start(&joiner_seed, options()).await.unwrap().0,
+            latem,
+        }
+    }
+
+    /// Runs one session, `opener` dialing `accepter`, with `idle` as the idle time. Returns both
+    /// outcomes. `during` runs once the session has started.
+    async fn session(
+        opener: (&Node, &Arc<Store>),
+        accepter: (&Node, &Arc<Store>),
+        idle: Duration,
+        during: impl AsyncFnOnce(&mpsc::Sender<Notice>),
+    ) -> (Outcome, Outcome) {
+        let (accept_tx, accept_rx) = mpsc::channel(8);
+        let accept_store = accepter.1.clone();
+        let endpoint = accepter.0.endpoint().clone();
+        let accepting = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            run(connection, Role::Accepter, accept_store, accept_rx, idle).await
+        });
+        let id = iroh::EndpointId::from_bytes(&accepter.0.id()).unwrap();
+        let connection = opener.0.endpoint().connect(id, ALPN).await.unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let opening = tokio::spawn(run(connection, Role::Opener, opener.1.clone(), rx, idle));
+        during(&tx).await;
+        drop(accept_tx);
+        (
+            opening.await.unwrap().unwrap(),
+            accepting.await.unwrap().unwrap(),
+        )
+    }
+
+    fn summaries(store: &Store, latem: CollectionId) -> (Summary, Summary) {
+        let vault = store.lock().unwrap();
+        (
+            vault.set_summary(SetId::records(latem)).unwrap(),
+            vault.set_summary(SetId::GRANTS).unwrap(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joined_device_catches_up_and_later_writes_follow() {
+        let p = pair(2).await;
+        let admin = (&p.admin_node, &p.admin);
+        let joined = (&p.joined_node, &p.joined);
+        let (opened, accepted) = session(admin, joined, Duration::from_secs(2), async |_| {}).await;
+        // The collection record and two entries, and four grants: the admin's and the recovery
+        // key's for both collections. Every member keeps every grant (sync.md, who stores
+        // grants), even ones it can't open.
+        assert_eq!(accepted.received, 3 + 4);
+        assert_eq!(opened.dropped + accepted.dropped, 0);
+        assert_eq!(summaries(&p.joined, p.latem), summaries(&p.admin, p.latem));
+        {
+            let mut vault = p.joined.lock().unwrap();
+            assert_eq!(vault.collection("latem").unwrap(), p.latem);
+            let entry = vault.get(p.latem, "prod/KEY_1").unwrap().unwrap();
+            assert_eq!(&entry.value[..], b"value 1");
+            assert!(vault.collection("ssh").is_err(), "no scope on ssh");
+        }
+
+        // A later write reaches it in the next session, which it opens this time.
+        p.admin
+            .lock()
+            .unwrap()
+            .set(p.latem, "prod/NEW", Kind::Var, b"fresh")
+            .unwrap();
+        let (opened, _) = session(joined, admin, Duration::from_secs(2), async |_| {}).await;
+        assert_eq!(opened.received, 1);
+        let entry = p
+            .joined
+            .lock()
+            .unwrap()
+            .get(p.latem, "prod/NEW")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&entry.value[..], b"fresh");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notices_reach_a_running_session() {
+        let p = pair(1).await;
+        let admin = (&p.admin_node, &p.admin);
+        let joined = (&p.joined_node, &p.joined);
+        let admin_store = p.admin.clone();
+        let latem = p.latem;
+        let (opened, _) = session(
+            admin,
+            joined,
+            Duration::from_secs(3),
+            async move |notices| {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                admin_store
+                    .lock()
+                    .unwrap()
+                    .set(latem, "prod/LIVE", Kind::Var, b"now")
+                    .unwrap();
+                notices
+                    .send(Notice::Changed(SetId::records(latem)))
+                    .await
+                    .unwrap();
+            },
+        )
+        .await;
+        assert!(opened.sent >= 4, "{opened:?}");
+        let entry = p
+            .joined
+            .lock()
+            .unwrap()
+            .get(p.latem, "prod/LIVE")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&entry.value[..], b"now");
+    }
+
+    /// More than 32 items on each side, overlapping, settles through fingerprints and splits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_sets_settle_through_fingerprints() {
+        let p = pair(100).await;
+        let set = SetId::records(p.latem);
+        // Give the joined device 40 of the records and the grants first.
+        {
+            let admin = p.admin.lock().unwrap();
+            let mut joined = p.joined.lock().unwrap();
+            for grant in admin
+                .set_items(
+                    SetId::GRANTS,
+                    &admin.set_ids(SetId::GRANTS, &[0; 32], None).unwrap(),
+                )
+                .unwrap()
+            {
+                joined.receive(SetId::GRANTS, &grant).unwrap();
+            }
+            let ids = admin.set_ids(set, &[0; 32], None).unwrap();
+            let some: Vec<ItemId> = ids.iter().step_by(2).take(40).copied().collect();
+            for item in admin.set_items(set, &some).unwrap() {
+                joined.receive(set, &item).unwrap();
+            }
+        }
+        let admin = (&p.admin_node, &p.admin);
+        let joined = (&p.joined_node, &p.joined);
+        session(joined, admin, Duration::from_secs(2), async |_| {}).await;
+        let (admin_records, _) = summaries(&p.admin, p.latem);
+        let (joined_records, _) = summaries(&p.joined, p.latem);
+        assert_eq!(admin_records.count, 101);
+        assert_eq!(joined_records, admin_records);
+        let listed = p.joined.lock().unwrap().list(p.latem).unwrap().len();
+        assert_eq!(listed, 100);
+    }
+}

@@ -18,8 +18,11 @@ use openvault_crypto::hash::Hash;
 use openvault_crypto::pake::{self, JoinKeys, Pake, Side};
 use tokio::time::{Instant, timeout, timeout_at};
 
+use openvault_core::sets::SetId;
+
 use crate::EndpointKey;
 use crate::frame::{self, FrameError, Reason};
+use crate::wire::{self, ITEMS, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST};
 
 pub const ALPN: &[u8] = b"openvault/join/1";
 
@@ -28,18 +31,7 @@ const CONFIRM: u8 = 0x21;
 const REQUEST: u8 = 0x22;
 const ACCEPTED: u8 = 0x23;
 const JOINED: u8 = 0x24;
-const LOG_REQUEST: u8 = 0x02;
-const LOG_ENTRIES: u8 = 0x03;
-const ITEMS: u8 = 0x07;
-
-/// The grants set's id (sync.md, sets).
-const GRANTS_SET: [u8; 17] = {
-    let mut id = [0; 17];
-    id[0] = 0x02;
-    id
-};
-/// Log entries per request, and in one session (sync.md, log exchange).
-const LOG_BATCH: u16 = 64;
+/// The most log entries one join takes (sync.md, who may request).
 const MAX_LOG: usize = 4096;
 /// How long a step may take when nobody has to do anything.
 const STEP: Duration = Duration::from_secs(30);
@@ -168,18 +160,17 @@ impl AdminSession {
             let (kind, body) = step(&mut self.recv).await?;
             match kind {
                 LOG_REQUEST => {
-                    let (from, max) = parse_log_request(&body)?;
+                    let (from, max) = wire::parse_log_request(&body)?;
                     let start = usize::try_from(from).unwrap_or(usize::MAX).min(log.len());
                     let end = (start + usize::from(max.min(LOG_BATCH))).min(log.len());
-                    let mut entries = (end - start).to_be_bytes()[6..].to_vec();
-                    for entry in &log[start..end] {
-                        let bytes = entry.to_bytes();
-                        entries.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-                        entries.extend_from_slice(&bytes);
-                    }
+                    let entries = wire::log_entries(&log[start..end]);
                     frame::write(&mut self.send, LOG_ENTRIES, &entries).await?;
                     if end == log.len() && !grants_sent {
-                        frame::write(&mut self.send, ITEMS, &encode_grants(grants)).await?;
+                        let grants: Vec<Vec<u8>> = grants.iter().map(Grant::to_bytes).collect();
+                        // Grants are small: one message holds a join's.
+                        for message in wire::items(SetId::GRANTS, &grants) {
+                            frame::write(&mut self.send, ITEMS, &message).await?;
+                        }
                         grants_sent = true;
                     }
                 }
@@ -292,12 +283,11 @@ impl JoinerSession {
         let mut log: Vec<LogEntry> = Vec::with_capacity(total);
         while log.len() < total {
             let max = LOG_BATCH.min(u16::try_from(total - log.len()).unwrap_or(LOG_BATCH));
-            let mut request = (log.len() as u64).to_be_bytes().to_vec();
-            request.extend_from_slice(&max.to_be_bytes());
+            let request = wire::log_request(log.len() as u64, max);
             frame::write(&mut self.send, LOG_REQUEST, &request).await?;
             let (kind, body) = step(&mut self.recv).await?;
             expect(kind, LOG_ENTRIES)?;
-            let entries = parse_entries(&body)?;
+            let entries = wire::parse_log_entries(&body)?;
             if entries.is_empty() || entries.len() > usize::from(max) {
                 return Err(FrameError::Bad("log entries").into());
             }
@@ -310,7 +300,15 @@ impl JoinerSession {
         }
         let (kind, body) = step(&mut self.recv).await?;
         expect(kind, ITEMS)?;
-        Ok((log, parse_grants(&body)?))
+        let (set, items) = wire::parse_items(&body)?;
+        if set != SetId::GRANTS {
+            return Err(FrameError::Bad("items from another set").into());
+        }
+        let grants = items
+            .into_iter()
+            .map(Grant::from_bytes)
+            .collect::<openvault_core::Result<_>>()?;
+        Ok((log, grants))
     }
 
     /// Tells the admin the join is complete.
@@ -349,79 +347,6 @@ fn expect(kind: u8, expected: u8) -> Result<(), JoinError> {
     } else {
         Err(FrameError::Bad("unexpected message").into())
     }
-}
-
-fn parse_log_request(body: &[u8]) -> Result<(u64, u16), JoinError> {
-    let bytes: [u8; 10] = body
-        .try_into()
-        .map_err(|_| FrameError::Bad("log request"))?;
-    Ok((
-        u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes")),
-        u16::from_be_bytes(bytes[8..].try_into().expect("2 bytes")),
-    ))
-}
-
-/// `count (u16) ‖ entries, each u32 length ‖ entry`.
-fn parse_entries(body: &[u8]) -> Result<Vec<LogEntry>, JoinError> {
-    let mut rest = body;
-    let count = take_u16(&mut rest)?;
-    let mut entries = Vec::with_capacity(usize::from(count));
-    for _ in 0..count {
-        entries.push(LogEntry::from_bytes(take_item(&mut rest)?)?);
-    }
-    if !rest.is_empty() {
-        return Err(FrameError::Bad("trailing bytes").into());
-    }
-    Ok(entries)
-}
-
-/// `set id (17) ‖ count (u16) ‖ items, each u32 length ‖ item` (sync.md, range reconciliation).
-fn encode_grants(grants: &[Grant]) -> Vec<u8> {
-    let mut out = GRANTS_SET.to_vec();
-    out.extend_from_slice(&(grants.len() as u16).to_be_bytes());
-    for grant in grants {
-        let bytes = grant.to_bytes();
-        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        out.extend_from_slice(&bytes);
-    }
-    out
-}
-
-fn parse_grants(body: &[u8]) -> Result<Vec<Grant>, JoinError> {
-    let (set, mut rest) = body
-        .split_first_chunk::<17>()
-        .ok_or(FrameError::Bad("items"))?;
-    if *set != GRANTS_SET {
-        return Err(FrameError::Bad("items from another set").into());
-    }
-    let count = take_u16(&mut rest)?;
-    let mut grants = Vec::with_capacity(usize::from(count));
-    for _ in 0..count {
-        grants.push(Grant::from_bytes(take_item(&mut rest)?)?);
-    }
-    if !rest.is_empty() {
-        return Err(FrameError::Bad("trailing bytes").into());
-    }
-    Ok(grants)
-}
-
-fn take_u16(rest: &mut &[u8]) -> Result<u16, JoinError> {
-    let (count, after) = rest
-        .split_first_chunk::<2>()
-        .ok_or(FrameError::Bad("count"))?;
-    *rest = after;
-    Ok(u16::from_be_bytes(*count))
-}
-
-fn take_item<'a>(rest: &mut &'a [u8]) -> Result<&'a [u8], JoinError> {
-    let (len, after) = rest
-        .split_first_chunk::<4>()
-        .ok_or(FrameError::Bad("item length"))?;
-    let (item, after) = after
-        .split_at_checked(u32::from_be_bytes(*len) as usize)
-        .ok_or(FrameError::Bad("item"))?;
-    *rest = after;
-    Ok(item)
 }
 
 #[cfg(test)]

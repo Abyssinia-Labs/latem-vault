@@ -30,7 +30,7 @@ openvault join                                   # on the new device: shows a 6-
 openvault approve --read latem                   # on the MacBook: the code, a review, then Touch ID
 ```
 
-The code and the review make sure the device you approve is the one in front of you. The new device gets the vault's membership log and the keys for the collections it may read. Their secrets reach it with sync, which comes next.
+The code and the review make sure the device you approve is the one in front of you. The new device gets the vault's membership log and the keys for the collections it may read. With `openvault service` running on both, their secrets follow within seconds, and so does every later change.
 
 `openvault run` passes every entry under `prod/` to the command as an environment variable, so `prod/SENTRY_DSN` becomes `SENTRY_DSN`. `--prefix` puts a prefix in front of every name. latem reads its secrets from `LATEM_SECRET_<NAME>`, so it runs like this:
 

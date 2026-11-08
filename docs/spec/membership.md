@@ -2,7 +2,7 @@
 
 Status: draft, 2026-11-05. Implemented by `crates/core`: the format and rules in `membership`, and keeping the log in the local store in `store`. Exchanging entries between devices is in [sync.md](sync.md#log-exchange), and adding a device in [join.md](join.md). Builds on [crypto.md](crypto.md) and [records.md](records.md); the design is in [design §7](../design.md#membership-log) and [§8](../design.md#8-joining).
 
-Changed 2026-11-07: device names and platforms are sealed with the vault's names key (below). The code still writes them in the clear. Vaults created before the change are created again once it is implemented.
+Changed 2026-11-07: device names and platforms are sealed with the vault's names key (below). A store whose log was written before the change (store version 2, records.md) refuses to open, and its vault is created again.
 
 The membership log decides who is in a vault:
 
@@ -34,9 +34,10 @@ signature   65          the signer's signature over the unsigned part, context "
 
 Keys inside payloads use the crypto.md encodings, whose first bytes give their length: verifying keys are 33 bytes (Ed25519) or 66 (P-256), wrapping keys 34 (X25519) or 67 (P-256).
 
-**Test vector.** The genesis entry of vault `01` × 16 is made with the crypto.md recovery key test vector (secret = 32 zero bytes). It lists only the recovery admin key and is signed by it.
-- In the format without a names key it is 228 bytes long, with hash `77b53378f73774df461b6e6444fdaf4a3f796dce377bb13372aeaee33d1d3cc5`. Like the crypto.md vectors, it comes from this implementation and is pinned in its tests.
-- Genesis now also carries the wrapped names key, and HPKE wrapping is randomized. The vector will therefore be pinned again with a fixed names key and a fixed HPKE ephemeral key.
+**Test vector.** The genesis entry of vault `01` × 16, made with the crypto.md recovery key test vector (secret = 32 zero bytes), lists only the recovery admin key and is signed by it.
+- Its names key is `02` × 32. HPKE wrapping is randomized, so the vector fixes the wrapped names key: `00205bb0d4242e0a76d9ae61bd757c40c3151583ceb47c685b0ac5b305357c8a5153f00bdc8e12a46c0770fc09ee0f383361335f34424132898bacea2cb71e4e12cd8c5c4175a02bde50f4deeb790144ffa3`. It unwraps with the recovery key.
+- The entry is 310 bytes long, with hash `761c2db1a367fecf09cb6ebaa3ea6d9589968d0ea2365d0331f000f9b2e50e14`.
+- Like the crypto.md vectors, it comes from this implementation and is pinned in its tests.
 
 ## Types
 

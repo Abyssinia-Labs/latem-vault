@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 
 use openvault_crypto::hash::{self, Hash, contexts};
-use openvault_crypto::{Signature, SignatureContext, SigningKey, VerifyingKey, WrapKey};
+use openvault_crypto::{
+    Signature, SignatureContext, SigningKey, SymmetricKey, VerifyingKey, WrapKey, WrappedKey,
+};
 
 use crate::{CollectionId, DeviceId, Error, Result, VaultId};
 
@@ -17,6 +19,12 @@ pub const MAX_PAYLOAD_LEN: usize = 1024;
 pub const MAX_ADMINS: usize = 8;
 const MAX_PLATFORM_LEN: usize = 16;
 pub const MAX_NAME_LEN: usize = 64;
+/// Room for the longest platform and name with their lengths, so every sealed name is the
+/// same size and doesn't give its length away (membership.md, names key).
+const NAME_PLAINTEXT_LEN: usize = 1 + MAX_PLATFORM_LEN + 1 + MAX_NAME_LEN;
+/// The padded plaintext with XChaCha20-Poly1305's 24-byte nonce and 16-byte tag.
+pub const SEALED_NAME_LEN: usize = 24 + NAME_PLAINTEXT_LEN + 16;
+const NAMES_KEY_LABEL: &[u8] = b"names key\0";
 
 const GENESIS: u8 = 0x01;
 const ADD_DEVICE: u8 = 0x02;
@@ -58,7 +66,97 @@ impl Scope {
     }
 }
 
-/// A device's description and public keys, as add_device records them.
+/// The context the names key is wrapped with: `"names key" ‖ 0x00 ‖ vault id`. At 26 bytes
+/// it can't be confused with a collection key's, which is always 36 (crypto.md).
+pub fn names_key_context(vault: VaultId) -> Vec<u8> {
+    [NAMES_KEY_LABEL, vault.as_bytes()].concat()
+}
+
+/// A device's platform and name, as people see them. The log keeps them sealed with the
+/// vault's names key, so the coordinator's copy doesn't show them (membership.md, names key).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceName {
+    /// Such as `macos`. Shown to people only.
+    pub platform: String,
+    /// Such as `MacBook`.
+    pub name: String,
+}
+
+impl DeviceName {
+    /// Seals the platform and name for `device`'s add_device entry in `vault`.
+    pub fn seal(
+        &self,
+        names_key: &SymmetricKey,
+        vault: VaultId,
+        device: DeviceId,
+    ) -> Result<SealedName> {
+        self.check()?;
+        let mut plaintext = zeroize::Zeroizing::new(Vec::with_capacity(NAME_PLAINTEXT_LEN));
+        for text in [&self.platform, &self.name] {
+            plaintext.push(u8::try_from(text.len()).expect("checked against the limits"));
+            plaintext.extend_from_slice(text.as_bytes());
+        }
+        plaintext.resize(NAME_PLAINTEXT_LEN, 0);
+        let sealed = names_key.seal(&name_aad(vault, device), &plaintext);
+        Ok(SealedName(
+            sealed
+                .try_into()
+                .expect("the plaintext is padded to a fixed length"),
+        ))
+    }
+
+    fn check(&self) -> Result<()> {
+        let platform = &self.platform;
+        let name = &self.name;
+        let result = if platform.is_empty()
+            || platform.len() > MAX_PLATFORM_LEN
+            || !platform
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        {
+            Err("the platform must be 1 to 16 of a-z and 0-9")
+        } else if name.is_empty() || name.len() > MAX_NAME_LEN || name.chars().any(char::is_control)
+        {
+            Err("the device name must be 1 to 64 bytes with no control characters")
+        } else {
+            Ok(())
+        };
+        result.map_err(Error::InvalidLogEntry)
+    }
+}
+
+/// A device's platform and name, sealed with the names key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedName([u8; SEALED_NAME_LEN]);
+
+impl SealedName {
+    /// Opens the platform and name of `device` in `vault`. Fails if they were sealed for
+    /// another device or vault, or with another key, or break the name rules.
+    pub fn open(
+        &self,
+        names_key: &SymmetricKey,
+        vault: VaultId,
+        device: DeviceId,
+    ) -> Result<DeviceName> {
+        let plaintext = names_key.open(&name_aad(vault, device), &self.0)?;
+        let mut r = Reader(&plaintext[..]);
+        let platform = r.short_text()?;
+        let name = r.short_text()?;
+        if r.0.iter().any(|&b| b != 0) {
+            return Err(invalid("the sealed name isn't padded with zeros"));
+        }
+        let name = DeviceName { platform, name };
+        name.check()?;
+        Ok(name)
+    }
+}
+
+/// `vault id ‖ device id`, so a sealed name can't be moved to another device's entry.
+fn name_aad(vault: VaultId, device: DeviceId) -> Vec<u8> {
+    [&vault.as_bytes()[..], device.as_bytes()].concat()
+}
+
+/// A device's public keys and sealed name, as add_device records them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub id: DeviceId,
@@ -68,23 +166,42 @@ pub struct DeviceInfo {
     pub wrap_key: WrapKey,
     /// The device's Ed25519 iroh identity.
     pub transport_key: VerifyingKey,
-    /// Such as `macos`. Shown to people only.
-    pub platform: String,
-    /// Such as `MacBook`.
-    pub name: String,
+    /// Its platform and name, sealed with the names key.
+    pub name: SealedName,
+    /// The names key, wrapped to `wrap_key`.
+    pub names_key: WrappedKey,
 }
 
 impl DeviceInfo {
+    /// Describes a device for add_device in `vault`: seals `name` and wraps `names_key` to the
+    /// device's wrapping key.
+    pub fn new(
+        vault: VaultId,
+        id: DeviceId,
+        verifying_key: VerifyingKey,
+        wrap_key: WrapKey,
+        transport_key: VerifyingKey,
+        name: &DeviceName,
+        names_key: &SymmetricKey,
+    ) -> Result<Self> {
+        Ok(Self {
+            id,
+            name: name.seal(names_key, vault, id)?,
+            names_key: wrap_key.wrap(&names_key_context(vault), names_key),
+            verifying_key,
+            wrap_key,
+            transport_key,
+        })
+    }
+
     /// The add_device payload. Call [`Change::check_fields`] first.
     fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(self.id.as_bytes());
         out.extend_from_slice(self.verifying_key.as_bytes());
         out.extend_from_slice(self.wrap_key.as_bytes());
         out.extend_from_slice(self.transport_key.as_bytes());
-        for text in [&self.platform, &self.name] {
-            out.push(u8::try_from(text.len()).expect("checked against the limits"));
-            out.extend_from_slice(text.as_bytes());
-        }
+        out.extend_from_slice(&self.name.0);
+        out.extend_from_slice(&self.names_key.to_bytes());
     }
 }
 
@@ -94,6 +211,8 @@ pub enum Change {
     Genesis {
         recovery: WrapKey,
         admins: Vec<VerifyingKey>,
+        /// The names key, wrapped to `recovery`.
+        names_key: WrappedKey,
     },
     AddDevice(DeviceInfo),
     SetScope {
@@ -115,12 +234,17 @@ impl Change {
     fn encode(&self) -> (u8, Vec<u8>) {
         let mut out = Vec::new();
         let code = match self {
-            Self::Genesis { recovery, admins } => {
+            Self::Genesis {
+                recovery,
+                admins,
+                names_key,
+            } => {
                 out.extend_from_slice(recovery.as_bytes());
                 out.push(u8::try_from(admins.len()).expect("checked against MAX_ADMINS"));
                 for admin in admins {
                     out.extend_from_slice(admin.as_bytes());
                 }
+                out.extend_from_slice(&names_key.to_bytes());
                 GENESIS
             }
             Self::AddDevice(info) => {
@@ -167,7 +291,12 @@ impl Change {
                 let admins = (0..count)
                     .map(|_| r.verifying_key())
                     .collect::<Result<_>>()?;
-                Self::Genesis { recovery, admins }
+                let names_key = r.wrapped_key()?;
+                Self::Genesis {
+                    recovery,
+                    admins,
+                    names_key,
+                }
             }
             ADD_DEVICE => Self::AddDevice(r.device_info()?),
             SET_SCOPE => {
@@ -209,25 +338,20 @@ impl Change {
             {
                 Err("an admin is listed twice")
             }
+            Self::Genesis {
+                recovery,
+                names_key,
+                ..
+            } if names_key.kem_id() != recovery.kem_id() => {
+                Err("the names key isn't wrapped to the recovery key")
+            }
             Self::AddDevice(info) if !info.transport_key.is_ed25519() => {
                 Err("the transport key must be Ed25519")
             }
-            Self::AddDevice(info)
-                if info.platform.is_empty()
-                    || info.platform.len() > MAX_PLATFORM_LEN
-                    || !info
-                        .platform
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) =>
-            {
-                Err("the platform must be 1 to 16 of a-z and 0-9")
-            }
-            Self::AddDevice(info)
-                if info.name.is_empty()
-                    || info.name.len() > MAX_NAME_LEN
-                    || info.name.chars().any(char::is_control) =>
-            {
-                Err("the device name must be 1 to 64 bytes with no control characters")
+            // The name rules are checked when a name is sealed or opened: accepting an entry
+            // doesn't need the names key (membership.md, names key).
+            Self::AddDevice(info) if info.names_key.kem_id() != info.wrap_key.kem_id() => {
+                Err("the names key isn't wrapped to the device")
             }
             _ => Ok(()),
         };
@@ -379,6 +503,8 @@ pub struct Membership {
     seq: u64,
     head: Hash,
     recovery: WrapKey,
+    /// The names key, wrapped to the recovery key.
+    names_key: WrappedKey,
     admins: Vec<VerifyingKey>,
     devices: HashMap<DeviceId, Device>,
     scopes: HashMap<(DeviceId, CollectionId), Scope>,
@@ -387,29 +513,35 @@ pub struct Membership {
 
 impl Membership {
     /// Starts a new vault's log with a genesis entry signed by `admin`, which must be one of
-    /// `admins`.
+    /// `admins`. Genesis carries `names_key` wrapped to `recovery`.
     pub fn create(
         vault: VaultId,
         recovery: WrapKey,
         admins: Vec<VerifyingKey>,
+        names_key: &SymmetricKey,
         admin: &impl AdminKey,
     ) -> Result<(Self, LogEntry)> {
         if !admins.contains(&admin.verifying_key()) {
             return Err(invalid("signer isn't an admin"));
         }
-        let entry = LogEntry::sign(
-            vault,
-            0,
-            [0; 32],
-            Change::Genesis { recovery, admins },
-            admin,
-        )?;
+        let names_key = recovery.wrap(&names_key_context(vault), names_key);
+        let genesis = Change::Genesis {
+            recovery,
+            admins,
+            names_key,
+        };
+        let entry = LogEntry::sign(vault, 0, [0; 32], genesis, admin)?;
         Ok((Self::from_genesis(&entry)?, entry))
     }
 
     /// Starts from a genesis entry, after checking it.
     pub fn from_genesis(entry: &LogEntry) -> Result<Self> {
-        let Change::Genesis { recovery, admins } = &entry.change else {
+        let Change::Genesis {
+            recovery,
+            admins,
+            names_key,
+        } = &entry.change
+        else {
             return Err(invalid("the first entry isn't genesis"));
         };
         if entry.seq != 0 || entry.prev != [0; 32] {
@@ -426,6 +558,7 @@ impl Membership {
             seq: 0,
             head: hash,
             recovery: recovery.clone(),
+            names_key: names_key.clone(),
             admins: admins.clone(),
             devices: HashMap::new(),
             scopes: HashMap::new(),
@@ -513,6 +646,11 @@ impl Membership {
         &self.recovery
     }
 
+    /// The names key, wrapped to the recovery key (membership.md, names key).
+    pub fn recovery_names_key(&self) -> &WrappedKey {
+        &self.names_key
+    }
+
     pub fn admins(&self) -> &[VerifyingKey] {
         &self.admins
     }
@@ -548,6 +686,7 @@ impl Membership {
             &self.seq.to_be_bytes(),
             &self.head,
             self.recovery.as_bytes(),
+            &self.names_key.to_bytes(),
         ]
         .concat();
         out.push(u8::try_from(self.admins.len()).expect("checked against MAX_ADMINS"));
@@ -588,6 +727,7 @@ impl Membership {
         let seq = u64::from_be_bytes(r.array()?);
         let head = r.array()?;
         let recovery = r.wrap_key()?;
+        let names_key = r.wrapped_key()?;
         let admins = (0..r.u8()?)
             .map(|_| r.verifying_key())
             .collect::<Result<_>>()?;
@@ -620,6 +760,7 @@ impl Membership {
             seq,
             head,
             recovery,
+            names_key,
             admins,
             devices,
             scopes,
@@ -761,20 +902,20 @@ impl<'a> Reader<'a> {
         Ok(key)
     }
 
+    fn wrapped_key(&mut self) -> Result<WrappedKey> {
+        let (key, rest) = WrappedKey::split_prefix(self.0)?;
+        self.0 = rest;
+        Ok(key)
+    }
+
     fn device_info(&mut self) -> Result<DeviceInfo> {
-        let id = DeviceId::from_bytes(self.array()?);
-        let verifying_key = self.verifying_key()?;
-        let wrap_key = self.wrap_key()?;
-        let transport_key = self.verifying_key()?;
-        let platform = self.short_text()?;
-        let name = self.short_text()?;
         Ok(DeviceInfo {
-            id,
-            verifying_key,
-            wrap_key,
-            transport_key,
-            platform,
-            name,
+            id: DeviceId::from_bytes(self.array()?),
+            verifying_key: self.verifying_key()?,
+            wrap_key: self.wrap_key()?,
+            transport_key: self.verifying_key()?,
+            name: SealedName(self.array()?),
+            names_key: self.wrapped_key()?,
         })
     }
 
@@ -804,15 +945,29 @@ mod tests {
 
     use super::*;
 
-    fn device(name: &str) -> DeviceInfo {
-        DeviceInfo {
-            id: DeviceId::random(),
-            verifying_key: SigningKey::generate_p256().verifying_key(),
-            wrap_key: UnwrapKey::generate_p256().wrap_key(),
-            transport_key: SigningKey::generate_ed25519().verifying_key(),
-            platform: "macos".into(),
+    fn names_key() -> SymmetricKey {
+        SymmetricKey::from_bytes([2; 32])
+    }
+
+    fn name(platform: &str, name: &str) -> DeviceName {
+        DeviceName {
+            platform: platform.into(),
             name: name.into(),
         }
+    }
+
+    /// A device for `m`'s vault, its name sealed with [`names_key`].
+    fn device(m: &Membership, device_name: &str) -> DeviceInfo {
+        DeviceInfo::new(
+            m.vault(),
+            DeviceId::random(),
+            SigningKey::generate_p256().verifying_key(),
+            UnwrapKey::generate_p256().wrap_key(),
+            SigningKey::generate_ed25519().verifying_key(),
+            &name("macos", device_name),
+            &names_key(),
+        )
+        .unwrap()
     }
 
     /// A new vault with one admin, and its log so far.
@@ -822,6 +977,7 @@ mod tests {
             VaultId::random(),
             UnwrapKey::generate_x25519().wrap_key(),
             vec![admin.verifying_key()],
+            &names_key(),
             &admin,
         )
         .unwrap();
@@ -838,7 +994,7 @@ mod tests {
     #[test]
     fn devices_scopes_and_epochs() {
         let (admin, mut m, mut log) = vault();
-        let (mac, phone) = (device("MacBook"), device("iPhone"));
+        let (mac, phone) = (device(&m, "MacBook"), device(&m, "iPhone"));
         let c = CollectionId::random();
         for change in [
             Change::AddDevice(mac.clone()),
@@ -867,6 +1023,10 @@ mod tests {
         assert_eq!(m.scope(phone.id, c), Scope::None);
         assert!(m.device(phone.id).unwrap().revoked);
         assert_eq!(m.device(mac.id).unwrap().info, mac);
+        assert_eq!(
+            mac.name.open(&names_key(), m.vault(), mac.id).unwrap(),
+            name("macos", "MacBook")
+        );
         assert_eq!(m.epoch(c), Some(1));
         assert_eq!(m.epoch(CollectionId::random()), None);
 
@@ -896,7 +1056,7 @@ mod tests {
     #[test]
     fn rejects_changes_that_break_the_rules() {
         let (admin, mut m, _) = vault();
-        let (mac, revoked) = (device("MacBook"), device("old"));
+        let (mac, revoked) = (device(&m, "MacBook"), device(&m, "old"));
         let c = CollectionId::random();
         for change in [
             Change::AddDevice(mac.clone()),
@@ -912,14 +1072,16 @@ mod tests {
         }
         let head = m.head();
 
-        let mut reused = device("copy");
+        let mut reused = device(&m, "copy");
         reused.wrap_key = revoked.wrap_key.clone();
-        let mut p256_transport = device("x");
+        let mut p256_transport = device(&m, "x");
         p256_transport.transport_key = SigningKey::generate_p256().verifying_key();
-        let mut platform = device("x");
-        platform.platform = "macOS".into();
-        let mut name = device("x");
-        name.name = "line\nbreak".into();
+        let context = names_key_context(m.vault());
+        let mut x25519_names_key = device(&m, "x");
+        x25519_names_key.names_key = UnwrapKey::generate_x25519()
+            .wrap_key()
+            .wrap(&context, &names_key());
+        let recovery = UnwrapKey::generate_x25519().wrap_key();
         let scope = |device, scope| Change::SetScope {
             device,
             collection: c,
@@ -928,7 +1090,8 @@ mod tests {
         let cases = [
             (
                 Change::Genesis {
-                    recovery: UnwrapKey::generate_x25519().wrap_key(),
+                    names_key: recovery.wrap(&context, &names_key()),
+                    recovery,
                     admins: vec![admin.verifying_key()],
                 },
                 "genesis isn't first",
@@ -943,12 +1106,8 @@ mod tests {
                 "the transport key must be Ed25519",
             ),
             (
-                Change::AddDevice(platform),
-                "the platform must be 1 to 16 of a-z and 0-9",
-            ),
-            (
-                Change::AddDevice(name),
-                "the device name must be 1 to 64 bytes with no control characters",
+                Change::AddDevice(x25519_names_key),
+                "the names key isn't wrapped to the device",
             ),
             (scope(DeviceId::random(), Scope::Read), "no such device"),
             (scope(mac.id, Scope::Write), "the scope is unchanged"),
@@ -1003,17 +1162,17 @@ mod tests {
         let (admin, mut m, _) = vault();
         let other = SigningKey::generate_ed25519();
         assert_eq!(
-            rejected(m.append(Change::AddDevice(device("a")), &other)),
+            rejected(m.append(Change::AddDevice(device(&m, "a")), &other)),
             "signer isn't an admin"
         );
 
         // Entries signed elsewhere must follow this log's head, in order, from this vault.
         let mut ahead = m.clone();
         let first = ahead
-            .append(Change::AddDevice(device("a")), &admin)
+            .append(Change::AddDevice(device(&m, "a")), &admin)
             .unwrap();
         let second = ahead
-            .append(Change::AddDevice(device("b")), &admin)
+            .append(Change::AddDevice(device(&m, "b")), &admin)
             .unwrap();
         assert_eq!(
             rejected(m.apply(&second)),
@@ -1026,15 +1185,15 @@ mod tests {
         );
         let (other_admin, mut elsewhere, _) = vault();
         let foreign = elsewhere
-            .append(Change::AddDevice(device("c")), &other_admin)
+            .append(Change::AddDevice(device(&elsewhere, "c")), &other_admin)
             .unwrap();
         assert_eq!(
             rejected(m.clone().apply(&foreign)),
             "the entry is from another vault"
         );
 
-        // A changed payload or signature doesn't verify. The last payload byte is the last
-        // letter of the device name.
+        // A changed payload or signature doesn't verify. The last payload byte is in the
+        // wrapped names key's tag.
         let mut bytes = second.to_bytes();
         let last = bytes.len() - SIGNATURE_LEN - 1;
         bytes[last] ^= 0x20;
@@ -1059,16 +1218,101 @@ mod tests {
         m.append(Change::RemoveAdmin(admin.verifying_key()), &next)
             .unwrap();
         assert_eq!(
-            rejected(m.append(Change::AddDevice(device("d")), &admin)),
+            rejected(m.append(Change::AddDevice(device(&m, "d")), &admin)),
             "signer isn't an admin"
         );
-        m.append(Change::AddDevice(device("d")), &next).unwrap();
+        m.append(Change::AddDevice(device(&m, "d")), &next).unwrap();
+    }
+
+    #[test]
+    fn device_names_are_sealed() {
+        let (vault, id) = (VaultId::random(), DeviceId::random());
+        let key = names_key();
+        let sealed = name("linux", "Desktop").seal(&key, vault, id).unwrap();
+        assert_eq!(
+            sealed.open(&key, vault, id).unwrap(),
+            name("linux", "Desktop")
+        );
+
+        // A sealed name opens only for its own device and vault, and with its own key.
+        assert!(sealed.open(&key, VaultId::random(), id).is_err());
+        assert!(sealed.open(&key, vault, DeviceId::random()).is_err());
+        assert!(sealed.open(&SymmetricKey::generate(), vault, id).is_err());
+
+        // Short and long names seal to the same length; bad ones don't seal.
+        let longest = name(&"a".repeat(MAX_PLATFORM_LEN), &"é".repeat(MAX_NAME_LEN / 2));
+        assert_eq!(
+            longest
+                .seal(&key, vault, id)
+                .unwrap()
+                .open(&key, vault, id)
+                .unwrap(),
+            longest
+        );
+        for (bad, reason) in [
+            (
+                name("macOS", "x"),
+                "the platform must be 1 to 16 of a-z and 0-9",
+            ),
+            (name("", "x"), "the platform must be 1 to 16 of a-z and 0-9"),
+            (
+                name(&"a".repeat(17), "x"),
+                "the platform must be 1 to 16 of a-z and 0-9",
+            ),
+            (
+                name("linux", "line\nbreak"),
+                "the device name must be 1 to 64 bytes with no control characters",
+            ),
+            (
+                name("linux", &"a".repeat(MAX_NAME_LEN + 1)),
+                "the device name must be 1 to 64 bytes with no control characters",
+            ),
+        ] {
+            assert_eq!(rejected(bad.seal(&key, vault, id)), reason, "{bad:?}");
+        }
+
+        // add_device carries the names key wrapped to the device, and it opens the name.
+        let unwrap_key = UnwrapKey::generate_x25519();
+        let info = DeviceInfo::new(
+            vault,
+            id,
+            SigningKey::generate_ed25519().verifying_key(),
+            unwrap_key.wrap_key(),
+            SigningKey::generate_ed25519().verifying_key(),
+            &name("linux", "Desktop"),
+            &key,
+        )
+        .unwrap();
+        let unwrapped = unwrap_key
+            .unwrap(&names_key_context(vault), &info.names_key)
+            .unwrap();
+        assert_eq!(unwrapped.as_bytes(), key.as_bytes());
+        assert_eq!(
+            info.name.open(&unwrapped, vault, id).unwrap(),
+            name("linux", "Desktop")
+        );
+
+        // Genesis must wrap the names key to the recovery key's KEM.
+        let admin = SigningKey::generate_ed25519();
+        let genesis = Change::Genesis {
+            recovery: UnwrapKey::generate_x25519().wrap_key(),
+            admins: vec![admin.verifying_key()],
+            names_key: UnwrapKey::generate_p256()
+                .wrap_key()
+                .wrap(&names_key_context(vault), &key),
+        };
+        assert_eq!(
+            rejected(LogEntry::sign(vault, 0, [0; 32], genesis, &admin)),
+            "the names key isn't wrapped to the recovery key"
+        );
     }
 
     #[test]
     fn rejects_bad_encodings() {
         let (admin, mut m, _) = vault();
-        let entry = m.append(Change::AddDevice(device("a")), &admin).unwrap();
+        let entry = m
+            .append(Change::AddDevice(device(&m, "a")), &admin)
+            .unwrap();
         let bytes = entry.to_bytes();
         let invalid = |bytes: &[u8]| LogEntry::from_bytes(bytes).is_err();
 
@@ -1111,7 +1355,9 @@ mod tests {
     #[test]
     fn hash_covers_everything_but_the_signature() {
         let (admin, mut m, log) = vault();
-        let entry = m.append(Change::AddDevice(device("a")), &admin).unwrap();
+        let entry = m
+            .append(Change::AddDevice(device(&m, "a")), &admin)
+            .unwrap();
         let resigned = [&entry.unsigned[..], log[0].signature.as_bytes()].concat();
         assert_eq!(
             LogEntry::from_bytes(&resigned).unwrap().hash(),
@@ -1123,7 +1369,7 @@ mod tests {
     #[test]
     fn finds_forks() {
         let (admin, mut m, mut log) = vault();
-        let mac = device("MacBook");
+        let mac = device(&m, "MacBook");
         log.push(m.append(Change::AddDevice(mac.clone()), &admin).unwrap());
         let scope = |scope| Change::SetScope {
             device: mac.id,
@@ -1143,7 +1389,7 @@ mod tests {
             LogEntry::sign(m.vault(), 2, log[1].hash(), scope(Scope::Read), &outsider).unwrap();
         assert!(!Membership::is_fork(&log, &forged).unwrap());
         let next = other
-            .append(Change::AddDevice(device("b")), &admin)
+            .append(Change::AddDevice(device(&other, "b")), &admin)
             .unwrap();
         assert!(!Membership::is_fork(&log, &next).unwrap());
         let (_, _, elsewhere) = vault();
@@ -1152,7 +1398,13 @@ mod tests {
 
     #[test]
     fn genesis_format_is_pinned() {
-        // Recovery secret = 32 zero bytes (crypto.md test vector), vault id = 16 bytes of 1.
+        // Recovery secret = 32 zero bytes (crypto.md test vector), vault id = 16 bytes of 1,
+        // names key = 32 bytes of 2. HPKE wrapping is randomized, so the wrapped names key is
+        // fixed here, and checked to unwrap with the recovery key.
+        const WRAPPED_NAMES_KEY: &str = "00205bb0d4242e0a76d9ae61bd757c40c3151583ceb47c685b0ac5b3\
+            05357c8a5153f00bdc8e12a46c0770fc09ee0f383361335f34424132898bacea2cb71e4e12cd8c5c41\
+            75a02bde50f4deeb790144ffa3";
+        const HASH: &str = "761c2db1a367fecf09cb6ebaa3ea6d9589968d0ea2365d0331f000f9b2e50e14";
         let recovery = RecoveryKey::from_phrase(
             &["abandon"; 23]
                 .into_iter()
@@ -1161,21 +1413,24 @@ mod tests {
                 .join(" "),
         )
         .unwrap();
+        let vault = VaultId::from_bytes([1; 16]);
+        let context = names_key_context(vault);
+        let names_key = WrappedKey::from_bytes(&hex::decode(WRAPPED_NAMES_KEY).unwrap()).unwrap();
+        let unwrapped = recovery.unwrap_key().unwrap(&context, &names_key).unwrap();
+        assert_eq!(unwrapped.as_bytes(), &[2; 32]);
+
         let admin = recovery.admin_signing_key();
-        let (m, genesis) = Membership::create(
-            VaultId::from_bytes([1; 16]),
-            recovery.unwrap_key().wrap_key(),
-            vec![admin.verifying_key()],
-            &admin,
-        )
-        .unwrap();
+        let genesis = Change::Genesis {
+            recovery: recovery.unwrap_key().wrap_key(),
+            admins: vec![admin.verifying_key()],
+            names_key,
+        };
+        let entry = LogEntry::sign(vault, 0, [0; 32], genesis, &admin).unwrap();
+        let m = Membership::from_genesis(&entry).unwrap();
         assert_eq!(
-            genesis.to_bytes().len(),
-            1 + 16 + 8 + 32 + 33 + 1 + 4 + 34 + 1 + 33 + 65
+            entry.to_bytes().len(),
+            1 + 16 + 8 + 32 + 33 + 1 + 4 + 34 + 1 + 33 + 82 + 65
         );
-        assert_eq!(
-            hex::encode(m.genesis_hash()),
-            "77b53378f73774df461b6e6444fdaf4a3f796dce377bb13372aeaee33d1d3cc5"
-        );
+        assert_eq!(hex::encode(m.genesis_hash()), HASH);
     }
 }

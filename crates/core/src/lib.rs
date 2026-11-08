@@ -59,6 +59,10 @@ pub enum Error {
     LogExists,
     #[error("that recovery phrase belongs to another vault")]
     WrongRecoveryKey,
+    #[error(
+        "this vault's membership log is from before device names were sealed; create the vault again"
+    )]
+    LogBeforeSealedNames,
     #[error("store is corrupt: {0}")]
     Corrupt(&'static str),
 }

@@ -12,12 +12,16 @@ use rusqlite::{
 };
 use zeroize::Zeroizing;
 
-use crate::membership::{AdminKey, Change, DeviceInfo, LogEntry, Membership, Scope};
+use crate::membership::{
+    AdminKey, Change, DeviceInfo, DeviceName, LogEntry, Membership, Scope, names_key_context,
+};
 use crate::record::{Body, Kind, Record, Version};
 use crate::{CollectionId, DeviceId, DeviceKeys, Error, Result, VaultId, names};
 
-/// Version 2 added the membership log. Opening a version 1 store adds its (empty) table.
-const SCHEMA_VERSION: i64 = 2;
+/// Version 2 added the membership log, and version 3 sealed the device names in it
+/// (membership.md, names key). Opening a version 1 store adds the (empty) log table. A version
+/// 2 store opens only if its log is empty, since its entries are in the old format.
+const SCHEMA_VERSION: i64 = 3;
 
 /// The membership log (membership.md), in order. Its current state is kept in `meta` as
 /// `membership`, so opening a vault doesn't replay it.
@@ -150,12 +154,8 @@ impl<K: DeviceKeys> Vault<K> {
     ) -> Result<Self> {
         let vault_id = VaultId::random();
         let device_id = DeviceId::random();
-        let (membership, log) = start_membership(
-            vault_id,
-            recovery,
-            admin,
-            device_info(device_id, &keys, name),
-        )?;
+        let (membership, log) =
+            start_membership(vault_id, recovery, admin, &keys, device_id, name)?;
         let recovery = recovery.unwrap_key().wrap_key();
 
         // Create the file ourselves so it is never readable by others, even briefly.
@@ -283,6 +283,25 @@ impl<K: DeviceKeys> Vault<K> {
         recovery.unwrap_key().wrap_key() == self.recovery
     }
 
+    /// The platform and name of `device`, opened with the names key from this device's own
+    /// add_device entry (membership.md, names key). `None` if the log doesn't list the device.
+    pub fn device_name(&self, device: DeviceId) -> Result<Option<DeviceName>> {
+        let Some(membership) = &self.membership else {
+            return Ok(None);
+        };
+        let Some(target) = membership.device(device) else {
+            return Ok(None);
+        };
+        let this = membership
+            .device(self.device_id)
+            .ok_or(Error::Corrupt("this device isn't in the membership log"))?;
+        let names_key = self
+            .keys
+            .unwrap(&names_key_context(self.vault_id), &this.info.names_key)?;
+        let name = target.info.name.open(&names_key, self.vault_id, device)?;
+        Ok(Some(name))
+    }
+
     /// Starts the log of a vault created before there was one (membership.md, creating a
     /// vault): genesis, this device as `name`, and `write` on every existing collection, all
     /// signed by `recovery`, which must be this vault's recovery key.
@@ -297,7 +316,9 @@ impl<K: DeviceKeys> Vault<K> {
             self.vault_id,
             recovery,
             None,
-            device_info(self.device_id, &self.keys, name),
+            &self.keys,
+            self.device_id,
+            name,
         )?;
         let admin = recovery.admin_signing_key();
         for collection in self.collections()? {
@@ -736,17 +757,27 @@ fn connect(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Brings an older store up to [`SCHEMA_VERSION`]. Version 1 had no membership log.
+/// Brings an older store up to [`SCHEMA_VERSION`]. Version 1 had no membership log, and
+/// version 2's log had device names in the clear.
 fn upgrade(conn: &mut Connection) -> Result<()> {
     match user_version(conn)? {
         SCHEMA_VERSION => return Ok(()),
-        1 => {}
+        1 | 2 => {}
         other => return Err(Error::UnsupportedStore(other)),
     }
     // Immediate, so two processes opening the same old store don't both upgrade it.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if user_version(&tx)? == 1 {
+    let version = user_version(&tx)?;
+    if version == 1 {
         tx.execute_batch(LOG_SCHEMA)?;
+    }
+    if version == 2 {
+        let entries: i64 = tx.query_row("SELECT count(*) FROM log", [], |row| row.get(0))?;
+        if entries > 0 {
+            return Err(Error::LogBeforeSealedNames);
+        }
+    }
+    if version < SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     tx.commit()?;
@@ -799,36 +830,57 @@ fn load_membership(
 }
 
 /// The log's first entries, signed by the recovery key's admin key: genesis, listing that key
-/// and `device_admin` as the admins, then add_device for this device (membership.md, creating
-/// a vault).
+/// and `device_admin` as the admins, then add_device for this device as `name` (membership.md,
+/// creating a vault). A new names key seals the name and is wrapped to the recovery key and to
+/// this device.
 fn start_membership(
     vault: VaultId,
     recovery: &RecoveryKey,
     device_admin: Option<VerifyingKey>,
-    device: DeviceInfo,
+    keys: &impl DeviceKeys,
+    device: DeviceId,
+    name: &str,
 ) -> Result<(Membership, Vec<LogEntry>)> {
     let admin = recovery.admin_signing_key();
     let admins = std::iter::once(admin.verifying_key())
         .chain(device_admin)
         .collect();
-    let (mut membership, genesis) =
-        Membership::create(vault, recovery.unwrap_key().wrap_key(), admins, &admin)?;
-    let add = membership.append(Change::AddDevice(device), &admin)?;
+    let names_key = SymmetricKey::generate();
+    let (mut membership, genesis) = Membership::create(
+        vault,
+        recovery.unwrap_key().wrap_key(),
+        admins,
+        &names_key,
+        &admin,
+    )?;
+    let info = device_info(vault, device, keys, name, &names_key)?;
+    let add = membership.append(Change::AddDevice(info), &admin)?;
     Ok((membership, vec![genesis, add]))
 }
 
 /// This device as add_device describes it. Its transport key is derived from the local key
 /// (records.md, local store), so the key file doesn't need to hold one.
-fn device_info(id: DeviceId, keys: &impl DeviceKeys, name: &str) -> DeviceInfo {
+fn device_info(
+    vault: VaultId,
+    id: DeviceId,
+    keys: &impl DeviceKeys,
+    name: &str,
+    names_key: &SymmetricKey,
+) -> Result<DeviceInfo> {
     let transport = derive_key(contexts::TRANSPORT, keys.local_key().as_bytes());
-    DeviceInfo {
-        id,
-        verifying_key: keys.verifying_key(),
-        wrap_key: keys.wrap_key(),
-        transport_key: SigningKey::from_ed25519_seed(&transport).verifying_key(),
+    let name = DeviceName {
         platform: std::env::consts::OS.into(),
         name: name.into(),
-    }
+    };
+    DeviceInfo::new(
+        vault,
+        id,
+        keys.verifying_key(),
+        keys.wrap_key(),
+        SigningKey::from_ed25519_seed(&transport).verifying_key(),
+        &name,
+        names_key,
+    )
 }
 
 /// Adds accepted entries to the log and keeps the membership they lead to.
@@ -1029,8 +1081,26 @@ mod tests {
             assert_eq!(device.wrap_key, s.keys.wrap_key());
             assert!(device.transport_key.is_ed25519());
             assert_eq!(
-                (device.name.as_str(), device.platform.as_str()),
-                ("test", std::env::consts::OS)
+                vault.device_name(vault.device_id()).unwrap(),
+                Some(DeviceName {
+                    platform: std::env::consts::OS.into(),
+                    name: "test".into(),
+                })
+            );
+            assert_eq!(vault.device_name(DeviceId::random()).unwrap(), None);
+            // The recovery key opens the same names key.
+            let names_key = s
+                .recovery
+                .unwrap_key()
+                .unwrap(&names_key_context(vault.vault_id()), m.recovery_names_key())
+                .unwrap();
+            assert_eq!(
+                device
+                    .name
+                    .open(&names_key, vault.vault_id(), vault.device_id())
+                    .unwrap()
+                    .name,
+                "test"
             );
             assert!(vault.is_recovery_key(&s.recovery));
             assert!(!vault.is_recovery_key(&RecoveryKey::generate()));
@@ -1097,6 +1167,31 @@ mod tests {
             Scope::Write
         );
         assert_eq!(stored_log(&vault).len(), 3);
+    }
+
+    #[test]
+    fn logs_from_before_sealed_names_are_refused() {
+        let s = setup();
+        drop(s.create());
+        {
+            let conn = connect(&s.path).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        assert!(matches!(
+            Vault::open(&s.path, &s.keys),
+            Err(Error::LogBeforeSealedNames)
+        ));
+
+        // A version 2 store whose log is still empty (an M1 vault that was opened by a build
+        // with the log, but never started one) upgrades.
+        {
+            let conn = connect(&s.path).unwrap();
+            conn.execute_batch("DELETE FROM log; DELETE FROM meta WHERE key = 'membership';")
+                .unwrap();
+        }
+        let vault = s.open();
+        assert!(vault.membership().is_none());
+        assert_eq!(user_version(&vault.conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

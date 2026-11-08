@@ -74,7 +74,9 @@ Each device keeps one SQLite database per vault, readable only by its user (mode
 - an index of each entry's current version;
 - the membership log and the state it leads to ([membership.md](membership.md#keeping-the-log)).
 
-The database's `user_version` is the store version: 1 in M1, 2 since the membership log. Opening a version 1 store upgrades it by adding the empty log table. The upgrade that adds sync also turns each wrapped key the device already holds into a grant it signs.
+The database's `user_version` is the store version: 1 in M1, 2 since the membership log, and 3 since device names in the log are sealed (membership.md, names key).
+- Opening a version 1 store upgrades it by adding the empty log table.
+- A version 2 store opens only if its log is empty. Entries written before names were sealed can't be read, so that vault is created again. The upgrade that adds sync also turns each wrapped key the device already holds into a grant it signs.
 
 A device that is joining (join.md) has a store holding only its device id until the join completes.
 

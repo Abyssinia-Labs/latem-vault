@@ -75,6 +75,11 @@ impl WrapKey {
         &self.0
     }
 
+    /// The RFC 9180 KEM id: `0x0020` for X25519, `0x0010` for P-256.
+    pub fn kem_id(&self) -> u16 {
+        split_kem_id(&self.0).expect("validated on construction").0
+    }
+
     /// Wraps `key` so only the holder of the matching [`UnwrapKey`] can recover it.
     pub fn wrap(&self, context: &[u8], key: &SymmetricKey) -> WrappedKey {
         let (kem_id, public) = split_kem_id(&self.0).expect("validated on construction");
@@ -201,6 +206,25 @@ impl WrappedKey {
             enc: enc.to_vec(),
             ciphertext: ciphertext.to_vec(),
         })
+    }
+
+    /// Parses a wrapped key at the start of `bytes`, for formats that embed one without a
+    /// length, and returns it with the bytes after it.
+    pub fn split_prefix(bytes: &[u8]) -> Result<(Self, &[u8]), Error> {
+        let len = match split_kem_id(bytes) {
+            Ok((KEM_X25519, _)) => 2 + 32 + WRAPPED_LEN,
+            Ok((KEM_P256, _)) => 2 + 65 + WRAPPED_LEN,
+            _ => return Err(Error::Encoding("wrapped key")),
+        };
+        let (wrapped, rest) = bytes
+            .split_at_checked(len)
+            .ok_or(Error::Encoding("wrapped key"))?;
+        Ok((Self::from_bytes(wrapped)?, rest))
+    }
+
+    /// The KEM id of the key this was wrapped to, as [`WrapKey::kem_id`].
+    pub fn kem_id(&self) -> u16 {
+        self.kem_id
     }
 
     /// Unwraps with a P-256 key held in hardware (the Secure Enclave or a TPM), whose public
@@ -526,5 +550,24 @@ mod tests {
         }
         assert!(WrapKey::split_prefix(&[0x00, 0x21, 1, 2, 3]).is_err());
         assert!(WrapKey::split_prefix(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn split_wrapped_prefix() {
+        for (key, len) in [
+            (UnwrapKey::generate_x25519(), 82),
+            (UnwrapKey::generate_p256(), 115),
+        ] {
+            let wrapped = key.wrap_key().wrap(b"ctx", &SymmetricKey::generate());
+            assert_eq!(wrapped.kem_id(), key.wrap_key().kem_id());
+            let bytes = [&wrapped.to_bytes()[..], b"rest"].concat();
+            assert_eq!(bytes.len(), len + 4);
+            assert_eq!(
+                WrappedKey::split_prefix(&bytes).unwrap(),
+                (wrapped, &b"rest"[..])
+            );
+            assert!(WrappedKey::split_prefix(&bytes[..len - 1]).is_err());
+        }
+        assert!(WrappedKey::split_prefix(&[0x00, 0x21, 1, 2, 3]).is_err());
     }
 }

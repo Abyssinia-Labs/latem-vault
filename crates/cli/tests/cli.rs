@@ -946,8 +946,55 @@ fn services_sync_a_joined_device() {
     // It can read but not write.
     let output = joiner.run_with_stdin(&["set", "latem/prod/X", "--var"], b"1");
     assert!(String::from_utf8_lossy(&output.stderr).contains("can't write"));
-
+    // A session logs what it moved when it closes, here because the admin's service stops.
     assert!(admin_service.stop());
     let log = joiner_service.log();
     assert!(log.contains("synced with test"), "{log}");
+
+    // Once revoked, it gets nothing new, though the two still see each other. The review lists
+    // what it could read.
+    let admin_service = Service::start(&admin);
+    eventually(&admin, &["devices"], "visible");
+    let answers = format!("y\n{}\n", admin.phrase);
+    let output = admin.run_with_stdin(&["devices", "revoke", "Desktop"], answers.as_bytes());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("Reads     latem (1 secret)"), "{stdout}");
+    assert!(stdout.contains("New keys for latem"), "{stdout}");
+    assert!(stdout.contains("  latem/prod/SENTRY_DSN"), "{stdout}");
+    let devices = admin.ok(&["devices"]);
+    assert!(
+        devices
+            .lines()
+            .any(|line| line.starts_with("Desktop") && line.ends_with("revoked")),
+        "{devices}"
+    );
+    assert!(
+        admin
+            .fails(&["devices", "revoke", "Desktop"])
+            .contains("already revoked")
+    );
+    admin.set("latem/prod/AFTER", "--var", b"secret now");
+    assert_eq!(admin.ok(&["get", "latem/prod/REGION"]), "eu west");
+    // Its session ends once it asks for the new log entries.
+    let started = std::time::Instant::now();
+    while !joiner_service.log().contains("not a member") {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "{}",
+            joiner_service.log()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        joiner.run(&["get", "latem/prod/AFTER"]).stdout.is_empty(),
+        "{}",
+        joiner_service.log()
+    );
+    assert!(admin_service.stop());
 }

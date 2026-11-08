@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use openvault_core::{Vault, names};
+use openvault_core::{DeviceId, Vault, names};
 use openvault_crypto::RecoveryKey;
 use openvault_keystore::{AdminKey, Keys};
 use openvault_net::EndpointKey;
@@ -23,8 +23,8 @@ pub struct Context<'a> {
 
 /// A failure that the CLI answers by asking for the recovery phrase and trying again.
 #[derive(Debug, thiserror::Error)]
-#[error("creating a collection needs an admin signature, and this device has no admin key")]
-struct RecoveryPhraseNeeded;
+#[error("{0} needs an admin signature, and this device has no admin key")]
+struct RecoveryPhraseNeeded(&'static str);
 
 pub fn handle(cx: &mut Context, request: Request) -> Response {
     match run(cx, request) {
@@ -113,6 +113,57 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
         Request::Devices => Response::Devices(devices(vault, cx.visible)),
         // The service reloaded before handling it; nothing else to do here.
         Request::Changed => Response::Done,
+        Request::Review { device } => Response::Review(vault.review_revocation(device)?),
+        Request::Revoke {
+            device,
+            recovery_phrase,
+        } => revoke(
+            vault,
+            cx.admin_key,
+            device,
+            recovery_phrase.as_ref().map(|phrase| phrase.as_str()),
+        )?,
+    })
+}
+
+/// Signs with this device's admin key when it has one, which asks for Touch ID, and with the
+/// recovery key otherwise.
+fn revoke(
+    vault: &mut Vault<Keys>,
+    admin_key: &Path,
+    device: DeviceId,
+    recovery_phrase: Option<&str>,
+) -> Result<Response> {
+    let revocation = if let Some(admin) = listed_admin_key(vault, admin_key)? {
+        let name = vault
+            .device_name(device)
+            .ok()
+            .flatten()
+            .map_or_else(|| device.to_string(), |name| name.name);
+        let admin = admin.with_reason(format!("remove {name} from your vault"));
+        vault.revoke_device(device, &admin)?
+    } else {
+        let phrase = recovery_phrase.ok_or(RecoveryPhraseNeeded("revoking a device"))?;
+        let recovery = RecoveryKey::from_phrase(phrase)?;
+        if !vault.is_recovery_key(&recovery) {
+            bail!("that recovery phrase belongs to another vault");
+        }
+        vault.revoke_device(device, &recovery.admin_signing_key())?
+    };
+    let names: Vec<_> = vault.collections()?;
+    let rotated = revocation
+        .rotated
+        .iter()
+        .map(|id| {
+            names
+                .iter()
+                .find(|collection| collection.id == *id)
+                .map_or_else(|| id.to_string(), |collection| collection.name.clone())
+        })
+        .collect();
+    Ok(Response::Revoked {
+        rotated,
+        carried: u32::try_from(revocation.carried).unwrap_or(u32::MAX),
     })
 }
 
@@ -134,7 +185,7 @@ fn create_collection(
         vault.create_collection(name, &admin)?;
         return Ok(());
     }
-    let phrase = recovery_phrase.ok_or(RecoveryPhraseNeeded)?;
+    let phrase = recovery_phrase.ok_or(RecoveryPhraseNeeded("creating a collection"))?;
     let recovery = RecoveryKey::from_phrase(phrase)?;
     if !vault.is_recovery_key(&recovery) {
         bail!("that recovery phrase belongs to another vault");

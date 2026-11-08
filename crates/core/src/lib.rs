@@ -18,7 +18,7 @@ use std::path::PathBuf;
 pub use ids::{CollectionId, DeviceId, VaultId};
 pub use keys::{DeviceKeys, SoftwareKeys, transport_seed};
 pub use record::{Kind, Version};
-pub use store::{CollectionInfo, Entry, EntryInfo, Received, Vault};
+pub use store::{CollectionInfo, Entry, EntryInfo, Received, Review, Revocation, Vault, Written};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -66,6 +66,8 @@ pub enum Error {
     Fork,
     #[error("this vault has no membership log yet")]
     NoLog,
+    #[error("can't revoke that device: {0}")]
+    CantRevoke(&'static str),
     #[error("this vault already has a membership log")]
     LogExists,
     #[error("that recovery phrase belongs to another vault")]

@@ -124,7 +124,10 @@ enum Command {
         hold: Vec<String>,
     },
     /// List this vault's devices, and which of them are on this network.
-    Devices,
+    Devices {
+        #[command(subcommand)]
+        action: Option<DevicesAction>,
+    },
     /// Hold the vault open, find this vault's other devices on the local network, and answer
     /// other commands, so a passphrase is typed once. Runs until Ctrl-C.
     Service,
@@ -152,6 +155,17 @@ enum CollectionsAction {
     /// Create a collection. Asks for Touch ID when this Mac has an admin key, and for the
     /// recovery phrase otherwise.
     Create { name: String },
+}
+
+#[derive(Subcommand)]
+enum DevicesAction {
+    /// Remove a device from the vault: it stops syncing, and each collection it can read gets a
+    /// new key. Shows what it can read and wrote last first. Asks for Touch ID when this Mac has
+    /// an admin key, and for the recovery phrase otherwise.
+    Revoke {
+        /// The device's name, or the start of its id
+        device: String,
+    },
 }
 
 #[derive(Args)]
@@ -204,7 +218,10 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             )?;
         }
         Command::Approve { write, read, hold } => join::approve(&home, &write, &read, &hold)?,
-        Command::Devices => devices(&home)?,
+        Command::Devices { action: None } => devices(&home)?,
+        Command::Devices {
+            action: Some(DevicesAction::Revoke { device }),
+        } => revoke(&home, &device)?,
         Command::Service => service(&home)?,
         Command::Collections { action: None } => {
             for name in home.access()?.collections()? {
@@ -605,7 +622,7 @@ fn devices(home: &Home) -> Result<()> {
         println!("This vault has no membership log yet. Creating a collection starts it.");
         return Ok(());
     }
-    let rows: Vec<(String, String, &str, String)> = devices
+    let rows: Vec<(String, String, &str, String, String)> = devices
         .iter()
         .map(|device| {
             let (platform, name) = device
@@ -622,7 +639,8 @@ fn devices(home: &Home) -> Result<()> {
             } else if device.visible {
                 notes.push("visible");
             }
-            (name, platform, keys, notes.join(", "))
+            let id = device.id.to_string()[..8].to_owned();
+            (name, platform, keys, id, notes.join(", "))
         })
         .collect();
     let width = rows
@@ -630,8 +648,8 @@ fn devices(home: &Home) -> Result<()> {
         .map(|row| row.0.chars().count())
         .max()
         .unwrap_or(0);
-    for (name, platform, keys, notes) in &rows {
-        let line = format!("{name:<width$}  {platform:<8}  {keys:<8}  {notes}");
+    for (name, platform, keys, id, notes) in &rows {
+        let line = format!("{name:<width$}  {platform:<8}  {keys:<8}  {id}  {notes}");
         println!("{}", line.trim_end());
     }
     if !access.is_service() {
@@ -639,6 +657,153 @@ fn devices(home: &Home) -> Result<()> {
         println!("Run `openvault service` to see which of them are on this network.");
     }
     Ok(())
+}
+
+/// Revokes a device, after showing what it can read and what it wrote last (sync.md,
+/// reviewing), and then lists the secrets to change at their providers.
+fn revoke(home: &Home, query: &str) -> Result<()> {
+    let mut access = home.access()?;
+    let devices = access.devices()?;
+    let device = find_device(&devices, query)?;
+    let (platform, name) = device
+        .name
+        .clone()
+        .unwrap_or_else(|| ("?".into(), device.id.to_string()));
+    if device.this {
+        bail!("{name} is this device; revoke it from another one");
+    }
+    if device.revoked {
+        bail!("{name} is already revoked");
+    }
+    let review = match access.call(Request::Review { device: device.id })? {
+        Response::Review(review) => review,
+        other => return Err(unexpected(&other)),
+    };
+
+    let id = device.id.to_string();
+    println!("Device    {name} ({platform})");
+    println!("Id        {}…", &id[..8]);
+    let reads: Vec<String> = review
+        .secrets
+        .iter()
+        .map(|(collection, secrets)| match secrets.len() {
+            1 => format!("{collection} (1 secret)"),
+            n => format!("{collection} ({n} secrets)"),
+        })
+        .collect();
+    if reads.is_empty() {
+        println!("Reads     nothing");
+    } else {
+        println!("Reads     {}", reads.join(", "));
+    }
+    let written: Vec<String> = review
+        .wrote_last
+        .iter()
+        .flat_map(|(collection, entries)| {
+            entries.iter().map(move |entry| {
+                let deleted = if entry.deleted { " (deleted)" } else { "" };
+                format!("{collection}/{}{deleted}", entry.name)
+            })
+        })
+        .collect();
+    match written.split_first() {
+        None => println!("Wrote     nothing that is current"),
+        Some((first, rest)) => {
+            println!("Wrote     {first}");
+            for entry in rest {
+                println!("          {entry}");
+            }
+        }
+    }
+    println!();
+    println!("It will stop syncing with this vault, and each collection it reads gets a new key.");
+    if !join::confirm(&format!("Revoke {name}? [y/N] "))? {
+        bail!("not revoked");
+    }
+
+    if home.admin().exists() {
+        eprintln!("Confirm with Touch ID or your password to remove {name} from your vault.");
+    }
+    let mut response = access.call(Request::Revoke {
+        device: device.id,
+        recovery_phrase: None,
+    })?;
+    if let Response::Error {
+        code: ErrorCode::RecoveryPhraseNeeded,
+        ..
+    } = response
+    {
+        if io::stdin().is_terminal() {
+            eprintln!("Revoking a device needs an admin signature. This device has no admin key,");
+            eprintln!("so it comes from your recovery phrase.");
+        }
+        response = access.call(Request::Revoke {
+            device: device.id,
+            recovery_phrase: Some(read_recovery_phrase()?),
+        })?;
+    }
+    let Response::Revoked { rotated, carried } = response else {
+        return Err(unexpected(&response));
+    };
+    println!("Revoked {name}.");
+    if !rotated.is_empty() {
+        println!(
+            "New keys for {}: what is written from now on is sealed with keys it doesn't have.",
+            rotated.join(", ")
+        );
+    }
+    if carried > 0 {
+        println!(
+            "Its last changes to {carried} entries were written again with the new keys, so they're kept."
+        );
+    }
+    let secrets: Vec<String> = review
+        .secrets
+        .iter()
+        .flat_map(|(collection, names)| {
+            names.iter().map(move |name| format!("{collection}/{name}"))
+        })
+        .collect();
+    if !secrets.is_empty() {
+        println!();
+        println!("It could read these secrets. Change them where they were issued:");
+        for secret in secrets {
+            println!("  {secret}");
+        }
+    }
+    Ok(())
+}
+
+/// The device `query` names: by its name, or by the start of its id.
+fn find_device<'a>(devices: &'a [DeviceSummary], query: &str) -> Result<&'a DeviceSummary> {
+    let named: Vec<&DeviceSummary> = devices
+        .iter()
+        .filter(|device| device.name.as_ref().is_some_and(|(_, name)| name == query))
+        .collect();
+    let found = if named.is_empty() && query.len() >= 4 {
+        let prefix = query.to_ascii_lowercase();
+        devices
+            .iter()
+            .filter(|device| device.id.to_string().starts_with(&prefix))
+            .collect()
+    } else {
+        named
+    };
+    match found.as_slice() {
+        [device] => Ok(device),
+        [] => bail!("no device is called {query}; `openvault devices` lists them"),
+        several => {
+            let ids: Vec<String> = several
+                .iter()
+                .map(|device| device.id.to_string()[..8].to_owned())
+                .collect();
+            bail!(
+                "{} devices are called {query}; give the start of its id instead: {}",
+                several.len(),
+                ids.join(", ")
+            )
+        }
+    }
 }
 
 /// Runs the service in the foreground until Ctrl-C (service.md).

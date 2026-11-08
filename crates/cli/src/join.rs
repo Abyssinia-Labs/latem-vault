@@ -392,7 +392,7 @@ fn read_code(device: &str) -> Result<String> {
     Ok(code)
 }
 
-fn confirm(question: &str) -> Result<bool> {
+pub(crate) fn confirm(question: &str) -> Result<bool> {
     let answer = prompt(question)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }

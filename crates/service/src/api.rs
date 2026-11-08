@@ -5,7 +5,7 @@
 
 use std::io::{self, Read, Write};
 
-use openvault_core::{DeviceId, Kind};
+use openvault_core::{DeviceId, Kind, Review, Written};
 use zeroize::Zeroizing;
 
 /// The longest message, type and body: a folder of large values still fits.
@@ -45,6 +45,15 @@ pub enum Request {
     /// Something wrote to the vault without the service, such as `openvault approve`: the
     /// service reloads what it keeps and tells the other devices.
     Changed,
+    /// What a device can read and wrote last, before revoking it.
+    Review {
+        device: DeviceId,
+    },
+    Revoke {
+        device: DeviceId,
+        /// Needed only when this device has no admin key.
+        recovery_phrase: Option<Zeroizing<String>>,
+    },
 }
 
 #[derive(Debug)]
@@ -56,7 +65,17 @@ pub enum Response {
     Listing(Vec<Listed>),
     Deleted(bool),
     Devices(Vec<DeviceSummary>),
-    Error { code: ErrorCode, message: String },
+    Review(Review),
+    Revoked {
+        /// The collections that got a new key.
+        rotated: Vec<String>,
+        /// Entries the device wrote last, written again under the new keys.
+        carried: u32,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 /// A secret or variable with its name.
@@ -160,6 +179,20 @@ impl Request {
             }),
             Self::Devices => frame(0x08, |_| {}),
             Self::Changed => frame(0x09, |_| {}),
+            Self::Review { device } => frame(0x0a, |w| w.put(device.as_bytes())),
+            Self::Revoke {
+                device,
+                recovery_phrase,
+            } => frame(0x0b, |w| {
+                w.put(device.as_bytes());
+                match recovery_phrase {
+                    Some(phrase) => {
+                        w.u8(1);
+                        w.str(phrase);
+                    }
+                    None => w.u8(0),
+                }
+            }),
         }
     }
 
@@ -196,6 +229,17 @@ impl Request {
             },
             0x08 => Self::Devices,
             0x09 => Self::Changed,
+            0x0a => Self::Review {
+                device: r.device()?,
+            },
+            0x0b => Self::Revoke {
+                device: r.device()?,
+                recovery_phrase: match r.u8()? {
+                    0 => None,
+                    1 => Some(Zeroizing::new(r.string()?)),
+                    _ => return Err(DecodeError::Bad("has phrase")),
+                },
+            },
             _ => return Err(DecodeError::Bad("unknown request")),
         };
         r.finish()?;
@@ -254,6 +298,32 @@ impl Response {
                     w.str(platform);
                     w.str(name);
                 }
+            }),
+            Self::Review(review) => frame(0x87, |w| {
+                w.count(review.secrets.len());
+                for (collection, names) in &review.secrets {
+                    w.str(collection);
+                    w.count(names.len());
+                    for name in names {
+                        w.str(name);
+                    }
+                }
+                w.count(review.wrote_last.len());
+                for (collection, written) in &review.wrote_last {
+                    w.str(collection);
+                    w.count(written.len());
+                    for entry in written {
+                        w.str(&entry.name);
+                        w.u8(entry.deleted.into());
+                    }
+                }
+            }),
+            Self::Revoked { rotated, carried } => frame(0x88, |w| {
+                w.count(rotated.len());
+                for name in rotated {
+                    w.str(name);
+                }
+                w.put(&carried.to_be_bytes());
             }),
             Self::Error { code, message } => frame(0x7f, |w| {
                 w.u8(match code {
@@ -324,6 +394,46 @@ impl Response {
                     });
                 }
                 Self::Devices(devices)
+            }
+            0x87 => {
+                let mut review = Review::default();
+                for _ in 0..r.count()? {
+                    let collection = r.string()?;
+                    let count = r.count()?;
+                    let mut names = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        names.push(r.string()?);
+                    }
+                    review.secrets.push((collection, names));
+                }
+                for _ in 0..r.count()? {
+                    let collection = r.string()?;
+                    let count = r.count()?;
+                    let mut written = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        written.push(Written {
+                            name: r.string()?,
+                            deleted: match r.u8()? {
+                                0 => false,
+                                1 => true,
+                                _ => return Err(DecodeError::Bad("deleted")),
+                            },
+                        });
+                    }
+                    review.wrote_last.push((collection, written));
+                }
+                Self::Review(review)
+            }
+            0x88 => {
+                let count = r.count()?;
+                let mut rotated = Vec::with_capacity(count);
+                for _ in 0..count {
+                    rotated.push(r.string()?);
+                }
+                Self::Revoked {
+                    rotated,
+                    carried: u32::from_be_bytes(r.take(4)?.try_into().expect("took 4 bytes")),
+                }
             }
             0x7f => Self::Error {
                 code: match r.u8()? {
@@ -455,6 +565,10 @@ impl<'a> Reader<'a> {
 
     fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
+    }
+
+    fn device(&mut self) -> Result<DeviceId, DecodeError> {
+        DeviceId::try_from(self.take(16)?).map_err(|_| DecodeError::Bad("device id"))
     }
 
     fn count(&mut self) -> Result<usize, DecodeError> {
@@ -593,6 +707,24 @@ mod tests {
             Some("abandon ability")
         );
 
+        let device = DeviceId::random();
+        let Request::Revoke {
+            device: decoded,
+            recovery_phrase: None,
+        } = round_trip_request(&Request::Revoke {
+            device,
+            recovery_phrase: None,
+        })
+        else {
+            panic!("not a revoke");
+        };
+        assert_eq!(decoded, device);
+        let Request::Review { device: decoded } = round_trip_request(&Request::Review { device })
+        else {
+            panic!("not a review");
+        };
+        assert_eq!(decoded, device);
+
         for request in [Request::Collections, Request::Devices] {
             let message = request.encode();
             assert_eq!(&message[..], &[0, 0, 0, 1, message[4]]);
@@ -633,6 +765,36 @@ mod tests {
             panic!("not an entry");
         };
         assert_eq!((value.kind, &value.value[..]), (Kind::Var, &b"eu-west"[..]));
+
+        let review = Review {
+            secrets: vec![("latem".into(), vec!["prod/SENTRY_DSN".into()])],
+            wrote_last: vec![(
+                "latem".into(),
+                vec![
+                    Written {
+                        name: "prod/REGION".into(),
+                        deleted: false,
+                    },
+                    Written {
+                        name: "prod/OLD".into(),
+                        deleted: true,
+                    },
+                ],
+            )],
+        };
+        let Response::Review(decoded) = round_trip_response(&Response::Review(review)) else {
+            panic!("not a review");
+        };
+        assert_eq!(decoded.secrets[0].1, ["prod/SENTRY_DSN"]);
+        assert_eq!(decoded.wrote_last[0].1.len(), 2);
+        assert!(decoded.wrote_last[0].1[1].deleted);
+        let Response::Revoked { rotated, carried } = round_trip_response(&Response::Revoked {
+            rotated: vec!["latem".into()],
+            carried: 3,
+        }) else {
+            panic!("not revoked");
+        };
+        assert_eq!((rotated, carried), (vec!["latem".to_owned()], 3));
 
         let Response::Error { code, message } = round_trip_response(&Response::Error {
             code: ErrorCode::RecoveryPhraseNeeded,

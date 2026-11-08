@@ -1,7 +1,9 @@
 //! The local store: one SQLite database per vault (records.md, local store).
 
+mod revoke;
 mod sync;
 
+pub use revoke::{Review, Revocation, Written};
 pub use sync::Received;
 
 use std::collections::HashMap;
@@ -1941,12 +1943,28 @@ mod tests {
         admin
             .set(latem, "prod/REGION", Kind::Var, b"eu-west")
             .unwrap();
+        let (joined, path) = join_device(
+            s,
+            &mut admin,
+            joiner_keys,
+            "joined.db",
+            &[(latem, Scope::Read)],
+        );
+        (admin, joined, latem, path)
+    }
+
+    /// A device that joined `admin`'s vault with `scopes`, its store in `file`.
+    fn join_device(
+        s: &Setup,
+        admin: &mut Vault<&SoftwareKeys>,
+        joiner_keys: &SoftwareKeys,
+        file: &str,
+        scopes: &[(CollectionId, Scope)],
+    ) -> (Vault<SoftwareKeys>, PathBuf) {
         let device = DeviceId::random();
         let request = JoinRequest::sign(&[1; 32], device, joiner_keys, desktop()).unwrap();
-        let approval = admin
-            .approve_join(&request, &[(latem, Scope::Read)], &s.admin())
-            .unwrap();
-        let path = s.path.with_file_name("joined.db");
+        let approval = admin.approve_join(&request, scopes, &s.admin()).unwrap();
+        let path = s.path.with_file_name(file);
         let head = admin.membership().unwrap().head();
         let keys = SoftwareKeys::from_parts(
             openvault_crypto::UnwrapKey::from_secret_bytes(
@@ -1966,7 +1984,31 @@ mod tests {
             &approval.grants,
         )
         .unwrap();
-        (admin, joined, latem, path)
+        (joined, path)
+    }
+
+    /// Sends `from`'s log entries that `to` lacks.
+    fn send_log<A: DeviceKeys, B: DeviceKeys>(from: &Vault<A>, to: &mut Vault<B>) {
+        let head = to.membership().unwrap().head().0;
+        to.append_log(&from.log_from(head + 1, 64).unwrap())
+            .unwrap();
+    }
+
+    /// The epoch of the current version of `name`.
+    fn current_epoch<K: DeviceKeys>(vault: &Vault<K>, collection: CollectionId, name: &str) -> u32 {
+        let record: Vec<u8> = vault
+            .conn
+            .query_row(
+                "SELECT r.record FROM entries e JOIN records r USING (record_id)
+                 WHERE e.collection_id = ?1 AND e.name_tag = ?2",
+                params![
+                    &collection.as_bytes()[..],
+                    &vault.entry_tag(collection, name)[..]
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        Record::from_bytes(&record).unwrap().header().epoch
     }
 
     /// Sends `from` everything in each set they share that `to` lacks, as reconciliation would.
@@ -2135,6 +2177,132 @@ mod tests {
         drop(joined);
         let joined = Vault::open(&path, &joiner_keys).unwrap();
         assert_eq!(joined.list(latem).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn revoking_a_reader_gives_the_others_a_new_key() {
+        let s = setup();
+        let joiner_keys = SoftwareKeys::generate();
+        let (mut admin, joined, latem, _) = joined_pair(&s, &joiner_keys);
+        let ssh = admin.collection("ssh").unwrap();
+        let review = admin.review_revocation(joined.device_id()).unwrap();
+        assert_eq!(
+            review.secrets,
+            [("latem".to_owned(), vec!["prod/SENTRY_DSN".to_owned()])]
+        );
+        assert!(review.wrote_last.is_empty());
+
+        let revocation = admin.revoke_device(joined.device_id(), &s.admin()).unwrap();
+        assert_eq!(revocation.rotated, [latem], "not ssh: it couldn't read it");
+        assert_eq!(revocation.carried, 0);
+        let m = admin.membership().unwrap();
+        assert!(m.device(joined.device_id()).unwrap().revoked);
+        assert_eq!(m.scope(joined.device_id(), latem), Scope::None);
+        assert_eq!((m.epoch(latem), m.epoch(ssh)), (Some(1), Some(0)));
+        // The new key goes to this device and the recovery key, and the grants check out.
+        let new: Vec<Grant> = grants(&admin)
+            .into_iter()
+            .filter(|grant| grant.collection() == latem && grant.epoch() == 1)
+            .collect();
+        assert_eq!(new.len(), 2);
+        assert!(new.iter().any(|grant| grant.recipient().is_none()));
+        assert!(
+            new.iter()
+                .any(|grant| grant.recipient() == Some(admin.device_id()))
+        );
+        for grant in &new {
+            grant.check(m).unwrap();
+        }
+        // What was there still reads, and new writes use the new key.
+        assert_eq!(
+            value(admin.get(latem, "prod/REGION").unwrap()),
+            Some(b"eu-west".to_vec())
+        );
+        admin.set(latem, "prod/NEW", Kind::Var, b"1").unwrap();
+        assert_eq!(current_epoch(&admin, latem, "prod/NEW"), 1);
+        assert_eq!(current_epoch(&admin, latem, "prod/REGION"), 0);
+
+        for device in [joined.device_id(), admin.device_id()] {
+            assert!(matches!(
+                admin.revoke_device(device, &s.admin()),
+                Err(Error::CantRevoke(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_revoked_writers_versions_stop_counting_and_its_writes_are_carried_forward() {
+        let s = setup();
+        let (reader_keys, writer_keys) = (SoftwareKeys::generate(), SoftwareKeys::generate());
+        let (mut admin, mut reader, latem, _) = joined_pair(&s, &reader_keys);
+        let (mut writer, _) = join_device(
+            &s,
+            &mut admin,
+            &writer_keys,
+            "writer.db",
+            &[(latem, Scope::Write)],
+        );
+        send_log(&admin, &mut reader);
+        send_missing(&admin, &mut writer);
+        // The writer changes one entry and adds another, and every device has them.
+        writer
+            .set(latem, "prod/REGION", Kind::Var, b"us-east")
+            .unwrap();
+        writer
+            .set(latem, "prod/ADDED", Kind::Secret, b"from the writer")
+            .unwrap();
+        send_missing(&writer, &mut admin);
+        send_missing(&admin, &mut reader);
+        assert_eq!(
+            value(reader.get(latem, "prod/REGION").unwrap()),
+            Some(b"us-east".to_vec())
+        );
+        let review = admin.review_revocation(writer.device_id()).unwrap();
+        assert_eq!(review.wrote_last.len(), 1);
+        assert_eq!(
+            review.wrote_last[0]
+                .1
+                .iter()
+                .map(|w| &w.name[..])
+                .collect::<Vec<_>>(),
+            ["prod/ADDED", "prod/REGION"]
+        );
+
+        // The admin writes the writer's last changes again under the new key, so its values stay.
+        let revocation = admin.revoke_device(writer.device_id(), &s.admin()).unwrap();
+        assert_eq!(revocation.carried, 2);
+        let region = admin.get(latem, "prod/REGION").unwrap().unwrap();
+        assert_eq!(&region.value[..], b"us-east");
+        assert_eq!(region.version.device, admin.device_id());
+        assert_eq!(current_epoch(&admin, latem, "prod/REGION"), 1);
+
+        // A reader that learns of the revocation stops counting the writer's versions...
+        send_log(&admin, &mut reader);
+        assert_eq!(
+            value(reader.get(latem, "prod/REGION").unwrap()),
+            Some(b"eu-west".to_vec())
+        );
+        assert_eq!(value(reader.get(latem, "prod/ADDED").unwrap()), None);
+        // ...until the new key and the carried versions arrive.
+        send_missing(&admin, &mut reader);
+        assert_eq!(
+            value(reader.get(latem, "prod/REGION").unwrap()),
+            Some(b"us-east".to_vec())
+        );
+        assert_eq!(
+            value(reader.get(latem, "prod/ADDED").unwrap()),
+            Some(b"from the writer".to_vec())
+        );
+
+        // What it signs with its old key no longer becomes current, whatever its clock.
+        writer
+            .set(latem, "prod/REGION", Kind::Var, b"forged")
+            .unwrap();
+        send_set(&writer, &mut admin, SetId::records(latem));
+        assert_eq!(
+            value(admin.get(latem, "prod/REGION").unwrap()),
+            Some(b"us-east".to_vec())
+        );
     }
 
     #[test]

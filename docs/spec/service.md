@@ -67,11 +67,15 @@ Each device runs one iroh endpoint (design §10):
 | `0x07` | folder | collection (str) ‖ folder (str) |
 | `0x08` | devices | — |
 | `0x09` | changed | — |
+| `0x0a` | review | device id (16) |
+| `0x0b` | revoke | device id (16) ‖ has phrase (u8) ‖ recovery phrase (str, only if has phrase is 1) |
 
 - **set** writes every entry in one transaction, as `import-env` needs.
 - **folder** returns the current values under `folder/`, for `openvault run`.
 - **changed** says that something wrote to the vault without the service, as `approve` does. The service reloads what it keeps, as before every request, and starts sessions as after a log entry (sync.md, starting a session).
 - **create collection** signs with this device's admin key when it has one, which asks for Touch ID. Otherwise it needs the recovery phrase. Without one in the request, it fails with "recovery phrase needed", and the CLI asks for the phrase and sends the request again.
+- **review** returns what a device can read and what it wrote last, which `openvault devices revoke` shows before asking (sync.md, reviewing).
+- **revoke** revokes a device (sync.md, revoking and reducing scopes). It signs like create collection, and starts sessions as after a log entry.
 
 ### Responses
 
@@ -84,6 +88,8 @@ Each device runs one iroh endpoint (design §10):
 | `0x84` | listing | count (u32) ‖ entries: name (str) ‖ kind |
 | `0x85` | deleted | existed (u8) |
 | `0x86` | devices | count (u32) ‖ devices: id (16) ‖ flags (u8) ‖ platform (str) ‖ name (str) |
+| `0x87` | review | count (u32) ‖ collections it reads: name (str) ‖ count (u32) ‖ secret names (str); then count (u32) ‖ collections: name (str) ‖ count (u32) ‖ entries it wrote last: name (str) ‖ deleted (u8) |
+| `0x88` | revoked | count (u32) ‖ collections that got a new key (str) ‖ entries written again (u32) |
 | `0x7f` | error | code (u8) ‖ message (str) |
 
 **Device flags.**

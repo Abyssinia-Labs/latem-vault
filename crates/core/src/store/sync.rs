@@ -10,7 +10,7 @@ use super::{
     insert_grant, keep_own_key, meta, read_log, save_log, set_summary, wrap_context,
 };
 use crate::grant::Grant;
-use crate::membership::{LogEntry, Membership, Scope};
+use crate::membership::{Change, LogEntry, Membership, Scope};
 use crate::record::{Body, Kind, Record};
 use crate::sets::{ItemId, SetId, Summary};
 use crate::{CollectionId, DeviceId, DeviceKeys, Error, Result, names};
@@ -72,6 +72,18 @@ impl<K: DeviceKeys> Vault<K> {
         for entry in &new {
             membership.apply(entry)?;
         }
+        // A collection whose key changed is recounted, since versions from a device that lost
+        // `write` stop counting (records.md, versions).
+        let mut rotated: Vec<CollectionId> = new
+            .iter()
+            .filter_map(|entry| match entry.change() {
+                Change::RotateEpoch { collection, .. } => Some(*collection),
+                _ => None,
+            })
+            .collect();
+        rotated.sort();
+        rotated.dedup();
+        let keys = self.epoch_keys(&membership, &rotated)?;
         let tx = self.conn.unchecked_transaction()?;
         save_log(&tx, &new, &membership)?;
         for collection in membership.collections() {
@@ -81,8 +93,12 @@ impl<K: DeviceKeys> Vault<K> {
                 params![&collection.as_bytes()[..], epoch],
             )?;
         }
+        for &collection in &rotated {
+            self.recount(&tx, &membership, collection, &keys)?;
+        }
         tx.commit()?;
         self.membership = Some(membership);
+        self.collection_keys.extend(keys);
         Ok(new.len())
     }
 
@@ -384,7 +400,7 @@ impl<K: DeviceKeys> Vault<K> {
 
     /// Makes `record` the current version of its name if it is newer, and names the collection if
     /// it is the collection's own entry and now current.
-    fn index(
+    pub(super) fn index(
         &self,
         tx: &Transaction<'_>,
         collection: CollectionId,
@@ -439,7 +455,7 @@ impl<K: DeviceKeys> Vault<K> {
 
 /// Whether a version may become its name's current one. One from an old epoch whose author has
 /// since lost write never does (records.md, versions).
-fn counts(membership: &Membership, record: &Record) -> bool {
+pub(super) fn counts(membership: &Membership, record: &Record) -> bool {
     let header = record.header();
     membership.epoch(header.collection) == Some(header.epoch)
         || membership.scope(header.version.device, header.collection) == Scope::Write

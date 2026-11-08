@@ -60,7 +60,7 @@ A reader rejects a record if any check fails: format, flags, body hash, signatur
 
 ## Versions
 
-A record's version is `(lamport, device)`, compared in that order; the greatest version of a name is current. One exception: a version is ignored if its epoch is older than the collection's current epoch and its author no longer has `write` on the collection. Then nothing a revoked or demoted device signs with its old keys can become current ([sync.md](sync.md#revoking-and-reducing-scopes)). A device keeps one Lamport clock per vault. A new record gets `clock + 1`, and the clock advances to every version it writes or receives, so a local write is always newer than anything the device has seen. A deleted record stays current until a newer version replaces it, so an older version arriving later can't bring a deleted entry back.
+A record's version is `(lamport, device)`, compared in that order; the greatest version of a name is current. One exception: a version is ignored if its epoch is older than the collection's current epoch and its author no longer has `write` on the collection. Then nothing a revoked or demoted device signs with its old keys can become current ([sync.md](sync.md#revoking-and-reducing-scopes)). Since that depends on the log, a device recounts a collection's entries whenever its epoch changes (sync.md, recounting). A device keeps one Lamport clock per vault. A new record gets `clock + 1`, and the clock advances to every version it writes or receives, so a local write is always newer than anything the device has seen. A deleted record stays current until a newer version replaces it, so an older version arriving later can't bring a deleted entry back.
 
 ## Local store
 

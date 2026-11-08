@@ -523,7 +523,10 @@ impl<S: SyncStore> Session<S> {
         Ok(())
     }
 
+    /// Starts the roots over after the log changed. The peer's membership is checked again once
+    /// the logs are level, since the change may have revoked it.
     fn reset_roots(&mut self) {
+        self.peer = None;
         self.roots_sent = false;
         self.peer_roots.clear();
         self.reconciled.clear();
@@ -810,6 +813,7 @@ mod session_tests {
 
     struct Pair {
         _dir: tempfile::TempDir,
+        recovery: RecoveryKey,
         admin: Arc<Store>,
         joined: Arc<Store>,
         admin_node: Node,
@@ -880,6 +884,7 @@ mod session_tests {
         };
         Pair {
             _dir: dir,
+            recovery,
             admin: Arc::new(Mutex::new(admin)),
             joined: Arc::new(Mutex::new(joined)),
             admin_node: Node::start(&admin_seed, options()).await.unwrap().0,
@@ -995,6 +1000,56 @@ mod session_tests {
             .unwrap()
             .unwrap();
         assert_eq!(&entry.value[..], b"now");
+    }
+
+    /// A session ends once both sides know the peer was revoked, even when the revoked device has
+    /// the newest log, as it would from a device that hadn't yet applied the revocation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_ends_when_its_peer_is_revoked() {
+        let p = pair(1).await;
+        let idle = Duration::from_secs(10);
+        let (accept_tx, accept_rx) = mpsc::channel(8);
+        let accept_store = p.joined.clone();
+        let endpoint = p.joined_node.endpoint().clone();
+        let accepting = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            run(connection, Role::Accepter, accept_store, accept_rx, idle).await
+        });
+        let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
+        let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+        let (open_tx, open_rx) = mpsc::channel(8);
+        let opening = tokio::spawn(run(
+            connection,
+            Role::Opener,
+            p.admin.clone(),
+            open_rx,
+            idle,
+        ));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let joined = p.joined.lock().unwrap().device_id();
+        let entries = {
+            let mut admin = p.admin.lock().unwrap();
+            let head = admin.membership().unwrap().head().0;
+            admin
+                .revoke_device(joined, &p.recovery.admin_signing_key())
+                .unwrap();
+            admin.log_from(head + 1, 64).unwrap()
+        };
+        p.joined.lock().unwrap().append_log(&entries).unwrap();
+        open_tx.send(Notice::Log).await.unwrap();
+        accept_tx.send(Notice::Log).await.unwrap();
+
+        for side in [opening, accepting] {
+            let result = tokio::time::timeout(Duration::from_secs(5), side)
+                .await
+                .expect("the session ended")
+                .unwrap();
+            assert!(
+                matches!(result, Err(SyncError::Refused(Reason::NotAMember))),
+                "{result:?}"
+            );
+        }
     }
 
     /// A connection the peer closes because the two already have a session ends with

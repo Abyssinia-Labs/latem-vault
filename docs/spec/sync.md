@@ -1,6 +1,6 @@
 # Sync spec, v1
 
-Status: draft, 2026-11-07. Implemented on the local network: the sets, grants and accepting records in `crates/core` (`sets`, `grant`, the store's `sync` module), sessions and reconciliation in `crates/net` (`sync`), and starting sessions in `crates/service`. Builds on [records.md](records.md) and [membership.md](membership.md). The design is in [design §9](../design.md#9-sync) and [§10](../design.md#10-networking).
+Status: draft, 2026-11-07. Implemented on the local network: the sets, grants and accepting records in `crates/core` (`sets`, `grant`, the store's `sync` module), revoking in the store's `revoke` module, sessions and reconciliation in `crates/net` (`sync`), and starting sessions in `crates/service`. Builds on [records.md](records.md) and [membership.md](membership.md). The design is in [design §9](../design.md#9-sync) and [§10](../design.md#10-networking).
 
 Devices in a vault exchange three things directly, over iroh:
 - **the membership log;**
@@ -224,6 +224,12 @@ Revoking a device, or removing its `read` or `write` on a collection, rotates th
 2. rotate_epoch for every collection affected;
 3. grants of each new key to every remaining reader and to the recovery key.
 
+The device doing this makes the new keys and signs the grants, so it must be able to read every collection affected; otherwise it refuses before anything is signed. It can't revoke itself.
+
+**Recounting.** Each device that applies a rotate_epoch recounts that collection's entries (records.md, versions): a current version from an older epoch whose author no longer has `write` stops counting, and the newest version of its name that still counts takes its place. Only those entries' records are read, unless one stopped counting; then the collection's records are read once, to find the versions that take their place.
+
+**Sessions.** A running session checks the peer's membership again whenever the log changes, once the two logs are level. A session with a device that has just been revoked therefore ends with "not a member", even when the revoked device already has the newest log.
+
 **Versions from a removed writer.**
 - A device that has lost `write` keeps its signing key and the old collection keys. It can still sign records under old epochs, with any name and any Lamport clock, and they pass the header checks.
 - So when choosing an entry's current version, a reader ignores every version whose epoch is older than the collection's current one and whose author no longer has `write` on the collection (records.md, versions).
@@ -234,6 +240,7 @@ Revoking a device, or removing its `read` or `write` on a collection, rotates th
 - For every entry whose current version, just before it applied the rotation, was written by the removed device, it writes the same value again under the new epoch, deletions included.
 - Duplicates from several devices are harmless.
 - If no device with `write` remains, those entries stay in history only, until a device is given `write` and restores them.
+- **In v1,** only the device that signs the revocation does this, where it has `write`. Other writers learn of the rotation before they hold the new key, and until then they'd have to remember the entries to write again. Until the carried versions arrive, a device that applied the rotation shows each such entry's previous version, or none.
 
 **Reviewing.** `openvault devices revoke` lists the entries the device wrote last, for review, and the secrets it could read, to rotate at their providers (design §7).
 

@@ -6,7 +6,7 @@ This repository holds the open-source core: the Rust service and CLI, the coordi
 
 ## Status
 
-Milestone M1, one device, is done: secrets and variables work on a single machine, with no sync yet. Creating a collection already asks for Touch ID, which was planned for M2. Next is M2: devices joining over the LAN and syncing. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
+Milestone M1, one device, is done. M2, devices on the same network, is nearly done: devices join with a 6-digit code, sync directly over iroh, and can be revoked. What's left of M2 is latem's own OpenVault store, in latem's repository. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
 
 ## Try it
 
@@ -31,6 +31,14 @@ openvault approve --read latem                   # on the MacBook: the code, a r
 ```
 
 The code and the review make sure the device you approve is the one in front of you. The new device gets the vault's membership log and the keys for the collections it may read. With `openvault service` running on both, their secrets follow within seconds, and so does every later change.
+
+To remove a device, such as one that was lost:
+
+```sh
+openvault devices revoke Desktop                 # a review, then Touch ID
+```
+
+It stops syncing with the vault, and each collection it could read gets a new key, so nothing written afterwards reaches it. It keeps what it has already read, so the command ends with the secrets to change where they were issued.
 
 `openvault run` passes every entry under `prod/` to the command as an environment variable, so `prod/SENTRY_DSN` becomes `SENTRY_DSN`. `--prefix` puts a prefix in front of every name. latem reads its secrets from `LATEM_SECRET_<NAME>`, so it runs like this:
 

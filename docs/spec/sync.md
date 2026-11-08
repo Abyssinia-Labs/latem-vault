@@ -172,7 +172,7 @@ A device keeps a record in its set only if every header check passes:
 **Why only header checks.** These checks use only the header, the hash of the sealed body and the log. So devices with `hold` scope, which can't decrypt, make the same decisions as readers, and every device's sets converge to the same items.
 
 **Opening the body.**
-- A device that can read the collection then opens the body.
+- A device that can read the collection then opens the body. If its key for the record's epoch hasn't arrived, the record waits for it, and is opened when the grant arrives (records.md, waiting records).
 - A record that passes the header checks but fails to decrypt or decode is still kept and synced, so the sets still converge.
 - It never becomes an entry's current version, and the device logs it with its author.
 

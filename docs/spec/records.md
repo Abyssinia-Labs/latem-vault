@@ -71,18 +71,22 @@ Each device keeps one SQLite database per vault, readable only by its user (mode
 - collections, their current epochs and wrapped keys;
 - from sync on, the grants ([sync.md](sync.md#grants)), and each set's item count and id sum;
 - every record, as received;
+- the records it couldn't open yet because their key hadn't arrived;
 - an index of each entry's current version;
 - the membership log and the state it leads to ([membership.md](membership.md#keeping-the-log)).
 
-The database's `user_version` is the store version: 1 in M1, 2 since the membership log, 3 since device names in the log are sealed (membership.md, names key), 4 since grants (sync.md, grants), and 5 since sync.
+The database's `user_version` is the store version: 1 in M1, 2 since the membership log, 3 since device names in the log are sealed (membership.md, names key), 4 since grants (sync.md, grants), 5 since sync, and 6 since records can wait for their key.
 - Opening a version 1 store upgrades it by adding the empty log and grants tables. Starting its log later grants the keys it holds.
 - A version 2 store opens only if its log is empty. Entries written before names were sealed can't be read, so that vault is created again.
 - Opening a version 3 store adds the grants table, rebuilds the kept membership from the log (it gained the epoch history, membership.md), and turns each wrapped key the device holds, for itself or the recovery key, into a grant it signs.
 - Opening a version 4 store rebuilds the collections table so that a collection's name tag and label may be empty, adds the sets table and an index on each collection's record ids, and adds up the sets from the records and grants already there.
+- Opening a version 5 store adds the waiting list (below). It lists each record that isn't an entry's current version and whose key this device doesn't hold. It then keeps the key of each grant to this device that it holds without the key: a device that joined with version 4 kept its grants only. The records whose key the device now has are opened when the vault opens.
 
 A grant is kept by its id, with its collection, epoch and recipient. Creating a collection writes this device's and the recovery key's grants in the same transaction.
 
 Each set's count and id sum (sync.md, sets) is kept in a `sets` row, updated in the same transaction as each record or grant it gains. A collection the device knows only from the log and its grants, such as one on a device that has just joined, has a row without a name until its collection record arrives and opens.
+
+**Waiting records.** A record can arrive before this device has its key: the records and grants sets reconcile separately, a device with `hold` scope never has the key, and a key change sends new records and new grants at once. Such a record is kept, added to its set, and listed in a `waiting` table by collection and epoch. When a grant to this device for that collection and epoch arrives, the same transaction opens the records waiting for it, indexes the ones that count (versions, above), and takes them off the list. Opening the vault does the same for any listed record whose key the device already has. That lookup starts from the device's own keys, so held records cost nothing.
 
 A device writes to a collection only if it has `write` on it. Other devices would drop its records otherwise (sync.md, accepting records).
 

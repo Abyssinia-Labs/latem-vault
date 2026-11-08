@@ -2,6 +2,7 @@
 //! shares with a peer and what is in them, and taking in other devices' log entries, records and
 //! grants.
 
+use openvault_crypto::SymmetricKey;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::{
@@ -188,21 +189,24 @@ impl<K: DeviceKeys> Vault<K> {
             .epoch(grant.collection())
             .expect("checked by the grant");
         // A grant to this device that unwraps is also kept as the key it opens records with.
-        let own = grant.recipient() == Some(self.device_id)
-            && self
-                .keys
+        let key = if grant.recipient() == Some(self.device_id) {
+            self.keys
                 .unwrap(
                     &wrap_context(self.vault_id, grant.collection(), grant.epoch()),
                     grant.wrapped(),
                 )
-                .is_ok();
+                .ok()
+        } else {
+            None
+        };
         let tx = self.conn.unchecked_transaction()?;
         if !insert_grant(&tx, &grant)? {
             return Ok(Received::Known);
         }
-        if own {
+        if let Some(key) = &key {
             ensure_collection(&tx, grant.collection(), epoch)?;
             keep_own_key(&tx, &grant, &self.keys.wrap_key())?;
+            self.read_waiting(&tx, grant.collection(), grant.epoch(), key)?;
         }
         tx.commit()?;
         Ok(Received::New)
@@ -255,10 +259,7 @@ impl<K: DeviceKeys> Vault<K> {
             return Ok(Received::Known);
         }
 
-        // A version from an old epoch whose author has since lost write never becomes current
-        // (records.md, versions).
-        let counts =
-            header.epoch == current || membership.scope(author, collection) == Scope::Write;
+        let counts = counts(membership, &record);
         let readable = membership.scope(self.device_id, collection) >= Scope::Read;
         let body = if readable {
             match self.take_key(collection, header.epoch) {
@@ -267,7 +268,7 @@ impl<K: DeviceKeys> Vault<K> {
                     self.collection_keys.insert((collection, header.epoch), key);
                     Some(body)
                 }
-                // The grant for this epoch hasn't arrived yet; reconciliation brings it.
+                // The grant for this epoch hasn't arrived yet: the record waits for it.
                 Err(Error::NoKey(_)) => None,
                 Err(e) => return Err(e),
             }
@@ -291,10 +292,94 @@ impl<K: DeviceKeys> Vault<K> {
                 Received::New
             }
             Some(Err(_)) => Received::Unreadable,
-            None => Received::New,
+            None => {
+                tx.execute(
+                    "INSERT INTO waiting VALUES (?1, ?2, ?3)",
+                    params![&id[..], &collection.as_bytes()[..], header.epoch],
+                )?;
+                Received::New
+            }
         };
         tx.commit()?;
         Ok(received)
+    }
+
+    /// Opens the records waiting for a key this device now has, as after the upgrade to version 6
+    /// (records.md, waiting records). Starts from this device's keys, so records it only holds
+    /// cost nothing.
+    pub(super) fn open_waiting(&mut self) -> Result<()> {
+        if self.membership.is_none() {
+            return Ok(());
+        }
+        let ready: Vec<(Vec<u8>, u32)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT collection_id, epoch FROM collection_keys k WHERE recipient = ?1
+                 AND EXISTS (
+                     SELECT 1 FROM waiting w
+                     WHERE w.collection_id = k.collection_id AND w.epoch = k.epoch
+                 )",
+            )?;
+            statement
+                .query_map([self.keys.wrap_key().as_bytes()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut keys = Vec::with_capacity(ready.len());
+        for (collection, epoch) in ready {
+            let collection = CollectionId::try_from(collection.as_slice())?;
+            keys.push((collection, epoch, self.take_key(collection, epoch)?));
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (collection, epoch, key) in &keys {
+            self.read_waiting(&tx, *collection, *epoch, key)?;
+        }
+        tx.commit()?;
+        for (collection, epoch, key) in keys {
+            self.collection_keys.insert((collection, epoch), key);
+        }
+        Ok(())
+    }
+
+    /// Opens the records that waited for `key`, this device's key to `collection` at `epoch`,
+    /// indexes the ones that count, and takes them all off the list. One that doesn't open stays
+    /// kept but never becomes current, as when it arrives.
+    fn read_waiting(
+        &self,
+        tx: &Transaction<'_>,
+        collection: CollectionId,
+        epoch: u32,
+        key: &SymmetricKey,
+    ) -> Result<()> {
+        let membership = self.membership.as_ref().ok_or(Error::NoLog)?;
+        let ids: Vec<Vec<u8>> = {
+            let mut statement = tx
+                .prepare("SELECT record_id FROM waiting WHERE collection_id = ?1 AND epoch = ?2")?;
+            statement
+                .query_map(params![&collection.as_bytes()[..], epoch], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for id in ids {
+            let bytes: Vec<u8> = tx.query_row(
+                "SELECT record FROM records WHERE record_id = ?1",
+                [&id[..]],
+                |row| row.get(0),
+            )?;
+            let record = Record::from_bytes(&bytes)?;
+            let author = membership
+                .device(record.header().version.device)
+                .ok_or(Error::InvalidRecord("unknown author"))?;
+            if let Ok(body) = record.open(&author.info.verifying_key, key)
+                && counts(membership, &record)
+            {
+                self.index(tx, collection, &record.id(), &record, &body)?;
+            }
+            tx.execute("DELETE FROM waiting WHERE record_id = ?1", [&id[..]])?;
+        }
+        Ok(())
     }
 
     /// Makes `record` the current version of its name if it is newer, and names the collection if
@@ -350,6 +435,14 @@ impl<K: DeviceKeys> Vault<K> {
         )?;
         Ok(())
     }
+}
+
+/// Whether a version may become its name's current one. One from an old epoch whose author has
+/// since lost write never does (records.md, versions).
+fn counts(membership: &Membership, record: &Record) -> bool {
+    let header = record.header();
+    membership.epoch(header.collection) == Some(header.epoch)
+        || membership.scope(header.version.device, header.collection) == Scope::Write
 }
 
 /// Moves the clock up to `lamport` if it's behind, so a local write is always newer than

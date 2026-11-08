@@ -27,13 +27,15 @@ use crate::{CollectionId, DeviceId, DeviceKeys, Error, Result, VaultId, names, t
 
 /// Version 2 added the membership log, version 3 sealed the device names in it (membership.md,
 /// names key), and version 4 added grants (sync.md, grants) and the epoch history to the kept
-/// membership, and version 5 added set summaries and collections known before their name
-/// arrives (sync.md). Opening a version 1 store adds the (empty) log and grants tables. A
-/// version 2 store opens only if its log is empty, since its entries are in the old format.
-/// Opening a version 3 store rebuilds the kept membership from the log and signs a grant for
-/// each collection key the device holds. Opening a version 4 store rebuilds the collections
-/// table and adds up its sets.
-const SCHEMA_VERSION: i64 = 5;
+/// membership, version 5 added set summaries and collections known before their name arrives
+/// (sync.md), and version 6 added the records waiting for their key. Opening a version 1 store
+/// adds the (empty) log and grants tables. A version 2 store opens only if its log is empty,
+/// since its entries are in the old format. Opening a version 3 store rebuilds the kept
+/// membership from the log and signs a grant for each collection key the device holds. Opening a
+/// version 4 store rebuilds the collections table and adds up its sets. Opening a version 5
+/// store lists the records it kept without their key, and keeps the key of each grant to this
+/// device it holds, which a device that joined with version 4 didn't.
+const SCHEMA_VERSION: i64 = 6;
 
 /// Every grant this device knows of, its own and other devices' (sync.md, who stores grants).
 const GRANTS_SCHEMA: &str = "
@@ -47,6 +49,19 @@ CREATE TABLE grants (
 ) STRICT;
 
 CREATE INDEX grants_by_recipient ON grants (recipient, collection_id, epoch);
+";
+
+/// Records kept before this device had the key for their epoch, as when a record arrives before
+/// the grant of its key. When the key arrives they are opened and become entries (records.md,
+/// waiting records).
+const WAITING_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS waiting (
+    record_id BLOB PRIMARY KEY REFERENCES records,
+    collection_id BLOB NOT NULL,
+    epoch INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS waiting_by_key ON waiting (collection_id, epoch);
 ";
 
 /// What approving a join gives the joiner (join.md, approval): the whole log, and its grants.
@@ -245,7 +260,9 @@ impl<K: DeviceKeys> Vault<K> {
             return Err(Error::WrongKeys);
         }
         let membership = load_membership(&conn, vault_id, device_id, &keys)?;
-        Self::new(conn, keys, vault_id, device_id, recovery, membership)
+        let mut vault = Self::new(conn, keys, vault_id, device_id, recovery, membership)?;
+        vault.open_waiting()?;
+        Ok(vault)
     }
 
     fn new(
@@ -1014,7 +1031,7 @@ fn connect(path: &Path) -> Result<Connection> {
 fn upgrade(conn: &mut Connection, keys: &impl DeviceKeys) -> Result<()> {
     match user_version(conn)? {
         SCHEMA_VERSION => return Ok(()),
-        1..=4 => {}
+        1..=5 => {}
         other => return Err(Error::UnsupportedStore(other)),
     }
     // Rebuilding the collections table needs foreign keys off, which can only change outside a
@@ -1044,7 +1061,9 @@ fn upgrade_in_transaction(conn: &mut Connection, keys: &impl DeviceKeys) -> Resu
     if version < 4 {
         tx.execute_batch(GRANTS_SCHEMA)?;
     }
-    tx.execute_batch(V5_SCHEMA)?;
+    if version < 5 {
+        tx.execute_batch(V5_SCHEMA)?;
+    }
     let log = read_log(&tx)?;
     if version < 4 && !log.is_empty() {
         // The kept membership gained the epoch history, so it's rebuilt from the log.
@@ -1055,8 +1074,16 @@ fn upgrade_in_transaction(conn: &mut Connection, keys: &impl DeviceKeys) -> Resu
         let recovery = WrapKey::from_bytes(&meta(&tx, "recovery_wrap_key")?)?;
         write_own_grants(&tx, vault, device, &recovery, keys)?;
     }
-    // After any grants the step above signs.
-    sum_sets(&tx)?;
+    if version < 5 {
+        // After any grants the step above signs.
+        sum_sets(&tx)?;
+    }
+    tx.execute_batch(WAITING_SCHEMA)?;
+    // Before the keys below arrive, so the records they open are on the list.
+    list_waiting(&tx, &keys.wrap_key())?;
+    if !log.is_empty() {
+        keep_granted_keys(&tx, &log, keys)?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -1082,6 +1109,82 @@ CREATE TABLE IF NOT EXISTS sets (
     sum BLOB NOT NULL
 ) STRICT;
 ";
+
+/// Lists each record kept without being opened, because this device had no key for its epoch:
+/// the upgrade to version 6, which added the list. Opening the vault opens the ones whose key it
+/// has by then.
+fn list_waiting(tx: &Transaction<'_>, wrap_key: &WrapKey) -> Result<()> {
+    // Only records that aren't an entry's current version, and of those, each is parsed.
+    let mut waiting = Vec::new();
+    {
+        let mut statement = tx.prepare(
+            "SELECT record FROM records WHERE record_id NOT IN (SELECT record_id FROM entries)",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let record = Record::from_bytes(&row.get::<_, Vec<u8>>(0)?)?;
+            waiting.push((
+                record.id(),
+                record.header().collection,
+                record.header().epoch,
+            ));
+        }
+    }
+    for (id, collection, epoch) in waiting {
+        tx.execute(
+            "INSERT OR IGNORE INTO waiting SELECT ?1, ?2, ?3 WHERE NOT EXISTS (
+                 SELECT 1 FROM collection_keys
+                 WHERE collection_id = ?2 AND epoch = ?3 AND recipient = ?4
+             )",
+            params![
+                &id[..],
+                &collection.as_bytes()[..],
+                epoch,
+                wrap_key.as_bytes()
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Keeps the key of each grant to this device that it holds without the key: a device that
+/// joined with version 4 kept its grants but not their keys (the upgrade to version 6).
+fn keep_granted_keys(tx: &Transaction<'_>, log: &[LogEntry], keys: &impl DeviceKeys) -> Result<()> {
+    let wrap_key = keys.wrap_key();
+    let device = DeviceId::try_from(meta(tx, "device_id")?.as_slice())?;
+    let grants: Vec<Vec<u8>> = {
+        let mut statement = tx.prepare(
+            "SELECT grant FROM grants g WHERE recipient = ?1 AND NOT EXISTS (
+                 SELECT 1 FROM collection_keys k
+                 WHERE k.collection_id = g.collection_id AND k.epoch = g.epoch
+                 AND k.recipient = ?2
+             )",
+        )?;
+        statement
+            .query_map(
+                params![&device.as_bytes()[..], wrap_key.as_bytes()],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    if grants.is_empty() {
+        return Ok(());
+    }
+    let membership = Membership::replay(log)?;
+    for bytes in grants {
+        let grant = Grant::from_bytes(&bytes)?;
+        let context = wrap_context(membership.vault(), grant.collection(), grant.epoch());
+        if keys.unwrap(&context, grant.wrapped()).is_err() {
+            continue;
+        }
+        let Some(epoch) = membership.epoch(grant.collection()) else {
+            continue;
+        };
+        ensure_collection(tx, grant.collection(), epoch)?;
+        keep_own_key(tx, &grant, &wrap_key)?;
+    }
+    Ok(())
+}
 
 /// Adds up every set from the records and grants already stored.
 fn sum_sets(tx: &Transaction<'_>) -> Result<()> {
@@ -1145,6 +1248,7 @@ fn init_store(
     tx.execute_batch(SCHEMA)?;
     tx.execute_batch(LOG_SCHEMA)?;
     tx.execute_batch(GRANTS_SCHEMA)?;
+    tx.execute_batch(WAITING_SCHEMA)?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     for (key, value) in [
         ("vault_id", &vault.as_bytes()[..]),
@@ -1860,25 +1964,32 @@ mod tests {
 
     /// Sends `from` everything in each set they share that `to` lacks, as reconciliation would.
     fn send_missing<A: DeviceKeys, B: DeviceKeys>(from: &Vault<A>, to: &mut Vault<B>) -> usize {
-        let mut sent = 0;
-        for set in to.shared_sets(from.device_id()) {
-            let theirs: std::collections::HashSet<ItemId> = to
-                .set_ids(set, &[0; 32], None)
-                .unwrap()
-                .into_iter()
-                .collect();
-            let missing: Vec<ItemId> = from
-                .set_ids(set, &[0; 32], None)
-                .unwrap()
-                .into_iter()
-                .filter(|id| !theirs.contains(id))
-                .collect();
-            for item in from.set_items(set, &missing).unwrap() {
-                assert_eq!(to.receive(set, &item).unwrap(), Received::New);
-                sent += 1;
-            }
+        let sets = to.shared_sets(from.device_id());
+        sets.into_iter().map(|set| send_set(from, to, set)).sum()
+    }
+
+    /// Sends `from` everything in `set` that `to` lacks.
+    fn send_set<A: DeviceKeys, B: DeviceKeys>(
+        from: &Vault<A>,
+        to: &mut Vault<B>,
+        set: SetId,
+    ) -> usize {
+        let theirs: std::collections::HashSet<ItemId> = to
+            .set_ids(set, &[0; 32], None)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let missing: Vec<ItemId> = from
+            .set_ids(set, &[0; 32], None)
+            .unwrap()
+            .into_iter()
+            .filter(|id| !theirs.contains(id))
+            .collect();
+        let items = from.set_items(set, &missing).unwrap();
+        for item in &items {
+            assert_eq!(to.receive(set, item).unwrap(), Received::New);
         }
-        sent
+        items.len()
     }
 
     #[test]
@@ -1940,6 +2051,83 @@ mod tests {
             joined.set(latem, "prod/X", Kind::Var, b"1"),
             Err(Error::ReadOnly)
         ));
+    }
+
+    #[test]
+    fn records_that_arrive_before_their_key_are_opened_when_it_does() {
+        let s = setup();
+        let joiner_keys = SoftwareKeys::generate();
+        let (admin, mut joined, latem, _) = joined_pair(&s, &joiner_keys);
+        // As if its grant came after the join, as it does after a key change: no grant or key.
+        joined
+            .conn
+            .execute_batch("DELETE FROM collection_keys; DELETE FROM grants;")
+            .unwrap();
+        joined
+            .conn
+            .execute(
+                "DELETE FROM sets WHERE set_id = ?1",
+                [&SetId::GRANTS.as_bytes()[..]],
+            )
+            .unwrap();
+
+        // The collection record and two entries arrive first, and are kept unopened.
+        assert_eq!(send_set(&admin, &mut joined, SetId::records(latem)), 3);
+        assert_eq!(waiting(&joined), 3);
+        assert!(joined.collections().unwrap().is_empty());
+        assert!(matches!(
+            joined.collection("latem"),
+            Err(Error::NoSuchCollection(_))
+        ));
+
+        // Then the grants: the admin's and recovery key's for both collections, and its own.
+        assert_eq!(send_set(&admin, &mut joined, SetId::GRANTS), 4 + 1);
+        assert_eq!(waiting(&joined), 0);
+        assert_eq!(joined.collection("latem").unwrap(), latem);
+        assert_eq!(
+            value(joined.get(latem, "prod/SENTRY_DSN").unwrap()),
+            Some(b"https://sentry".to_vec())
+        );
+        assert_eq!(joined.list(latem).unwrap().len(), 2);
+    }
+
+    fn waiting<K: DeviceKeys>(vault: &Vault<K>) -> i64 {
+        vault
+            .conn
+            .query_row("SELECT count(*) FROM waiting", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn version_5_stores_keep_their_granted_keys_and_open_what_waited() {
+        let s = setup();
+        let joiner_keys = SoftwareKeys::generate();
+        let (admin, mut joined, latem, path) = joined_pair(&s, &joiner_keys);
+        // A device that joined with version 4 kept its grant but not the key in it, so with
+        // version 5 the records it took in stayed unopened, and nothing listed them.
+        joined
+            .conn
+            .execute("DELETE FROM collection_keys", [])
+            .unwrap();
+        assert_eq!(send_missing(&admin, &mut joined), 3 + 4);
+        assert!(joined.collections().unwrap().is_empty());
+        joined
+            .conn
+            .execute_batch("DROP TABLE waiting; PRAGMA user_version = 5;")
+            .unwrap();
+        drop(joined);
+
+        let mut joined = Vault::open(&path, &joiner_keys).unwrap();
+        assert_eq!(user_version(&joined.conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(waiting(&joined), 0);
+        assert_eq!(joined.collection("latem").unwrap(), latem);
+        assert_eq!(
+            value(joined.get(latem, "prod/REGION").unwrap()),
+            Some(b"eu-west".to_vec())
+        );
+        drop(joined);
+        let joined = Vault::open(&path, &joiner_keys).unwrap();
+        assert_eq!(joined.list(latem).unwrap().len(), 2);
     }
 
     #[test]

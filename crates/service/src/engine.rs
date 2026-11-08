@@ -100,7 +100,7 @@ impl Engine {
         let mut state = self.state.lock().expect("poisoned");
         if let Some(existing) = state.sessions.get(&peer) {
             if !existing.opened_here || self.node.id() < peer {
-                connection.close(0u32.into(), b"already syncing");
+                sync::close_duplicate(&connection);
                 return;
             }
             existing.task.abort();
@@ -181,13 +181,9 @@ impl Engine {
         match result {
             Ok(outcome) => {
                 state.retries.remove(&peer);
-                if outcome.received > 0 || outcome.log_entries > 0 {
-                    info!(
-                        "synced with {name}: {} new records and grants, {} log entries",
-                        outcome.received, outcome.log_entries
-                    );
-                } else {
-                    debug!("synced with {name}: nothing new; sent {}", outcome.sent);
+                match describe(&outcome) {
+                    Some(moved) => info!("synced with {name}: {moved}"),
+                    None => debug!("synced with {name}: nothing new"),
                 }
                 if outcome.dropped > 0 {
                     warn!(
@@ -196,6 +192,9 @@ impl Engine {
                     );
                 }
             }
+            // Both devices connected at once and the other kept its own connection, which carries
+            // the session (sync.md, who connects).
+            Err(SyncError::Duplicate) => debug!("{name} already has a session with this device"),
             Err(error) => {
                 let delay = *state.retries.get(&peer).unwrap_or(&FIRST_RETRY);
                 state.retries.insert(peer, (delay * 2).min(LAST_RETRY));
@@ -241,5 +240,58 @@ impl Engine {
             .member_by_endpoint(peer)
             .and_then(|device| vault.device_name(device).ok().flatten())
             .map_or_else(|| "a device".to_owned(), |name| name.name)
+    }
+}
+
+/// What a session moved, such as "received 28 records and grants; sent 2 log entries", or `None`
+/// if nothing.
+fn describe(outcome: &Outcome) -> Option<String> {
+    let received = counts(outcome.log_received, outcome.received);
+    let sent = counts(outcome.log_sent, outcome.sent);
+    let parts: Vec<String> = [("received", received), ("sent", sent)]
+        .into_iter()
+        .filter_map(|(verb, counts)| counts.map(|counts| format!("{verb} {counts}")))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+fn counts(log_entries: usize, items: usize) -> Option<String> {
+    let parts: Vec<String> = [
+        (log_entries, "log entry", "log entries"),
+        (items, "record or grant", "records and grants"),
+    ]
+    .into_iter()
+    .filter(|&(n, ..)| n > 0)
+    .map(|(n, one, many)| format!("{n} {}", if n == 1 { one } else { many }))
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" and "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcomes_read_as_sentences() {
+        let outcome = |log_received, received, log_sent, sent| Outcome {
+            log_received,
+            received,
+            dropped: 0,
+            log_sent,
+            sent,
+        };
+        assert_eq!(describe(&outcome(0, 0, 0, 0)), None);
+        assert_eq!(
+            describe(&outcome(0, 28, 0, 0)).unwrap(),
+            "received 28 records and grants"
+        );
+        assert_eq!(
+            describe(&outcome(0, 0, 0, 28)).unwrap(),
+            "sent 28 records and grants"
+        );
+        assert_eq!(
+            describe(&outcome(2, 1, 1, 3)).unwrap(),
+            "received 2 log entries and 1 record or grant; sent 1 log entry and 3 records and grants"
+        );
     }
 }

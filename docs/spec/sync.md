@@ -23,6 +23,7 @@ All integers are big-endian.
 - Either device may connect.
 - iroh authenticates the transport keys at both ends (OV-7), and the log decides what each device may do.
 - If two devices connect to each other at the same time, they keep the connection opened by the device with the smaller endpoint id, compared bytewise, and close the other. Endpoint ids are known before the logs are exchanged, which device ids aren't always.
+- The connection that isn't kept is closed with QUIC application error code 1, "already syncing". The device that opened it doesn't count this as a failure and doesn't retry: the kept connection carries the session. A session that ends normally closes with code 0.
 
 **Lifetime.** A device opens a connection when there is something to sync (below) and closes it after 60 seconds without a message. It keeps no idle connections.
 

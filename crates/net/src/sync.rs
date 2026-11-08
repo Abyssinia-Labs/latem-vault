@@ -8,13 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
 use openvault_core::membership::LogEntry;
 use openvault_core::sets::{Fingerprint, ItemId, SetId, Summary};
 use openvault_core::{DeviceId, DeviceKeys, Received, Vault, VaultId};
 use openvault_crypto::hash::Hash;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep_until};
 use tracing::{debug, warn};
 
 use crate::EndpointKey;
@@ -35,6 +35,10 @@ const SPLIT: usize = 16;
 const MAX_LOG: usize = 4096;
 /// The most ranges or ids one message may carry.
 const MAX_LIST: u16 = 1024;
+/// Close codes: a session ended, and a connection closed because the two devices already have a
+/// session (sync.md, who connects).
+const DONE: u32 = 0;
+const DUPLICATE: u32 = 1;
 
 /// What a session needs from the device's store. Every call may wait on the database, so a
 /// session makes them from blocking sections.
@@ -76,11 +80,15 @@ pub enum Role {
 /// What a session did, for the device's log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
-    pub log_entries: usize,
+    /// Log entries this device took in.
+    pub log_received: usize,
     /// New records and grants this device took in.
     pub received: usize,
     /// Items the peer sent that failed their checks and were dropped.
     pub dropped: usize,
+    /// Log entries this device sent.
+    pub log_sent: usize,
+    /// Records and grants this device sent.
     pub sent: usize,
 }
 
@@ -92,6 +100,10 @@ pub enum SyncError {
     Connect(String),
     #[error("{0}")]
     Refused(Reason),
+    /// The peer closed the connection because the two devices already have a session. This isn't
+    /// a failure.
+    #[error("the peer already has a session with this device")]
+    Duplicate,
     #[error(transparent)]
     Store(#[from] openvault_core::Error),
 }
@@ -141,8 +153,33 @@ pub async fn run<S: SyncStore>(
     mut notices: mpsc::Receiver<Notice>,
     idle: Duration,
 ) -> Result<Outcome, SyncError> {
+    let result = session(&connection, role, store, &mut notices, idle).await;
+    let duplicate = matches!(
+        connection.close_reason(),
+        Some(ConnectionError::ApplicationClosed(close)) if u64::from(close.error_code) == u64::from(DUPLICATE)
+    );
+    connection.close(DONE.into(), b"done");
+    match result {
+        Err(_) if duplicate => Err(SyncError::Duplicate),
+        result => result,
+    }
+}
+
+/// Closes a connection that duplicates a running session with the same peer. The peer's session
+/// ends with [`SyncError::Duplicate`].
+pub fn close_duplicate(connection: &Connection) {
+    connection.close(DUPLICATE.into(), b"already syncing");
+}
+
+async fn session<S: SyncStore>(
+    connection: &Connection,
+    role: Role,
+    store: Arc<S>,
+    notices: &mut mpsc::Receiver<Notice>,
+    idle: Duration,
+) -> Result<Outcome, SyncError> {
     let peer_endpoint = *connection.remote_id().as_bytes();
-    let (send, mut recv) = match role {
+    let (send, recv) = match role {
         Role::Opener => connection.open_bi().await,
         Role::Accepter => connection.accept_bi().await,
     }
@@ -163,7 +200,7 @@ pub async fn run<S: SyncStore>(
         log_requested: false,
         outcome: Outcome::default(),
     };
-    let result = session.drive(&mut recv, &mut notices, idle).await;
+    let result = session.drive(recv, notices, idle).await;
     if let Err(error) = &result {
         let reason = match error {
             SyncError::Refused(reason) => Some(*reason),
@@ -177,25 +214,24 @@ pub async fn run<S: SyncStore>(
     } else {
         let _ = session.send.finish();
     }
-    connection.close(0u32.into(), b"done");
     result.map(|()| session.outcome)
 }
 
 impl<S: SyncStore> Session<S> {
     async fn drive(
         &mut self,
-        recv: &mut RecvStream,
+        recv: RecvStream,
         notices: &mut mpsc::Receiver<Notice>,
         idle: Duration,
     ) -> Result<(), SyncError> {
         self.send_hello().await?;
+        // One read stays in flight across the loop. `select!` drops the branches it doesn't take,
+        // and a read dropped part way through a message would lose the bytes it had read.
+        let mut reading = Box::pin(next_message(recv));
         let mut deadline = Instant::now() + idle;
         loop {
             tokio::select! {
-                message = timeout_at(deadline, frame::read(recv)) => {
-                    let Ok(message) = message else {
-                        return Ok(());
-                    };
+                (recv, message) = &mut reading => {
                     let (kind, body) = match message {
                         Ok(message) => message,
                         // The peer went idle first and closed.
@@ -203,10 +239,12 @@ impl<S: SyncStore> Session<S> {
                         Err(FrameError::Peer { reason, .. }) => return Err(SyncError::Refused(reason)),
                         Err(e) => return Err(e.into()),
                     };
+                    reading.set(next_message(recv));
                     deadline = Instant::now() + idle;
                     self.handle(kind, &body).await?;
                 }
                 Some(notice) = notices.recv() => self.notice(notice).await?,
+                () = sleep_until(deadline) => return Ok(()),
             }
         }
     }
@@ -233,6 +271,7 @@ impl<S: SyncStore> Session<S> {
                 }
                 let entries = blocking(|| self.store.log_from(from, max.min(LOG_BATCH)))?;
                 frame::write(&mut self.send, LOG_ENTRIES, &wire::log_entries(&entries)).await?;
+                self.outcome.log_sent += entries.len();
                 Ok(())
             }
             LOG_ENTRIES => {
@@ -241,8 +280,8 @@ impl<S: SyncStore> Session<S> {
                 if entries.is_empty() {
                     return Err(FrameError::Bad("no log entries").into());
                 }
-                self.outcome.log_entries += entries.len();
-                if self.outcome.log_entries > MAX_LOG {
+                self.outcome.log_received += entries.len();
+                if self.outcome.log_received > MAX_LOG {
                     return Err(FrameError::Bad("too many log entries").into());
                 }
                 let new = blocking(|| self.store.append_log(&entries))?;
@@ -667,6 +706,12 @@ fn parse_reconcile(body: &[u8]) -> Result<(SetId, Vec<Range>), FrameError> {
     Ok((set, ranges))
 }
 
+/// Reads the next message and hands the stream back for the one after.
+async fn next_message(mut recv: RecvStream) -> (RecvStream, Result<(u8, Vec<u8>), FrameError>) {
+    let message = frame::read(&mut recv).await;
+    (recv, message)
+}
+
 /// Runs a store call that may wait on the database without holding up the runtime's other
 /// tasks. Sessions run on a multi-threaded runtime.
 fn blocking<T>(f: impl FnOnce() -> T) -> T {
@@ -940,6 +985,71 @@ mod session_tests {
             .unwrap()
             .unwrap();
         assert_eq!(&entry.value[..], b"now");
+    }
+
+    /// A connection the peer closes because the two already have a session ends with
+    /// `Duplicate`, which the device doesn't count as a failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_duplicate_connection_ends_without_a_failure() {
+        let p = pair(0).await;
+        let endpoint = p.joined_node.endpoint().clone();
+        let accepting = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            close_duplicate(&connection);
+        });
+        let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
+        let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+        let (_notices, rx) = mpsc::channel(1);
+        let result = run(
+            connection,
+            Role::Opener,
+            p.admin.clone(),
+            rx,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(matches!(result, Err(SyncError::Duplicate)), "{result:?}");
+        accepting.await.unwrap();
+    }
+
+    /// Notices that arrive while a long items message is still coming in leave it whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notices_during_a_long_message_leave_it_whole() {
+        let p = pair(0).await;
+        {
+            let mut admin = p.admin.lock().unwrap();
+            for i in 0..12u8 {
+                admin
+                    .set(
+                        p.latem,
+                        &format!("big/{i}"),
+                        Kind::Secret,
+                        &vec![i; 512 * 1024],
+                    )
+                    .unwrap();
+            }
+        }
+        let admin = (&p.admin_node, &p.admin);
+        let joined = (&p.joined_node, &p.joined);
+        // A set the two don't share: each notice wakes the session and does nothing else.
+        let elsewhere = Notice::Changed(SetId::records(CollectionId::random()));
+        let (opened, _) = session(
+            joined,
+            admin,
+            Duration::from_secs(2),
+            async move |notices| {
+                for _ in 0..2000 {
+                    if notices.send(elsewhere).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_micros(200)).await;
+                }
+            },
+        )
+        .await;
+        // The twelve records, the collection record and four grants.
+        assert_eq!(opened.received, 12 + 1 + 4);
+        assert_eq!(summaries(&p.joined, p.latem), summaries(&p.admin, p.latem));
     }
 
     /// More than 32 items on each side, overlapping, settles through fingerprints and splits.

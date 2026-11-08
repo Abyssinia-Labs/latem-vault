@@ -27,10 +27,18 @@ use openvault_service::handler::{self, unexpected};
 use openvault_service::{ADMIN_KEY, KEYS, SOCKET, VAULT, default_device_name};
 use zeroize::Zeroizing;
 
+/// This build: its version, and the commit it was built from (README, versions).
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("OPENVAULT_COMMIT"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(
     name = "openvault",
-    version,
+    version = VERSION,
     about = "Secrets and variables, encrypted on your own devices."
 )]
 struct Cli {
@@ -651,7 +659,7 @@ fn service(home: &Home) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(openvault_service::run(&home.0, keys))
+        .block_on(openvault_service::run(&home.0, keys, VERSION))
 }
 
 #[cfg(not(unix))]

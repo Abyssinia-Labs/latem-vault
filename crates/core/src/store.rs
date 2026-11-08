@@ -1883,6 +1883,13 @@ mod tests {
         vault.grants_to(device).unwrap().len()
     }
 
+    /// A new store version is a new minor version of the build, since older builds refuse the
+    /// store (README, versions). Change both together.
+    #[test]
+    fn the_build_version_follows_the_store_version() {
+        assert_eq!((env!("CARGO_PKG_VERSION_MINOR"), SCHEMA_VERSION), ("2", 6));
+    }
+
     #[test]
     fn version_3_stores_get_grants_and_epoch_history() {
         let s = setup();

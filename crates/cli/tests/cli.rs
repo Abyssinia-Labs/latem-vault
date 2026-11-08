@@ -234,6 +234,20 @@ fn passphrase_keys_need_a_terminal() {
 }
 
 #[test]
+fn the_version_names_the_build() {
+    let version = Device::empty().ok(&["--version"]);
+    let build = version
+        .trim()
+        .strip_prefix(concat!("openvault ", env!("CARGO_PKG_VERSION"), " ("))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("{version}"));
+    assert!(
+        build == "unknown" || (build.len() == 7 && build.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{build}"
+    );
+}
+
+#[test]
 fn commands_need_a_vault() {
     let device = Device::empty();
     assert!(device.fails(&["get", "latem/x"]).contains("openvault init"));

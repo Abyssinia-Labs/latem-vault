@@ -38,8 +38,9 @@ enum Change {
 }
 
 /// Runs the service for the vault in `dir` until Ctrl-C or SIGTERM. `keys` are the device's
-/// keys, already unlocked. Must be called inside a tokio runtime.
-pub async fn run(dir: &Path, keys: Keys) -> Result<()> {
+/// keys, already unlocked, and `version` is this build's, for the log. Must be called inside a
+/// tokio runtime.
+pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
     // Held until the service exits, so a second service for the same vault refuses to start.
     let lock = File::create(dir.join(LOCK))?;
     match lock.try_lock() {
@@ -79,7 +80,7 @@ pub async fn run(dir: &Path, keys: Keys) -> Result<()> {
         vault = %vault_id,
         device = %device_id,
         endpoint = %hex(&node.id()),
-        "service running; socket {}",
+        "openvault {version} running; socket {}",
         socket.display()
     );
 

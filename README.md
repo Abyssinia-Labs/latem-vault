@@ -66,6 +66,16 @@ scripts/ci.sh
 
 It runs rustfmt, then clippy and the tests on this Mac and in a Linux container, which needs Docker. `scripts/ci.sh macos` or `scripts/ci.sh linux` runs one side only.
 
+### Versions
+
+Each build knows its version and the commit it was built from. `openvault --version` prints them, as in `openvault 0.2.0 (8edda7f)`, and `openvault service` logs the same line when it starts. A build made outside a git checkout shows `unknown` for the commit. One made with uncommitted changes shows the commit those changes are on.
+
+Until 1.0, versions are `0.MINOR.PATCH`:
+- **MINOR** goes up when the store version or a protocol changes, in the same commit. An older build refuses a newer store, and can't speak a newer protocol, so devices on the same minor version can share a vault. Two tests fail until both are changed together. 0.2 is M2: store version 6, `openvault/sync/1` and `openvault/join/1`.
+- **PATCH** goes up for any other release.
+
+Each release is tagged on `main`, as `v0.2.0`.
+
 ## License
 
 Licensed under either of

@@ -722,6 +722,16 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
 
+    /// A new protocol is a new minor version of the build, since older builds can't speak it
+    /// (README, versions). Change both together.
+    #[test]
+    fn the_build_version_follows_the_protocols() {
+        assert_eq!(
+            (env!("CARGO_PKG_VERSION_MINOR"), ALPN, crate::join::ALPN),
+            ("2", &b"openvault/sync/1"[..], &b"openvault/join/1"[..])
+        );
+    }
+
     #[test]
     fn reconciles_round_trip_and_are_checked() {
         let ranges = vec![

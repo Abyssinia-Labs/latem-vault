@@ -129,7 +129,8 @@ The device that administers the vault, the MacBook in design §12, has an admin 
 **One approval, one prompt.**
 - An approval that signs several things asks once. A join, for example, signs add_device and its set_scope entries; a revocation signs rotate_epoch entries and grants too.
 - The `LAContext` is authenticated once, with a reason that names the whole approval, and is then passed to every signature in it.
-- This needs checking on real hardware when it is built.
+- In `crates/keystore`, an `AdminKey` restores its key with one context on its first signature and signs every later one with that key, so one approval uses one `AdminKey`.
+- Checked on a MacBook with macOS 26 on 2026-11-07: `cargo test -p openvault-keystore -- --ignored` signs three times and asks once.
 
 **The admin key file.** It sits next to the key file, as `admin` in the `openvault` directory, with the same rules: created only if absent, mode 0600, refused if others can read it or if it's over 16 KiB.
 
@@ -145,5 +146,5 @@ It has its own file because only an administering device has one, and so the key
 
 - Changing a key file's passphrase. Until then, a device that needs a new passphrase joins again as a new device.
 - TPM and Windows Hello.
-- Adding an admin key to a vault created without one, or making another device an admin. Both are an add_admin entry (membership.md) and come with joining in M2.
+- Adding an admin key to a vault created without one, or making another device an admin. Both are an add_admin entry (membership.md), signed separately from a join (join.md, not in v1).
 - The transport key is derived from the local key (records.md, local store), so the key file doesn't hold one.

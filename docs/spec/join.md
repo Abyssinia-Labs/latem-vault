@@ -1,6 +1,6 @@
 # Join spec, v1
 
-Status: draft, 2026-11-07. Not implemented yet. Builds on [membership.md](membership.md), [keystore.md](keystore.md) and [sync.md](sync.md), whose connections and message framing it uses. The design is in [design §8](../design.md#8-joining).
+Status: draft, 2026-11-07. Implemented on the local network: the PAKE in `crates/crypto` (`pake`), the request, approval and the joiner's store in `crates/core` (`join`, `Vault::approve_join`, `Vault::join`), the messages in `crates/net` (`join`), and the commands in `crates/cli`. Builds on [membership.md](membership.md), [keystore.md](keystore.md) and [sync.md](sync.md), whose connections and message framing it uses. The design is in [design §8](../design.md#8-joining).
 
 A new device joins a vault in one sitting:
 
@@ -15,19 +15,22 @@ All integers are big-endian.
 ## Commands
 
 ```
-openvault join [--name <name>]                       on the new device
+openvault join [--name <name>] [--keys <backend>]       on the new device
 openvault approve [--write|--read|--hold <collection>]...   on an admin device
 ```
 
 **join**
-- Creates the device's keys (keystore.md) and a store that holds only its device id, so an interrupted join can resume with the same identity.
+- Creates the device's keys (keystore.md) and a file `joining` in the openvault directory that holds its device id, so an interrupted join can resume with the same identity. The file goes once the store is written.
 - Waits up to 10 minutes for an admin, showing the code.
 - Running it again on the same device reuses the keys and the device id, and shows a new code.
+- It runs its own endpoint, with ALPN `openvault/join/1`. There is no vault yet for a service to hold.
 
 **approve**
-- Lists the devices waiting to join on the local network, and picks the device itself if there is only one.
+- Looks for devices waiting to join on the local network for up to 15 seconds. It picks the device itself if there is only one, and otherwise asks which.
 - Asks for that device's code and shows the device for review.
 - Scopes come from its flags. A device approved without any has none until `openvault scope` sets them.
+- It opens the vault itself and runs its own endpoint, which mDNS doesn't announce, even while `openvault service` runs. The service sees the new entries on its next request (service.md, the store).
+- A vault without a membership log yet can't approve anyone. Creating a collection starts the log (membership.md, creating a vault).
 
 ## Finding the device
 
@@ -36,6 +39,8 @@ While it waits, the joiner announces itself on the local network with mDNS. The 
 - its platform and name.
 
 These are hints for picking it from the list, and nothing in them is trusted. The admin connects to that node id over iroh with ALPN `openvault/join/1`.
+
+The announcement is mDNS user data: `join:<platform>:<name>`, at most 86 bytes. The admin drops control characters from it before showing it.
 
 ## The code
 
@@ -47,7 +52,7 @@ These are hints for picking it from the list, and nothing in them is trusted. Th
 
 ## PAKE
 
-SPAKE2 over Ed25519, as implemented by the RustCrypto `spake2` crate (compatible with python-spake2 and magic-wormhole):
+SPAKE2 over Ed25519, as implemented by the RustCrypto `spake2` crate (compatible with python-spake2 and magic-wormhole). It is pinned to 0.5.0-pre.0, the release that shares the workspace's curve25519-dalek 5:
 
 | Input | Value |
 | --- | --- |
@@ -88,6 +93,8 @@ In order, on one stream (sync.md, framing):
 | 7 | both | log request, log entries (sync.md) | until the joiner has the log up to that head |
 | 8 | admin | items (sync.md), grants set | the joiner's grants |
 | 9 | joiner | `0x24` joined | empty |
+
+**Timing.** Each message must arrive within 30 seconds, except accepted (step 6), which waits for the admin to review and sign, up to the end of the join's 10 minutes. The admin sends the grants (step 8) as soon as it has answered the log request that reaches the head.
 
 **Checking the confirmations.**
 - Each side compares the confirmation it receives in constant time.
@@ -150,6 +157,7 @@ The joiner accepts the vault only if both of these hold:
 - It writes its store in one transaction: the vault id, the log and its state, and the grants.
 - It sends joined.
 - From then on it is an ordinary device and syncs records with any peer (sync.md).
+- Until its first sync it has no records, so no collection names either: `openvault collections` lists none, while `openvault devices` already lists the vault's devices.
 
 ## Not in v1
 

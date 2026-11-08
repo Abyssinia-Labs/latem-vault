@@ -63,17 +63,34 @@ pub(crate) fn admin_verifying_key(blob: &[u8]) -> Result<VerifyingKey> {
     )?)
 }
 
-/// Signs `input` with the admin key in `blob`. The system asks for Touch ID or the password,
-/// and its dialog shows `reason`, which says what is being signed.
-pub(crate) fn admin_sign(blob: &[u8], reason: &str, input: &[u8]) -> Result<Signature> {
-    // SAFETY: a new LAContext has no preconditions, and the reason is copied when set.
-    let context = unsafe {
-        let context = LAContext::new();
-        context.setLocalizedReason(&NSString::from_str(reason));
-        context
-    };
-    let key = EnclaveKey::restore(blob, Some(&context))?;
-    Ok(Signature::from_p256_der(&key.sign(input)?)?)
+/// The admin key in a blob, restored with one authentication context. Its first signature asks
+/// for Touch ID or the password, with a dialog that shows the reason; later ones reuse that
+/// authentication, so an approval that signs several things asks once (keystore.md, one
+/// approval, one prompt).
+pub(crate) struct AdminSigner {
+    key: EnclaveKey,
+    /// Kept for as long as the key, which signs through it.
+    _context: Retained<LAContext>,
+}
+
+impl AdminSigner {
+    pub(crate) fn new(blob: &[u8], reason: &str) -> Result<Self> {
+        // SAFETY: a new LAContext has no preconditions, and the reason is copied when set.
+        let context = unsafe {
+            let context = LAContext::new();
+            context.setLocalizedReason(&NSString::from_str(reason));
+            context
+        };
+        let key = EnclaveKey::restore(blob, Some(&context))?;
+        Ok(Self {
+            key,
+            _context: context,
+        })
+    }
+
+    pub(crate) fn sign(&self, input: &[u8]) -> Result<Signature> {
+        Ok(Signature::from_p256_der(&self.key.sign(input)?)?)
+    }
 }
 
 /// A device's wrapping and signing keys in the Secure Enclave, plus its local key, which is

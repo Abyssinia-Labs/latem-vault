@@ -759,3 +759,79 @@ fn devices_lists_this_device() {
     );
     assert!(devices.contains("Run `openvault service`"), "{devices}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_device_joins_with_a_code() {
+    use std::io::{BufRead, BufReader};
+
+    let admin = Device::new();
+    let joiner = Device::empty();
+    let mut joining = joiner
+        .command(&["join", "--keys", "software", "--name", "Desktop"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(joining.stdout.take().unwrap()).lines();
+    // The code is the indented line of six digits.
+    let code = loop {
+        let line = lines
+            .next()
+            .expect("join exited before showing a code")
+            .unwrap();
+        let digits: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        if line.starts_with("    ")
+            && digits.len() == 6
+            && digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            break digits;
+        }
+    };
+
+    // A wrong code first, which the admin may correct.
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    let answers = format!("{wrong}\n{code}\ny\n{}\n", admin.phrase);
+    let output = admin.run_with_stdin(&["approve", "--read", "latem"], answers.as_bytes());
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Found Desktop") && stderr.contains("Wrong code."),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("Device    Desktop") && stdout.contains("Scopes    read latem"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Desktop joined the vault, with scopes read latem."),
+        "{stdout}"
+    );
+
+    let rest: Vec<String> = lines.map(Result::unwrap).collect();
+    let output = joining.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rest.iter().any(|line| line.starts_with("Joined the vault")),
+        "{rest:?}"
+    );
+    assert!(!joiner.home.path().join("joining").exists());
+
+    // Each device's log now lists both, with names that open on either.
+    for device in [&admin, &joiner] {
+        let devices = device.ok(&["devices"]);
+        assert!(
+            devices.contains("Desktop") && devices.contains("test "),
+            "{devices}"
+        );
+    }
+    let error = joiner.fails(&["join"]);
+    assert!(error.contains("already in a vault"), "{error}");
+}

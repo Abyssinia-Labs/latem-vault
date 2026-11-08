@@ -74,11 +74,14 @@ Each device keeps one SQLite database per vault, readable only by its user (mode
 - an index of each entry's current version;
 - the membership log and the state it leads to ([membership.md](membership.md#keeping-the-log)).
 
-The database's `user_version` is the store version: 1 in M1, 2 since the membership log, and 3 since device names in the log are sealed (membership.md, names key).
-- Opening a version 1 store upgrades it by adding the empty log table.
-- A version 2 store opens only if its log is empty. Entries written before names were sealed can't be read, so that vault is created again. The upgrade that adds sync also turns each wrapped key the device already holds into a grant it signs.
+The database's `user_version` is the store version: 1 in M1, 2 since the membership log, 3 since device names in the log are sealed (membership.md, names key), and 4 since grants (sync.md, grants).
+- Opening a version 1 store upgrades it by adding the empty log and grants tables. Starting its log later grants the keys it holds.
+- A version 2 store opens only if its log is empty. Entries written before names were sealed can't be read, so that vault is created again.
+- Opening a version 3 store adds the grants table, rebuilds the kept membership from the log (it gained the epoch history, membership.md), and turns each wrapped key the device holds, for itself or the recovery key, into a grant it signs.
 
-A device that is joining (join.md) has a store holding only its device id until the join completes.
+A grant is kept by its id, with its collection, epoch and recipient. Creating a collection writes this device's and the recovery key's grants in the same transaction.
+
+A device that is joining (join.md) has no store until the join completes, only its keys and a `joining` file with its device id.
 
 The index never stores a name in the clear. Each device has a 32-byte **local key**, kept by its keystore and never shared, from which it derives:
 

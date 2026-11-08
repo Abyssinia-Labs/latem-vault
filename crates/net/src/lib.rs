@@ -4,12 +4,17 @@
 //! outside the local network learns its id or addresses. It finds other OpenVault endpoints with
 //! mDNS under its own service name; which of them are members is for the membership log to say.
 
-use std::collections::BTreeSet;
+pub mod frame;
+pub mod join;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::endpoint::presets;
-use iroh::{Endpoint, RelayMode, SecretKey};
+use iroh::endpoint_info::UserData;
+pub use iroh::{Endpoint, EndpointId};
+use iroh::{RelayMode, SecretKey};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use n0_future::StreamExt;
 use tokio::sync::mpsc;
@@ -39,10 +44,32 @@ pub enum Error {
     Mdns(String),
 }
 
+/// How to start a [`Node`].
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// The protocols it accepts connections for. None, for an endpoint that only connects out.
+    pub alpns: Vec<Vec<u8>>,
+    /// Whether mDNS announces it. `approve` finds joiners without announcing itself.
+    pub advertise: bool,
+    /// What it announces besides its id and addresses: a joining device's platform and name.
+    pub announcement: Option<String>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            alpns: Vec::new(),
+            advertise: true,
+            announcement: None,
+        }
+    }
+}
+
 /// This device's endpoint, with mDNS discovery running.
 pub struct Node {
     endpoint: Endpoint,
-    visible: Arc<Mutex<BTreeSet<EndpointKey>>>,
+    /// What mDNS can see, with what each endpoint announces.
+    visible: Arc<Mutex<BTreeMap<EndpointKey, Option<String>>>>,
     discovery: JoinHandle<()>,
 }
 
@@ -51,16 +78,27 @@ impl Node {
     /// starts mDNS. Changes in what it can see arrive on the returned receiver.
     ///
     /// Must be called inside a tokio runtime.
-    pub async fn start(seed: &[u8; 32]) -> Result<(Self, mpsc::Receiver<Event>), Error> {
-        let endpoint = Endpoint::builder(presets::Minimal)
+    pub async fn start(
+        seed: &[u8; 32],
+        options: Options,
+    ) -> Result<(Self, mpsc::Receiver<Event>), Error> {
+        let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(SecretKey::from_bytes(seed))
             .relay_mode(RelayMode::Disabled)
+            .alpns(options.alpns);
+        if let Some(announcement) = options.announcement {
+            let data = UserData::try_from(announcement)
+                .map_err(|_| Error::Mdns("the announcement is too long".into()))?;
+            builder = builder.user_data_for_address_lookup(data);
+        }
+        let endpoint = builder
             .bind()
             .await
             .map_err(|e| Error::Bind(e.to_string()))?;
         let mdns = MdnsAddressLookup::builder()
             .service_name(MDNS_SERVICE)
             .discovery_cadence(MDNS_CADENCE)
+            .advertise(options.advertise)
             .build(endpoint.id())
             .map_err(|e| Error::Mdns(e.to_string()))?;
         // Added after binding, which publishes the endpoint's current addresses straight away.
@@ -69,7 +107,7 @@ impl Node {
             .map_err(|e| Error::Mdns(e.to_string()))?
             .add(mdns.clone());
 
-        let visible = Arc::new(Mutex::new(BTreeSet::new()));
+        let visible = Arc::new(Mutex::new(BTreeMap::new()));
         let (send, receive) = mpsc::channel(64);
         let mut events = mdns.subscribe().await;
         let seen = visible.clone();
@@ -80,15 +118,21 @@ impl Node {
                 let event = match event {
                     DiscoveryEvent::Discovered { endpoint_info, .. } => {
                         let key = *endpoint_info.endpoint_id.as_bytes();
+                        let announcement = endpoint_info.data.user_data().map(|d| d.to_string());
                         // Discovered also reports changed addresses for an endpoint already seen.
-                        if !seen.lock().expect("poisoned").insert(key) {
+                        if seen
+                            .lock()
+                            .expect("poisoned")
+                            .insert(key, announcement)
+                            .is_some()
+                        {
                             continue;
                         }
                         Event::Visible(key)
                     }
                     DiscoveryEvent::Expired { endpoint_id } => {
                         let key = *endpoint_id.as_bytes();
-                        if !seen.lock().expect("poisoned").remove(&key) {
+                        if seen.lock().expect("poisoned").remove(&key).is_none() {
                             continue;
                         }
                         Event::Gone(key)
@@ -117,7 +161,26 @@ impl Node {
 
     /// The OpenVault endpoints mDNS can see now, members or not.
     pub fn visible(&self) -> BTreeSet<EndpointKey> {
-        self.visible.lock().expect("poisoned").clone()
+        self.visible
+            .lock()
+            .expect("poisoned")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// The visible endpoints that announce something, with what they announce.
+    pub fn announcements(&self) -> Vec<(EndpointKey, String)> {
+        self.visible
+            .lock()
+            .expect("poisoned")
+            .iter()
+            .filter_map(|(key, announcement)| Some((*key, announcement.clone()?)))
+            .collect()
+    }
+
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
     }
 
     /// The addresses the endpoint is bound to.
@@ -142,7 +205,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn the_endpoint_id_is_the_transport_key() {
-        let (node, _events) = Node::start(&seed(7)).await.unwrap();
+        let (node, _events) = Node::start(&seed(7), Options::default()).await.unwrap();
         let expected = SecretKey::from_bytes(&seed(7)).public();
         assert_eq!(node.id(), *expected.as_bytes());
         node.close().await;
@@ -152,23 +215,35 @@ mod tests {
     /// closes. Needs a network interface that carries multicast.
     #[tokio::test(flavor = "multi_thread")]
     async fn endpoints_find_each_other() {
-        let (a, mut a_events) = Node::start(&seed(1)).await.unwrap();
-        let (b, mut b_events) = Node::start(&seed(2)).await.unwrap();
+        let (a, mut a_events) = Node::start(&seed(1), Options::default()).await.unwrap();
+        let announced = Options {
+            announcement: Some("join:linux:Desktop".into()),
+            ..Options::default()
+        };
+        let (b, mut b_events) = Node::start(&seed(2), announced).await.unwrap();
         let wait = Duration::from_secs(30);
 
-        let seen = tokio::time::timeout(wait, a_events.recv()).await.unwrap();
-        assert_eq!(seen, Some(Event::Visible(b.id())));
-        let seen = tokio::time::timeout(wait, b_events.recv()).await.unwrap();
-        assert_eq!(seen, Some(Event::Visible(a.id())));
+        // Other tests' endpoints share the network, so each side waits for the one it expects.
+        async fn until(events: &mut mpsc::Receiver<Event>, expected: Event, wait: Duration) {
+            tokio::time::timeout(wait, async {
+                while events.recv().await != Some(expected) {}
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no {expected:?}"));
+        }
+        until(&mut a_events, Event::Visible(b.id()), wait).await;
+        until(&mut b_events, Event::Visible(a.id()), wait).await;
         assert!(a.visible().contains(&b.id()));
+        assert!(
+            a.announcements()
+                .contains(&(b.id(), "join:linux:Desktop".to_owned()))
+        );
+        assert!(!b.announcements().iter().any(|(key, _)| *key == a.id()));
 
         let b_id = b.id();
         b.close().await;
-        let gone = tokio::time::timeout(Duration::from_secs(120), a_events.recv())
-            .await
-            .unwrap();
-        assert_eq!(gone, Some(Event::Gone(b_id)));
-        assert!(a.visible().is_empty());
+        until(&mut a_events, Event::Gone(b_id), Duration::from_secs(120)).await;
+        assert!(!a.visible().contains(&b_id));
         a.close().await;
     }
 }

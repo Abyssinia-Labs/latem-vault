@@ -2,9 +2,9 @@
 //!
 //! Everything here is a thin layer over audited crates: XChaCha20-Poly1305 for
 //! records, HPKE (RFC 9180) for wrapping collection keys, Ed25519 and ECDSA
-//! P-256 for signatures, and BLAKE3 for hashing and key derivation. The one
-//! exception is Argon2id for passphrases, which no audited crate provides
-//! (crypto.md, passphrases). The exact formats are specified in
+//! P-256 for signatures, and BLAKE3 for hashing and key derivation. The two
+//! exceptions, which no audited crate provides, are Argon2id for passphrases
+//! (crypto.md, passphrases) and SPAKE2 for joining (join.md, PAKE). The exact formats are specified in
 //! `docs/spec/crypto.md`.
 //!
 //! Only software keys live here. Secure Enclave and TPM keys belong to the
@@ -12,6 +12,7 @@
 
 pub mod aead;
 pub mod hash;
+pub mod pake;
 pub mod passphrase;
 pub mod recovery;
 pub mod sign;

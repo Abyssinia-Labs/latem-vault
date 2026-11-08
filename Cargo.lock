@@ -2383,6 +2383,7 @@ dependencies = [
  "openvault-core",
  "openvault-crypto",
  "openvault-keystore",
+ "openvault-net",
  "openvault-service",
  "rpassword",
  "tempfile",
@@ -2418,6 +2419,8 @@ dependencies = [
  "hpke",
  "p256",
  "sha2",
+ "spake2",
+ "subtle",
  "thiserror 2.0.21",
  "zeroize",
 ]
@@ -2446,6 +2449,9 @@ dependencies = [
  "iroh",
  "iroh-mdns-address-lookup",
  "n0-future",
+ "openvault-core",
+ "openvault-crypto",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -3296,6 +3302,19 @@ name = "sorted-index-buffer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea06cc588e43c632923a55450401b8f25e628131571d4e1baea1bdfdb2b5ed06"
+
+[[package]]
+name = "spake2"
+version = "0.5.0-pre.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d5601a88f45d069ad786f75c4fb13e7f127b0aadda913fb2cd65948d3c9a561"
+dependencies = [
+ "curve25519-dalek",
+ "getrandom 0.4.3",
+ "hkdf",
+ "rand_core",
+ "sha2",
+]
 
 [[package]]
 name = "spez"

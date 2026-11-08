@@ -31,6 +31,10 @@ pub mod contexts {
     pub const LOCAL_CACHE: &str = "openvault v1 local cache key";
     pub const TRANSPORT: &str = "openvault v1 transport key";
     pub const PASSPHRASE: &str = "openvault v1 passphrase key";
+    pub const JOIN_CONFIRM_JOINER: &str = "openvault v1 join confirm joiner";
+    pub const JOIN_CONFIRM_ADMIN: &str = "openvault v1 join confirm admin";
+    pub const JOIN_SESSION: &str = "openvault v1 join session";
+    pub const GRANT_ID: &str = "openvault v1 grant id";
 }
 
 #[cfg(test)]

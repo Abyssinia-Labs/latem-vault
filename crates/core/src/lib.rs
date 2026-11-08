@@ -3,7 +3,9 @@
 //! Formats are specified in `docs/spec/records.md` and `docs/spec/membership.md`. Cryptography comes from
 //! `openvault-crypto`; device keys come from whatever implements [`DeviceKeys`].
 
+pub mod grant;
 mod ids;
+pub mod join;
 mod keys;
 pub mod membership;
 pub mod names;
@@ -53,6 +55,10 @@ pub enum Error {
     InvalidRecord(&'static str),
     #[error("invalid log entry: {0}")]
     InvalidLogEntry(&'static str),
+    #[error("invalid grant: {0}")]
+    InvalidGrant(&'static str),
+    #[error("invalid join: {0}")]
+    InvalidJoin(&'static str),
     #[error("this vault has no membership log yet")]
     NoLog,
     #[error("this vault already has a membership log")]

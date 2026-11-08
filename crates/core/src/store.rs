@@ -12,16 +12,41 @@ use rusqlite::{
 };
 use zeroize::Zeroizing;
 
+use crate::grant::Grant;
+use crate::join::JoinRequest;
 use crate::membership::{
     AdminKey, Change, DeviceInfo, DeviceName, LogEntry, Membership, Scope, names_key_context,
 };
 use crate::record::{Body, Kind, Record, Version};
-use crate::{CollectionId, DeviceId, DeviceKeys, Error, Result, VaultId, names};
+use crate::{CollectionId, DeviceId, DeviceKeys, Error, Result, VaultId, names, transport_seed};
 
-/// Version 2 added the membership log, and version 3 sealed the device names in it
-/// (membership.md, names key). Opening a version 1 store adds the (empty) log table. A version
-/// 2 store opens only if its log is empty, since its entries are in the old format.
-const SCHEMA_VERSION: i64 = 3;
+/// Version 2 added the membership log, version 3 sealed the device names in it (membership.md,
+/// names key), and version 4 added grants (sync.md, grants) and the epoch history to the kept
+/// membership. Opening a version 1 store adds the (empty) log and grants tables. A version 2
+/// store opens only if its log is empty, since its entries are in the old format. Opening a
+/// version 3 store rebuilds the kept membership from the log and signs a grant for each
+/// collection key the device holds.
+const SCHEMA_VERSION: i64 = 4;
+
+/// Every grant this device knows of, its own and other devices' (sync.md, who stores grants).
+const GRANTS_SCHEMA: &str = "
+CREATE TABLE grants (
+    grant_id BLOB PRIMARY KEY,
+    collection_id BLOB NOT NULL,
+    epoch INTEGER NOT NULL,
+    -- A device id, or 16 zero bytes for the recovery key.
+    recipient BLOB NOT NULL,
+    grant BLOB NOT NULL
+) STRICT;
+
+CREATE INDEX grants_by_recipient ON grants (recipient, collection_id, epoch);
+";
+
+/// What approving a join gives the joiner (join.md, approval): the whole log, and its grants.
+pub struct Approval {
+    pub log: Vec<LogEntry>,
+    pub grants: Vec<Grant>,
+}
 
 /// The membership log (membership.md), in order. Its current state is kept in `meta` as
 /// `membership`, so opening a vault doesn't replay it.
@@ -160,41 +185,11 @@ impl<K: DeviceKeys> Vault<K> {
         let (membership, log) =
             start_membership(vault_id, recovery, admin, &keys, device_id, name)?;
         let recovery = recovery.unwrap_key().wrap_key();
-
-        // Create the file ourselves so it is never readable by others, even briefly.
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        match options.open(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(Error::VaultExists(path.into()));
-            }
-            result => drop(result?),
-        }
-
+        create_file(path)?;
         let init = || -> Result<Connection> {
             let conn = connect(path)?;
             let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(SCHEMA)?;
-            tx.execute_batch(LOG_SCHEMA)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            for (key, value) in [
-                ("vault_id", &vault_id.as_bytes()[..]),
-                ("device_id", &device_id.as_bytes()[..]),
-                ("recovery_wrap_key", recovery.as_bytes()),
-                ("clock", &0u64.to_be_bytes()[..]),
-            ] {
-                tx.execute("INSERT INTO meta VALUES (?1, ?2)", params![key, value])?;
-            }
-            tx.execute(
-                "INSERT INTO devices VALUES (?1, ?2, ?3)",
-                params![
-                    &device_id.as_bytes()[..],
-                    keys.verifying_key().as_bytes(),
-                    keys.wrap_key().as_bytes()
-                ],
-            )?;
+            init_store(&tx, vault_id, device_id, &recovery, &keys)?;
             save_log(&tx, &log, &membership)?;
             tx.commit()?;
             Ok(conn)
@@ -214,7 +209,7 @@ impl<K: DeviceKeys> Vault<K> {
             return Err(Error::NoVault(path.into()));
         }
         let mut conn = connect(path)?;
-        upgrade(&mut conn)?;
+        upgrade(&mut conn, &keys)?;
         let vault_id = VaultId::try_from(meta(&conn, "vault_id")?.as_slice())?;
         let device_id = DeviceId::try_from(meta(&conn, "device_id")?.as_slice())?;
         let recovery = WrapKey::from_bytes(&meta(&conn, "recovery_wrap_key")?)?;
@@ -300,14 +295,219 @@ impl<K: DeviceKeys> Vault<K> {
         let Some(target) = membership.device(device) else {
             return Ok(None);
         };
+        let name = target
+            .info
+            .name
+            .open(&self.names_key(membership)?, self.vault_id, device)?;
+        Ok(Some(name))
+    }
+
+    /// The names key, from this device's own add_device entry.
+    fn names_key(&self, membership: &Membership) -> Result<SymmetricKey> {
         let this = membership
             .device(self.device_id)
             .ok_or(Error::Corrupt("this device isn't in the membership log"))?;
-        let names_key = self
-            .keys
-            .unwrap(&names_key_context(self.vault_id), &this.info.names_key)?;
-        let name = target.info.name.open(&names_key, self.vault_id, device)?;
-        Ok(Some(name))
+        self.keys
+            .unwrap(&names_key_context(self.vault_id), &this.info.names_key)
+    }
+
+    /// Every log entry, in order.
+    pub fn log(&self) -> Result<Vec<LogEntry>> {
+        read_log(&self.conn)
+    }
+
+    /// Approves a join (join.md, approval). `admin` signs add_device for `request` and a
+    /// set_scope for each of `scopes`, and this device grants the joiner every key it holds for
+    /// the collections the joiner may read. All of it is written in one transaction.
+    ///
+    /// If the joiner is already in the log with the same keys, an approved join was
+    /// interrupted: nothing is signed, and the grants written then are returned again.
+    pub fn approve_join(
+        &mut self,
+        request: &JoinRequest,
+        scopes: &[(CollectionId, Scope)],
+        admin: &impl AdminKey,
+    ) -> Result<Approval> {
+        let membership = self.membership.as_ref().ok_or(Error::NoLog)?;
+        if let Some(existing) = membership.device(request.device) {
+            let same_keys = existing.info.verifying_key == request.verifying_key
+                && existing.info.wrap_key == request.wrap_key
+                && existing.info.transport_key == request.transport_key;
+            if existing.revoked || !same_keys {
+                return Err(Error::InvalidJoin(
+                    "the device id is in the log with other keys, or revoked",
+                ));
+            }
+            return Ok(Approval {
+                log: self.log()?,
+                grants: self.grants_to(request.device)?,
+            });
+        }
+
+        // Signed before anything is written, so a refused signature leaves nothing behind.
+        let info = DeviceInfo::new(
+            self.vault_id,
+            request.device,
+            request.verifying_key.clone(),
+            request.wrap_key.clone(),
+            request.transport_key.clone(),
+            &request.name,
+            &self.names_key(membership)?,
+        )?;
+        let mut membership = membership.clone();
+        let mut entries = vec![membership.append(Change::AddDevice(info), admin)?];
+        for &(collection, scope) in scopes {
+            if scope != Scope::None {
+                let change = Change::SetScope {
+                    device: request.device,
+                    collection,
+                    scope,
+                };
+                entries.push(membership.append(change, admin)?);
+            }
+        }
+
+        let mut grants = Vec::new();
+        for &(collection, scope) in scopes {
+            if scope < Scope::Read {
+                continue;
+            }
+            let current = membership.epoch(collection).expect("set_scope named it");
+            for epoch in 0..=current {
+                // Keys this device doesn't hold come from a device that does (join.md).
+                let key = match self.take_key(collection, epoch) {
+                    Ok(key) => key,
+                    Err(Error::NoKey(_)) => continue,
+                    Err(e) => return Err(e),
+                };
+                let wrapped = request
+                    .wrap_key
+                    .wrap(&wrap_context(self.vault_id, collection, epoch), &key);
+                self.collection_keys.insert((collection, epoch), key);
+                grants.push(self.sign_grant(collection, epoch, Some(request.device), wrapped)?);
+            }
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        save_log(&tx, &entries, &membership)?;
+        for grant in &grants {
+            insert_grant(&tx, grant)?;
+        }
+        tx.commit()?;
+        self.membership = Some(membership);
+        Ok(Approval {
+            log: self.log()?,
+            grants,
+        })
+    }
+
+    /// Creates the store of a device that has just joined (join.md, joining), from what the
+    /// admin sent. It checks that `log` verifies from genesis and ends at `head`, that it adds
+    /// `device` with `keys` and the `name` the joiner sent, and that every grant is to this
+    /// device, valid, and unwraps.
+    pub fn join(
+        path: &Path,
+        keys: K,
+        device: DeviceId,
+        name: &DeviceName,
+        head: (u64, Hash),
+        log: &[LogEntry],
+        grants: &[Grant],
+    ) -> Result<Self> {
+        let membership = Membership::replay(log)?;
+        if membership.head() != head {
+            return Err(Error::InvalidJoin(
+                "the log doesn't end at the admin's head",
+            ));
+        }
+        let vault_id = membership.vault();
+        let this = membership
+            .device(device)
+            .filter(|this| !this.revoked)
+            .ok_or(Error::InvalidJoin("the log doesn't add this device"))?;
+        let transport = SigningKey::from_ed25519_seed(&transport_seed(&keys)).verifying_key();
+        if this.info.verifying_key != keys.verifying_key()
+            || this.info.wrap_key != keys.wrap_key()
+            || this.info.transport_key != transport
+        {
+            return Err(Error::InvalidJoin(
+                "the log adds this device with other keys",
+            ));
+        }
+        let names_key = keys
+            .unwrap(&names_key_context(vault_id), &this.info.names_key)
+            .map_err(|_| Error::InvalidJoin("the names key doesn't unwrap"))?;
+        if this
+            .info
+            .name
+            .open(&names_key, vault_id, device)
+            .ok()
+            .as_ref()
+            != Some(name)
+        {
+            return Err(Error::InvalidJoin(
+                "the log has another name for this device",
+            ));
+        }
+        for grant in grants {
+            if grant.recipient() != Some(device) {
+                return Err(Error::InvalidJoin("a grant is for another device"));
+            }
+            grant.check(&membership)?;
+            let context = wrap_context(vault_id, grant.collection(), grant.epoch());
+            keys.unwrap(&context, grant.wrapped())
+                .map_err(|_| Error::InvalidJoin("a grant doesn't unwrap"))?;
+        }
+
+        let recovery = membership.recovery_key().clone();
+        create_file(path)?;
+        let init = || -> Result<Connection> {
+            let conn = connect(path)?;
+            let tx = conn.unchecked_transaction()?;
+            init_store(&tx, vault_id, device, &recovery, &keys)?;
+            save_log(&tx, log, &membership)?;
+            for grant in grants {
+                insert_grant(&tx, grant)?;
+            }
+            tx.commit()?;
+            Ok(conn)
+        };
+        match init() {
+            Ok(conn) => Self::new(conn, keys, vault_id, device, recovery, Some(membership)),
+            Err(e) => {
+                let _ = std::fs::remove_file(path);
+                Err(e)
+            }
+        }
+    }
+
+    /// The grants to `device` that this store holds.
+    fn grants_to(&self, device: DeviceId) -> Result<Vec<Grant>> {
+        let mut statement = self.conn.prepare(
+            "SELECT grant FROM grants WHERE recipient = ?1 ORDER BY collection_id, epoch",
+        )?;
+        let rows = statement.query_map([&device.as_bytes()[..]], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|bytes| Grant::from_bytes(&bytes?))
+            .collect::<Result<_>>()
+    }
+
+    /// A grant of `wrapped` signed with this device's signing key.
+    fn sign_grant(
+        &self,
+        collection: CollectionId,
+        epoch: u32,
+        recipient: Option<DeviceId>,
+        wrapped: WrappedKey,
+    ) -> Result<Grant> {
+        Grant::sign(
+            self.vault_id,
+            collection,
+            epoch,
+            recipient,
+            wrapped,
+            self.keys.verifying_key(),
+            |context, message| self.keys.sign(context, message),
+        )
     }
 
     /// Starts the log of a vault created before there was one (membership.md, creating a
@@ -346,6 +546,13 @@ impl<K: DeviceKeys> Vault<K> {
         }
         let tx = self.conn.unchecked_transaction()?;
         save_log(&tx, &log, &membership)?;
+        write_own_grants(
+            &tx,
+            self.vault_id,
+            self.device_id,
+            &self.recovery,
+            &self.keys,
+        )?;
         tx.commit()?;
         self.membership = Some(membership);
         Ok(())
@@ -384,15 +591,18 @@ impl<K: DeviceKeys> Vault<K> {
             params![&id.as_bytes()[..], &tag[..], label],
         )?;
         let context = wrap_context(self.vault_id, id, 0);
-        for recipient in [self.keys.wrap_key(), self.recovery.clone()] {
+        // This device and the recovery key get the key, as collection_keys rows to unwrap and
+        // as grants to sync (sync.md, who writes grants).
+        for (recipient, wrap_key) in [
+            (Some(self.device_id), self.keys.wrap_key()),
+            (None, self.recovery.clone()),
+        ] {
+            let wrapped = wrap_key.wrap(&context, &key);
             tx.execute(
                 "INSERT INTO collection_keys VALUES (?1, 0, ?2, ?3)",
-                params![
-                    &id.as_bytes()[..],
-                    recipient.as_bytes(),
-                    recipient.wrap(&context, &key).to_bytes()
-                ],
+                params![&id.as_bytes()[..], wrap_key.as_bytes(), wrapped.to_bytes()],
             )?;
+            insert_grant(&tx, &self.sign_grant(id, 0, recipient, wrapped)?)?;
         }
         let body = Body::new(Kind::Collection, "", name.as_bytes());
         self.write_record(&tx, id, 0, &key, &body, false)?;
@@ -765,17 +975,20 @@ fn connect(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Brings an older store up to [`SCHEMA_VERSION`]. Version 1 had no membership log, and
-/// version 2's log had device names in the clear.
-fn upgrade(conn: &mut Connection) -> Result<()> {
+/// Brings an older store up to [`SCHEMA_VERSION`]. Version 1 had no membership log, version
+/// 2's log had device names in the clear, and version 3 had no grants or epoch history.
+fn upgrade(conn: &mut Connection, keys: &impl DeviceKeys) -> Result<()> {
     match user_version(conn)? {
         SCHEMA_VERSION => return Ok(()),
-        1 | 2 => {}
+        1..=3 => {}
         other => return Err(Error::UnsupportedStore(other)),
     }
     // Immediate, so two processes opening the same old store don't both upgrade it.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version = user_version(&tx)?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
     if version == 1 {
         tx.execute_batch(LOG_SCHEMA)?;
     }
@@ -785,10 +998,149 @@ fn upgrade(conn: &mut Connection) -> Result<()> {
             return Err(Error::LogBeforeSealedNames);
         }
     }
-    if version < SCHEMA_VERSION {
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.execute_batch(GRANTS_SCHEMA)?;
+    let log = read_log(&tx)?;
+    if !log.is_empty() {
+        // The kept membership gained the epoch history, so it's rebuilt from the log.
+        let membership = Membership::replay(&log)?;
+        save_log(&tx, &[], &membership)?;
+        let vault = VaultId::try_from(meta(&tx, "vault_id")?.as_slice())?;
+        let device = DeviceId::try_from(meta(&tx, "device_id")?.as_slice())?;
+        let recovery = WrapKey::from_bytes(&meta(&tx, "recovery_wrap_key")?)?;
+        write_own_grants(&tx, vault, device, &recovery, keys)?;
     }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Creates the store's file, so it is never readable by others, even briefly.
+fn create_file(path: &Path) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    match options.open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(Error::VaultExists(path.into()))
+        }
+        result => {
+            drop(result?);
+            Ok(())
+        }
+    }
+}
+
+/// The tables and this device's rows in a new store.
+fn init_store(
+    tx: &Transaction<'_>,
+    vault: VaultId,
+    device: DeviceId,
+    recovery: &WrapKey,
+    keys: &impl DeviceKeys,
+) -> Result<()> {
+    tx.execute_batch(SCHEMA)?;
+    tx.execute_batch(LOG_SCHEMA)?;
+    tx.execute_batch(GRANTS_SCHEMA)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    for (key, value) in [
+        ("vault_id", &vault.as_bytes()[..]),
+        ("device_id", &device.as_bytes()[..]),
+        ("recovery_wrap_key", recovery.as_bytes()),
+        ("clock", &0u64.to_be_bytes()[..]),
+    ] {
+        tx.execute("INSERT INTO meta VALUES (?1, ?2)", params![key, value])?;
+    }
+    tx.execute(
+        "INSERT INTO devices VALUES (?1, ?2, ?3)",
+        params![
+            &device.as_bytes()[..],
+            keys.verifying_key().as_bytes(),
+            keys.wrap_key().as_bytes()
+        ],
+    )?;
+    Ok(())
+}
+
+fn read_log(conn: &Connection) -> Result<Vec<LogEntry>> {
+    let mut statement = conn.prepare("SELECT entry FROM log ORDER BY seq")?;
+    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    rows.map(|entry| LogEntry::from_bytes(&entry?))
+        .collect::<Result<_>>()
+}
+
+fn insert_grant(tx: &Transaction<'_>, grant: &Grant) -> Result<()> {
+    let recipient = grant
+        .recipient()
+        .map_or([0; 16], |device| *device.as_bytes());
+    tx.execute(
+        "INSERT OR IGNORE INTO grants VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            &grant.id()[..],
+            &grant.collection().as_bytes()[..],
+            grant.epoch(),
+            &recipient[..],
+            grant.to_bytes()
+        ],
+    )?;
+    Ok(())
+}
+
+/// Signs a grant for each collection key this device holds for itself or the recovery key and
+/// has no grant for yet: the upgrade to grants, and a log started for an M1 vault.
+fn write_own_grants(
+    tx: &Transaction<'_>,
+    vault: VaultId,
+    device: DeviceId,
+    recovery: &WrapKey,
+    keys: &impl DeviceKeys,
+) -> Result<()> {
+    struct Row {
+        collection: Vec<u8>,
+        epoch: u32,
+        recipient: Vec<u8>,
+        wrapped: Vec<u8>,
+    }
+    let own = keys.wrap_key();
+    let rows: Vec<Row> = {
+        let mut statement =
+            tx.prepare("SELECT collection_id, epoch, recipient, wrapped FROM collection_keys")?;
+        statement
+            .query_map([], |row| {
+                Ok(Row {
+                    collection: row.get(0)?,
+                    epoch: row.get(1)?,
+                    recipient: row.get(2)?,
+                    wrapped: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for Row {
+        collection,
+        epoch,
+        recipient,
+        wrapped,
+    } in rows
+    {
+        let recipient = if recipient == own.as_bytes() {
+            Some(device)
+        } else if recipient == recovery.as_bytes() {
+            None
+        } else {
+            continue;
+        };
+        let grant = Grant::sign(
+            vault,
+            CollectionId::try_from(collection.as_slice())?,
+            epoch,
+            recipient,
+            WrappedKey::from_bytes(&wrapped)?,
+            keys.verifying_key(),
+            |context, message| keys.sign(context, message),
+        )?;
+        insert_grant(tx, &grant)?;
+    }
     Ok(())
 }
 
@@ -1007,6 +1359,292 @@ mod tests {
         entry.map(|e| e.value.to_vec())
     }
 
+    fn grants(vault: &Vault<&SoftwareKeys>) -> Vec<Grant> {
+        let mut statement = vault.conn.prepare("SELECT grant FROM grants").unwrap();
+        statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|bytes| Grant::from_bytes(&bytes.unwrap()).unwrap())
+            .collect()
+    }
+
+    fn desktop() -> DeviceName {
+        DeviceName {
+            platform: "linux".into(),
+            name: "Desktop".into(),
+        }
+    }
+
+    #[test]
+    fn creating_a_collection_grants_its_key_to_this_device_and_recovery() {
+        let s = setup();
+        let mut vault = s.create();
+        let id = vault.create_collection("latem", &s.admin()).unwrap();
+        let grants = grants(&vault);
+        let m = vault.membership().unwrap();
+        let mut recipients: Vec<_> = grants.iter().map(Grant::recipient).collect();
+        recipients.sort();
+        assert_eq!(recipients, [None, Some(vault.device_id())]);
+        for grant in &grants {
+            assert_eq!((grant.collection(), grant.epoch()), (id, 0));
+            grant.check(m).unwrap();
+            assert_eq!(Grant::from_bytes(&grant.to_bytes()).unwrap(), *grant);
+        }
+        let recovery = grants.iter().find(|g| g.recipient().is_none()).unwrap();
+        s.recovery
+            .unwrap_key()
+            .unwrap(&wrap_context(vault.vault_id(), id, 0), recovery.wrapped())
+            .unwrap();
+    }
+
+    #[test]
+    fn grants_follow_the_rules() {
+        let s = setup();
+        let mut vault = s.create();
+        let id = vault.create_collection("latem", &s.admin()).unwrap();
+        let m = vault.membership().unwrap().clone();
+        let this = vault.device_id();
+        let wrapped = s.keys.wrap_key().wrap(
+            &wrap_context(vault.vault_id(), id, 0),
+            &SymmetricKey::generate(),
+        );
+        let grant = |vault_id, epoch, recipient, signer: &SoftwareKeys| {
+            Grant::sign(
+                vault_id,
+                id,
+                epoch,
+                recipient,
+                wrapped.clone(),
+                signer.verifying_key(),
+                |context, message| signer.sign(context, message),
+            )
+            .unwrap()
+        };
+        grant(vault.vault_id(), 0, Some(this), &s.keys)
+            .check(&m)
+            .unwrap();
+
+        let stranger = SoftwareKeys::generate();
+        for (bad, why) in [
+            (
+                grant(VaultId::random(), 0, Some(this), &s.keys),
+                "another vault",
+            ),
+            (
+                grant(vault.vault_id(), 1, Some(this), &s.keys),
+                "an epoch the log hasn't reached",
+            ),
+            (
+                grant(vault.vault_id(), 0, Some(DeviceId::random()), &s.keys),
+                "an unknown recipient",
+            ),
+            (
+                grant(vault.vault_id(), 0, Some(this), &stranger),
+                "a signer who couldn't read",
+            ),
+        ] {
+            assert!(
+                matches!(bad.check(&m), Err(Error::InvalidGrant(_))),
+                "{why}"
+            );
+        }
+
+        // The recovery key's grant must be wrapped to its kind of key; this one is X25519 too.
+        grant(vault.vault_id(), 0, None, &s.keys).check(&m).unwrap();
+        // The admin at the start of the epoch may sign, even without a scope.
+        let admin = s.admin();
+        Grant::sign(
+            vault.vault_id(),
+            id,
+            0,
+            Some(this),
+            wrapped.clone(),
+            admin.verifying_key(),
+            |c, msg| Ok(admin.sign(c, msg)),
+        )
+        .unwrap()
+        .check(&m)
+        .unwrap();
+
+        let mut tampered = grant(vault.vault_id(), 0, Some(this), &s.keys).to_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(Grant::from_bytes(&tampered).unwrap().check(&m).is_err());
+    }
+
+    #[test]
+    fn epoch_history_records_who_could_read_and_write() {
+        let s = setup();
+        let mut vault = s.create();
+        let id = vault.create_collection("latem", &s.admin()).unwrap();
+        let this = vault.device_id();
+        let mut m = vault.membership().unwrap().clone();
+        assert!(m.had_scope(this, id, 0, Scope::Write));
+        assert!(m.had_scope(this, id, 0, Scope::Read));
+        assert!(!m.had_scope(this, id, 1, Scope::Read));
+        assert_eq!(m.epoch_admins(id, 0), [s.admin().verifying_key()]);
+
+        let other = DeviceInfo::new(
+            vault.vault_id(),
+            DeviceId::random(),
+            SoftwareKeys::generate().verifying_key(),
+            SoftwareKeys::generate().wrap_key(),
+            SigningKey::generate_ed25519().verifying_key(),
+            &desktop(),
+            &SymmetricKey::generate(),
+        )
+        .unwrap();
+        let other_id = other.id;
+        m.append(Change::AddDevice(other), &s.admin()).unwrap();
+        let read = Change::SetScope {
+            device: other_id,
+            collection: id,
+            scope: Scope::Read,
+        };
+        m.append(read, &s.admin()).unwrap();
+        m.append(Change::RevokeDevice(other_id), &s.admin())
+            .unwrap();
+        m.append(
+            Change::RotateEpoch {
+                collection: id,
+                epoch: 1,
+            },
+            &s.admin(),
+        )
+        .unwrap();
+        // It could read during epoch 0, never write, and has nothing in epoch 1.
+        assert!(m.had_scope(other_id, id, 0, Scope::Read));
+        assert!(!m.had_scope(other_id, id, 0, Scope::Write));
+        assert!(!m.had_scope(other_id, id, 1, Scope::Read));
+        assert!(m.had_scope(this, id, 1, Scope::Write));
+
+        let state = Membership::from_state_bytes(&m.to_state_bytes()).unwrap();
+        assert!(state.had_scope(other_id, id, 0, Scope::Read));
+        assert_eq!(state.to_state_bytes(), m.to_state_bytes());
+    }
+
+    #[test]
+    fn approving_a_join_builds_the_joiners_store() {
+        let s = setup();
+        let mut admin_vault = s.create();
+        let latem = admin_vault.create_collection("latem", &s.admin()).unwrap();
+        let ssh = admin_vault.create_collection("ssh", &s.admin()).unwrap();
+        admin_vault
+            .set(latem, "prod/SENTRY_DSN", Kind::Secret, b"https://sentry")
+            .unwrap();
+
+        let joiner_keys = SoftwareKeys::generate();
+        let joiner = DeviceId::random();
+        let request = JoinRequest::sign(&[9; 32], joiner, &joiner_keys, desktop()).unwrap();
+        let scopes = [(latem, Scope::Read), (ssh, Scope::Hold)];
+        let approval = admin_vault
+            .approve_join(&request, &scopes, &s.admin())
+            .unwrap();
+        // add_device and two set_scopes after genesis, add_device and the two collections.
+        assert_eq!(approval.log.len(), 7);
+        assert_eq!(
+            approval.grants.len(),
+            1,
+            "a key for latem only: hold can't read"
+        );
+        let m = admin_vault.membership().unwrap().clone();
+        assert_eq!(m.scope(joiner, latem), Scope::Read);
+        assert_eq!(admin_vault.device_name(joiner).unwrap(), Some(desktop()));
+
+        // Approving again, as after an interrupted join, signs nothing new.
+        let again = admin_vault
+            .approve_join(&request, &scopes, &s.admin())
+            .unwrap();
+        assert_eq!(again.log.len(), 7);
+        assert_eq!(again.grants, approval.grants);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("joined.db");
+        let join = |head, name: &DeviceName, grants: &[Grant]| {
+            Vault::join(
+                &path,
+                &joiner_keys,
+                joiner,
+                name,
+                head,
+                &approval.log,
+                grants,
+            )
+        };
+        assert!(
+            join((0, [0; 32]), &desktop(), &approval.grants).is_err(),
+            "another head"
+        );
+        let other_name = DeviceName {
+            name: "Laptop".into(),
+            ..desktop()
+        };
+        assert!(
+            join(m.head(), &other_name, &approval.grants).is_err(),
+            "another name"
+        );
+        assert!(!path.exists(), "a refused join writes nothing");
+
+        let joined = join(m.head(), &desktop(), &approval.grants).unwrap();
+        assert_eq!(joined.vault_id(), admin_vault.vault_id());
+        assert_eq!(joined.device_id(), joiner);
+        assert_eq!(joined.membership().unwrap().head(), m.head());
+        assert_eq!(
+            joined
+                .device_name(admin_vault.device_id())
+                .unwrap()
+                .unwrap()
+                .name,
+            "test"
+        );
+        drop(joined);
+        let reopened = Vault::open(&path, &joiner_keys).unwrap();
+        assert_eq!(grants_to_count(&reopened, joiner), 1);
+
+        // A device id that is in the log with other keys is refused.
+        let impostor =
+            JoinRequest::sign(&[9; 32], joiner, &SoftwareKeys::generate(), desktop()).unwrap();
+        assert!(matches!(
+            admin_vault.approve_join(&impostor, &scopes, &s.admin()),
+            Err(Error::InvalidJoin(_))
+        ));
+    }
+
+    fn grants_to_count(vault: &Vault<&SoftwareKeys>, device: DeviceId) -> usize {
+        vault.grants_to(device).unwrap().len()
+    }
+
+    #[test]
+    fn version_3_stores_get_grants_and_epoch_history() {
+        let s = setup();
+        let id = {
+            let mut vault = s.create();
+            let id = vault.create_collection("latem", &s.admin()).unwrap();
+            vault.set(id, "A", Kind::Var, b"1").unwrap();
+            // A version 3 store had no grants, and its kept state no epoch history, which the
+            // upgrade rebuilds from the log rather than reads.
+            vault
+                .conn
+                .execute_batch(
+                    "DROP TABLE grants;
+                     UPDATE meta SET value = x'00' WHERE key = 'membership';
+                     PRAGMA user_version = 3;",
+                )
+                .unwrap();
+            id
+        };
+        let mut vault = s.open();
+        assert_eq!(user_version(&vault.conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(value(vault.get(id, "A").unwrap()), Some(b"1".to_vec()));
+        let m = vault.membership().unwrap();
+        assert!(m.had_scope(vault.device_id(), id, 0, Scope::Write));
+        let grants = grants(&vault);
+        assert_eq!(grants.len(), 2);
+        for grant in &grants {
+            grant.check(m).unwrap();
+        }
+    }
+
     #[test]
     fn refresh_picks_up_log_entries_from_another_connection() {
         let s = setup();
@@ -1212,6 +1850,7 @@ mod tests {
         drop(s.create());
         {
             let conn = connect(&s.path).unwrap();
+            conn.execute_batch("DROP TABLE grants").unwrap();
             conn.pragma_update(None, "user_version", 2).unwrap();
         }
         assert!(matches!(
@@ -1243,6 +1882,7 @@ mod tests {
                 .conn
                 .execute_batch(
                     "DROP TABLE log;
+                     DROP TABLE grants;
                      DELETE FROM meta WHERE key = 'membership';
                      PRAGMA user_version = 1;",
                 )
@@ -1274,6 +1914,8 @@ mod tests {
         assert_eq!(m.head().0, 3);
         assert_eq!(m.scope(vault.device_id(), id), Scope::Write);
         assert_eq!(m.scope(vault.device_id(), d), Scope::Write);
+        // Starting the log granted the existing collection's keys too.
+        assert_eq!(grants(&vault).len(), 4);
     }
 
     #[test]

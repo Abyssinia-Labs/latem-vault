@@ -122,6 +122,7 @@ In the local store (records.md) that is:
 
 - a `log` table of `seq`, entry hash and entry bytes;
 - the state, encoded by `Membership::to_state_bytes`, in the `membership` row of `meta`. It's written in the same transaction as the entries it follows from, and only this device reads it.
+- The state includes each collection epoch's history: the admins at the entry that began it, and every device that had `read` or `write`, and `write`, at some point during it. Checking a grant or a record signed under an old epoch needs these (sync.md), and the log is read once to find them.
 
 On open, the state's head must equal the hash of the last row in `log`, and this device must be in it with the keys it opened the vault with. Otherwise the store is corrupt. Both checks are single-row reads.
 

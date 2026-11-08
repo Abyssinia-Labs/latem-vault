@@ -6,6 +6,7 @@
 //! it runs, and open the vault themselves otherwise.
 
 mod env_file;
+mod join;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -91,6 +92,29 @@ enum Command {
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<OsString>,
     },
+    /// Join a vault on another device: shows a code to type into `openvault approve` there.
+    Join {
+        /// This device's name in the vault [default: this computer's host name]
+        #[arg(long)]
+        name: Option<String>,
+        /// Where this device's keys live [default: the Secure Enclave when this Mac has one,
+        /// otherwise a key file protected by a passphrase]
+        #[arg(long, value_enum)]
+        keys: Option<KeysArg>,
+    },
+    /// Let a device on this network join this vault, after checking the code it shows. Asks for
+    /// Touch ID when this Mac has an admin key, and for the recovery phrase otherwise.
+    Approve {
+        /// Let it write a collection; repeat for each
+        #[arg(long, value_name = "COLLECTION")]
+        write: Vec<String>,
+        /// Let it read a collection; repeat for each
+        #[arg(long, value_name = "COLLECTION")]
+        read: Vec<String>,
+        /// Let it store a collection without reading it; repeat for each
+        #[arg(long, value_name = "COLLECTION")]
+        hold: Vec<String>,
+    },
     /// List this vault's devices, and which of them are on this network.
     Devices,
     /// Hold the vault open, find this vault's other devices on the local network, and answer
@@ -158,14 +182,20 @@ fn dispatch(command: Command) -> Result<ExitCode> {
     let home = Home::locate()?;
     match command {
         Command::Init { keys, name } => {
-            let backend = match keys {
-                Some(KeysArg::SecureEnclave) => Backend::SecureEnclave,
-                Some(KeysArg::Passphrase) => Backend::Passphrase,
-                Some(KeysArg::Software) => Backend::Software,
-                None => Backend::best(),
-            };
-            init(&home, backend, &name.unwrap_or_else(default_device_name))?;
+            init(
+                &home,
+                backend(keys),
+                &name.unwrap_or_else(default_device_name),
+            )?;
         }
+        Command::Join { name, keys } => {
+            join::join(
+                &home,
+                backend(keys),
+                name.unwrap_or_else(default_device_name),
+            )?;
+        }
+        Command::Approve { write, read, hold } => join::approve(&home, &write, &read, &hold)?,
         Command::Devices => devices(&home)?,
         Command::Service => service(&home)?,
         Command::Collections { action: None } => {
@@ -201,6 +231,15 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         } => import_env(&home, &file, &collection, &env, &vars, overwrite)?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn backend(keys: Option<KeysArg>) -> Backend {
+    match keys {
+        Some(KeysArg::SecureEnclave) => Backend::SecureEnclave,
+        Some(KeysArg::Passphrase) => Backend::Passphrase,
+        Some(KeysArg::Software) => Backend::Software,
+        None => Backend::best(),
+    }
 }
 
 /// The directory holding this device's key file and vault database.

@@ -18,6 +18,9 @@ hkdf = "0.13"
 hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "x25519", "nistp", "chacha"] }
 p256 = { version = "0.14", features = ["ecdsa"] }
 sha2 = "0.11"
+# Not audited; the one Rust SPAKE2 that shares this crate's curve25519-dalek (join.md, PAKE).
+spake2 = { version = "=0.5.0-pre.0", features = ["getrandom"] }
+subtle = "2.6"
 thiserror = "2"
 zeroize = { version = "1.9", features = ["derive"] }
 

@@ -1,6 +1,6 @@
 # Sync spec, v1
 
-Status: draft, 2026-11-07. Not implemented yet. Builds on [records.md](records.md) and [membership.md](membership.md). The design is in [design §9](../design.md#9-sync) and [§10](../design.md#10-networking).
+Status: draft, 2026-11-07. Grants are implemented in `crates/core` (format, checks and storage) and sent during joins (join.md). Sessions, sets and reconciliation are not implemented yet. Builds on [records.md](records.md) and [membership.md](membership.md). The design is in [design §9](../design.md#9-sync) and [§10](../design.md#10-networking).
 
 Devices in a vault exchange three things directly, over iroh:
 - **the membership log;**

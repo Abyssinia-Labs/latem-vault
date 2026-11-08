@@ -99,7 +99,7 @@ Each device runs one iroh endpoint (design §10):
 
 ## The CLI
 
-- Every command except `init` and `service` connects to the socket first.
+- Every command except `init`, `service`, `join` and `approve` connects to the socket first. `join` and `approve` run their own endpoints (join.md, commands).
   - **If the service answers,** the command goes through it, and nothing asks for a passphrase.
   - **Otherwise,** the command opens the vault itself, as before. The service is optional, and `openvault run` still works on a device that doesn't run it.
 - Both paths run the same request handler, so a command behaves the same either way.

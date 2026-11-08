@@ -4,7 +4,7 @@
 //! [`Membership`] is the state after a run of entries. It checks each new entry against that
 //! state before applying it, so it never holds a state the log doesn't justify.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use openvault_crypto::hash::{self, Hash, contexts};
 use openvault_crypto::{
@@ -105,7 +105,7 @@ impl DeviceName {
         ))
     }
 
-    fn check(&self) -> Result<()> {
+    pub fn check(&self) -> Result<()> {
         let platform = &self.platform;
         let name = &self.name;
         let result = if platform.is_empty()
@@ -509,6 +509,19 @@ pub struct Membership {
     devices: HashMap<DeviceId, Device>,
     scopes: HashMap<(DeviceId, CollectionId), Scope>,
     epochs: HashMap<CollectionId, u32>,
+    history: HashMap<(CollectionId, u32), EpochHistory>,
+}
+
+/// Who could do what during one key epoch of a collection, for checking grants and records
+/// signed under it (sync.md, grants and accepting records).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EpochHistory {
+    /// The admins at the entry that began the epoch.
+    admins: Vec<VerifyingKey>,
+    /// Devices that had `read` or `write` at some point during the epoch.
+    readers: BTreeSet<DeviceId>,
+    /// Devices that had `write` at some point during the epoch.
+    writers: BTreeSet<DeviceId>,
 }
 
 impl Membership {
@@ -563,6 +576,7 @@ impl Membership {
             devices: HashMap::new(),
             scopes: HashMap::new(),
             epochs: HashMap::new(),
+            history: HashMap::new(),
         })
     }
 
@@ -676,6 +690,33 @@ impl Membership {
         self.epochs.get(&collection).copied()
     }
 
+    /// Whether `device` had at least `scope` on `collection` at some point during `epoch`, which
+    /// is what signing a grant (`Read`) or a record (`Write`) under that epoch needs.
+    pub fn had_scope(
+        &self,
+        device: DeviceId,
+        collection: CollectionId,
+        epoch: u32,
+        scope: Scope,
+    ) -> bool {
+        let Some(history) = self.history.get(&(collection, epoch)) else {
+            return false;
+        };
+        match scope {
+            Scope::None => true,
+            Scope::Hold | Scope::Read => history.readers.contains(&device),
+            Scope::Write => history.writers.contains(&device),
+        }
+    }
+
+    /// The admins at the entry that began `epoch` of `collection`: its first set_scope for epoch
+    /// 0, its rotate_epoch after that. Empty for an epoch the log hasn't reached.
+    pub fn epoch_admins(&self, collection: CollectionId, epoch: u32) -> &[VerifyingKey] {
+        self.history
+            .get(&(collection, epoch))
+            .map_or(&[], |history| &history.admins)
+    }
+
     /// The state as bytes, which a device keeps next to its log so that opening a vault
     /// doesn't replay it (membership.md, keeping the log). Only the device that wrote it reads
     /// it back, so it isn't signed, and [`from_state_bytes`](Self::from_state_bytes) trusts it.
@@ -717,6 +758,23 @@ impl Membership {
             out.extend_from_slice(collection.as_bytes());
             out.extend_from_slice(&epoch.to_be_bytes());
         }
+        let mut history: Vec<_> = self.history.iter().collect();
+        history.sort_by_key(|(key, _)| **key);
+        push_count(&mut out, history.len());
+        for ((collection, epoch), history) in history {
+            out.extend_from_slice(collection.as_bytes());
+            out.extend_from_slice(&epoch.to_be_bytes());
+            out.push(u8::try_from(history.admins.len()).expect("checked against MAX_ADMINS"));
+            for admin in &history.admins {
+                out.extend_from_slice(admin.as_bytes());
+            }
+            for devices in [&history.readers, &history.writers] {
+                push_count(&mut out, devices.len());
+                for device in devices {
+                    out.extend_from_slice(device.as_bytes());
+                }
+            }
+        }
         out
     }
 
@@ -753,6 +811,29 @@ impl Membership {
         let epochs = (0..r.u32()?)
             .map(|_| Ok((CollectionId::from_bytes(r.array()?), r.u32()?)))
             .collect::<Result<_>>()?;
+        let history = (0..r.u32()?)
+            .map(|_| {
+                let key = (CollectionId::from_bytes(r.array()?), r.u32()?);
+                let admins = (0..r.u8()?)
+                    .map(|_| r.verifying_key())
+                    .collect::<Result<_>>()?;
+                let mut devices = || {
+                    (0..r.u32()?)
+                        .map(|_| Ok(DeviceId::from_bytes(r.array()?)))
+                        .collect::<Result<BTreeSet<_>>>()
+                };
+                let readers = devices()?;
+                let writers = devices()?;
+                Ok((
+                    key,
+                    EpochHistory {
+                        admins,
+                        readers,
+                        writers,
+                    },
+                ))
+            })
+            .collect::<Result<_>>()?;
         r.finish()?;
         Ok(Self {
             vault,
@@ -765,6 +846,7 @@ impl Membership {
             devices,
             scopes,
             epochs,
+            history,
         })
     }
 
@@ -839,7 +921,21 @@ impl Membership {
                 collection,
                 scope,
             } => {
-                self.epochs.entry(*collection).or_insert(0);
+                let epoch = *self.epochs.entry(*collection).or_insert(0);
+                let admins = &self.admins;
+                let history =
+                    self.history
+                        .entry((*collection, epoch))
+                        .or_insert_with(|| EpochHistory {
+                            admins: admins.clone(),
+                            ..EpochHistory::default()
+                        });
+                if *scope >= Scope::Read {
+                    history.readers.insert(*device);
+                }
+                if *scope == Scope::Write {
+                    history.writers.insert(*device);
+                }
                 if *scope == Scope::None {
                     self.scopes.remove(&(*device, *collection));
                 } else {
@@ -852,6 +948,20 @@ impl Membership {
             }
             Change::RotateEpoch { collection, epoch } => {
                 self.epochs.insert(*collection, *epoch);
+                // Whoever has a scope when the epoch begins has it during the epoch.
+                let with = |at_least: Scope| {
+                    self.scopes
+                        .iter()
+                        .filter(|((_, c), scope)| c == collection && **scope >= at_least)
+                        .map(|((device, _), _)| *device)
+                        .collect()
+                };
+                let history = EpochHistory {
+                    admins: self.admins.clone(),
+                    readers: with(Scope::Read),
+                    writers: with(Scope::Write),
+                };
+                self.history.insert((*collection, *epoch), history);
             }
             Change::AddAdmin(key) => self.admins.push(key.clone()),
             Change::RemoveAdmin(key) => self.admins.retain(|admin| admin != key),

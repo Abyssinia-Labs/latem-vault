@@ -462,8 +462,8 @@ mod tests {
         }
     }
 
-    /// Asks for Touch ID or the password, so it runs only when asked:
-    /// `cargo test -p openvault-keystore -- --ignored`.
+    /// Asks for Touch ID or the password, once for the three signatures, so it runs only when
+    /// asked: `cargo test -p openvault-keystore -- --ignored`.
     #[test]
     #[ignore = "asks for Touch ID"]
     fn admin_key_signs_after_touch_id() {
@@ -472,11 +472,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key = AdminKey::create(&dir.path().join("admin"))
             .unwrap()
-            .with_reason("run the openvault admin key test");
-        let signature = key.sign(SignatureContext::LogEntry, b"test").unwrap();
-        key.verifying_key()
-            .verify(SignatureContext::LogEntry, b"test", &signature)
-            .unwrap();
+            .with_reason("run the openvault admin key test (one prompt for three signatures)");
+        for message in [&b"first"[..], b"second", b"third"] {
+            let signature = key.sign(SignatureContext::LogEntry, message).unwrap();
+            key.verifying_key()
+                .verify(SignatureContext::LogEntry, message, &signature)
+                .unwrap();
+        }
     }
 
     #[test]

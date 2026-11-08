@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context as _, Result, bail};
 use openvault_core::{DeviceId, Vault, transport_seed};
 use openvault_keystore::Keys;
-use openvault_net::{EndpointKey, Event, Node};
+use openvault_net::{EndpointKey, Event, Node, Options};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
@@ -58,7 +58,7 @@ pub async fn run(dir: &Path, keys: Keys) -> Result<()> {
         .with_context(|| format!("can't listen on {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
 
-    let (node, mut events) = Node::start(&seed).await?;
+    let (node, mut events) = Node::start(&seed, Options::default()).await?;
     drop(seed);
     info!(
         vault = %vault_id,

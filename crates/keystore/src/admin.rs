@@ -12,11 +12,15 @@ use crate::{Backend, Error, Result, file};
 #[cfg(target_os = "macos")]
 const DEFAULT_REASON: &str = "change who is in your OpenVault vault";
 
-/// An admin key, loaded from its file. It signs as a [`membership::AdminKey`].
+/// An admin key, loaded from its file. It signs as a [`membership::AdminKey`]. Every signature
+/// one `AdminKey` makes shares one Touch ID prompt, so one approval should use one value.
 pub struct AdminKey {
     blob: Vec<u8>,
     verifying_key: VerifyingKey,
     reason: String,
+    /// Restored with its authentication context on the first signature.
+    #[cfg(target_os = "macos")]
+    signer: std::cell::OnceCell<crate::secure_enclave::AdminSigner>,
 }
 
 impl AdminKey {
@@ -52,6 +56,7 @@ impl AdminKey {
                 blob,
                 verifying_key,
                 reason: DEFAULT_REASON.to_owned(),
+                signer: std::cell::OnceCell::new(),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -62,7 +67,8 @@ impl AdminKey {
     }
 
     /// Sets what the Touch ID dialog says the signature is for, such as "create the collection
-    /// ssh", so an unexpected request stands out (design §4, known limits).
+    /// ssh", so an unexpected request stands out (design §4, known limits). Call it before
+    /// signing: the dialog shows the reason the first signature had.
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = reason.into();
         self
@@ -78,11 +84,14 @@ impl membership::AdminKey for AdminKey {
         #[cfg(target_os = "macos")]
         {
             let input = openvault_crypto::sign::signing_input(context, message);
-            Ok(crate::secure_enclave::admin_sign(
-                &self.blob,
-                &self.reason,
-                &input,
-            )?)
+            let signer = match self.signer.get() {
+                Some(signer) => signer,
+                None => {
+                    let signer = crate::secure_enclave::AdminSigner::new(&self.blob, &self.reason)?;
+                    self.signer.get_or_init(|| signer)
+                }
+            };
+            Ok(signer.sign(&input)?)
         }
         #[cfg(not(target_os = "macos"))]
         {

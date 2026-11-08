@@ -17,6 +17,8 @@ const ALG_P256: u8 = 0x02;
 pub enum SignatureContext {
     Record,
     LogEntry,
+    JoinRequest,
+    KeyGrant,
 }
 
 impl SignatureContext {
@@ -24,6 +26,8 @@ impl SignatureContext {
         match self {
             Self::Record => b"openvault v1 sig record",
             Self::LogEntry => b"openvault v1 sig log entry",
+            Self::JoinRequest => b"openvault v1 sig join request",
+            Self::KeyGrant => b"openvault v1 sig key grant",
         }
     }
 }

@@ -309,6 +309,15 @@ impl<K: DeviceKeys> Vault<K> {
         self.vault_id
     }
 
+    /// The id of the vault at `path`, read without its keys: for a grandfather started on one of
+    /// the vault's devices (coordinator.md).
+    pub fn id_at(path: &Path) -> Result<VaultId> {
+        if !path.exists() {
+            return Err(Error::NoVault(path.into()));
+        }
+        VaultId::try_from(meta(&connect(path)?, "vault_id")?.as_slice())
+    }
+
     pub fn device_id(&self) -> DeviceId {
         self.device_id
     }
@@ -1889,7 +1898,7 @@ mod tests {
     /// store (README, versions). Change both together.
     #[test]
     fn the_build_version_follows_the_store_version() {
-        assert_eq!((env!("CARGO_PKG_VERSION_MINOR"), SCHEMA_VERSION), ("2", 6));
+        assert_eq!((env!("CARGO_PKG_VERSION_MINOR"), SCHEMA_VERSION), ("3", 6));
     }
 
     #[test]

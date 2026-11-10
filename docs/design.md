@@ -252,7 +252,8 @@ openvault import <folder> --collection <c>
 openvault open <collection>/<path>
 openvault keys [passphrase [--remove]]          how this device's keys are kept; give a key file a passphrase, change it or remove it
 openvault service [install|uninstall|status]    run the service, or have the system start it at login
-openvault grandfather
+openvault grandfather --hostname <name> [--vault <id>]   on the always-on machine: the relay and coordinator
+openvault coordinator [set <address>|unset]     use a grandfather, to reach the vault's devices away from home
 ```
 
 The local API runs on a Unix socket or named pipe for the CLI and apps, and on `localhost` HTTP for the web UI. The web UI needs a per-session token and checks the `Host` and `Origin` headers, since any website you visit can send requests to `localhost`.
@@ -383,6 +384,7 @@ Later: native Windows, Android, a Linux FUSE mount, a hardware security key for 
   - latem reads a repository's secrets from OpenVault first since latem#60 (its A86). The secrets moved from the one `latem` collection to one collection per repository (§15).
   - tsedal's Android preview build ran on the desktop, signed with the vault's keystore, and uploaded to Play. The mini joined too, and its iOS build signed and uploaded to TestFlight the same way.
   - Each machine runs `openvault service` from a LaunchAgent or a systemd user unit, written by hand for now.
+- **M3 is under way** ([coordinator.md](spec/coordinator.md)). Stage 1, `openvault grandfather` with its relay and the coordinator's log copy, and `openvault coordinator set` on devices, was built on 2026-11-10 and tested on one machine.
 
 ## 19. Open decisions
 

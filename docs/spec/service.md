@@ -56,8 +56,8 @@ All integers are big-endian.
 Each device runs one iroh endpoint (design §10):
 
 - **Identity.** Its secret key is the transport key (records.md, local store), so its endpoint id is the transport key in the device's add_device entry.
-- **No relays.** It uses no relay, so it never connects to n0's relays. The grandfather's relay comes in M3.
-- **No publishing.** It uses no DNS or pkarr address lookup and no port mapping. Nothing outside the local network learns the endpoint id or addresses.
+- **Relays.** It never connects to n0's relays. With a coordinator configured, it uses the grandfather's relay and no other (coordinator.md, devices); without one, no relay at all.
+- **No publishing.** It uses no DNS or pkarr address lookup and no port mapping. Without a coordinator, nothing outside the local network learns the endpoint id or addresses; with one, the grandfather does.
 - **Protocols.** It accepts connections with ALPN `openvault/sync/1` (sync.md) and runs a session on each. Joining uses `openvault/join/1` on endpoints of its own (join.md, commands).
 
 ### Discovery

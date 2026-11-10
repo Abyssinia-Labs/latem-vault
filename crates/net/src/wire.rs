@@ -1,7 +1,10 @@
-//! Message bodies that joining and sync share (sync.md): log requests and entries, and items.
+//! Message bodies that joining, sync and the coordinator share (sync.md): hellos, log requests
+//! and entries, and items.
 
+use openvault_core::VaultId;
 use openvault_core::membership::LogEntry;
 use openvault_core::sets::SetId;
+use openvault_crypto::hash::Hash;
 
 use crate::frame::{FrameError, MAX_MESSAGE};
 
@@ -15,6 +18,19 @@ pub const ITEMS: u8 = 0x07;
 
 /// Log entries per request (sync.md, log exchange).
 pub const LOG_BATCH: u16 = 64;
+
+/// `vault id (16) ‖ log head seq (u64) ‖ head hash (32)`.
+pub fn hello(vault: VaultId, seq: u64, hash: &Hash) -> Vec<u8> {
+    [&vault.as_bytes()[..], &seq.to_be_bytes(), hash].concat()
+}
+
+pub fn parse_hello(body: &[u8]) -> Result<(VaultId, u64, Hash), FrameError> {
+    let mut reader = Reader(body);
+    let vault = VaultId::from_bytes(reader.array()?);
+    let (seq, hash) = (reader.u64()?, reader.array()?);
+    reader.finish()?;
+    Ok((vault, seq, hash))
+}
 
 /// `from seq (u64) ‖ max (u16)`.
 pub fn log_request(from: u64, max: u16) -> Vec<u8> {

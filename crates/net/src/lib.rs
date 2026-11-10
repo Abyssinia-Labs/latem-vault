@@ -1,10 +1,12 @@
 //! A device's iroh endpoint, and how it finds the vault's other devices (`docs/spec/service.md`).
 //!
-//! The endpoint uses no relay, no DNS or pkarr publishing and no port mapping, so nothing
-//! outside the local network learns its id or addresses. It finds other OpenVault endpoints with
-//! mDNS under its own service name; which of them are members is for the membership log to say.
-//! When mDNS stops, the node starts it again ([`discovery_watch`]).
+//! The endpoint uses no DNS or pkarr publishing and no port mapping, and no relay unless the
+//! device has a coordinator configured, whose grandfather's relay is then the only one it uses
+//! (coordinator.md). It finds other OpenVault endpoints with mDNS under its own service name;
+//! which of them are members is for the membership log to say. When mDNS stops, the node starts
+//! it again ([`discovery_watch`]).
 
+pub mod coord;
 pub mod frame;
 pub mod join;
 pub mod sync;
@@ -16,11 +18,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use iroh::endpoint::Connection;
-use iroh::endpoint::presets;
+use iroh::endpoint::{Builder, presets};
 use iroh::endpoint_info::UserData;
-pub use iroh::{Endpoint, EndpointId};
-use iroh::{RelayMode, SecretKey};
+pub use iroh::tls::CaTlsConfig;
+pub use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
+use iroh::{NetReportConfig, RelayConfig, RelayMap, RelayMode, SecretKey};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
+use iroh_relay::RelayQuicConfig;
 use n0_future::StreamExt;
 use n0_future::boxed::BoxStream;
 use tokio::sync::mpsc;
@@ -70,6 +74,8 @@ pub struct Options {
     pub advertise: bool,
     /// What it announces besides its id and addresses: a joining device's platform and name.
     pub announcement: Option<String>,
+    /// The grandfather's relay, for a device with a coordinator configured.
+    pub relay: Option<Relay>,
 }
 
 impl Default for Options {
@@ -78,8 +84,60 @@ impl Default for Options {
             alpns: Vec::new(),
             advertise: true,
             announcement: None,
+            relay: None,
         }
     }
+}
+
+/// A relay for the endpoint to use, and no other (coordinator.md, devices).
+#[derive(Clone, Debug)]
+pub struct Relay {
+    pub url: RelayUrl,
+    /// The UDP port of its QUIC address discovery: [`coord::QAD_PORT`] but in tests.
+    pub quic_port: u16,
+    /// What its certificate is checked against: the usual roots but in tests.
+    pub roots: CaTlsConfig,
+}
+
+impl Relay {
+    pub fn new(url: RelayUrl) -> Self {
+        Self {
+            url,
+            quic_port: coord::QAD_PORT,
+            roots: CaTlsConfig::default(),
+        }
+    }
+}
+
+/// The endpoint builder [`Node::start`] binds: `seed` as the Ed25519 secret key (records.md,
+/// local store), and `options`' protocols, announcement and relay. Tests bind it themselves, to
+/// take away direct paths.
+pub fn builder(seed: &[u8; 32], options: &Options) -> Result<Builder, Error> {
+    let mut builder = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(seed))
+        .alpns(options.alpns.clone());
+    builder = match &options.relay {
+        None => builder.relay_mode(RelayMode::Disabled),
+        Some(relay) => {
+            let config = RelayConfig::new(
+                relay.url.clone(),
+                Some(RelayQuicConfig::new(relay.quic_port)),
+            );
+            // The relay's plain-HTTP side isn't reachable (coordinator.md, relay).
+            let mut report = NetReportConfig::default();
+            report.captive_portal_check = false;
+            builder
+                .relay_mode(RelayMode::Custom(RelayMap::from(config)))
+                .ca_tls_config(relay.roots.clone())
+                .net_report_config(report)
+        }
+    };
+    if let Some(announcement) = &options.announcement {
+        let data = UserData::try_from(announcement.clone())
+            .map_err(|_| Error::Mdns("the announcement is too long".into()))?;
+        builder = builder.user_data_for_address_lookup(data);
+    }
+    Ok(builder)
 }
 
 /// This device's endpoint, with mDNS discovery running.
@@ -90,24 +148,15 @@ pub struct Node {
 }
 
 impl Node {
-    /// Binds the endpoint with `seed` as its Ed25519 secret key (records.md, local store) and
-    /// starts mDNS. Changes in what it can see arrive on the returned receiver.
+    /// Binds the endpoint from [`builder`] and starts mDNS. Changes in what it can see arrive on
+    /// the returned receiver.
     ///
     /// Must be called inside a tokio runtime.
     pub async fn start(
         seed: &[u8; 32],
         options: Options,
     ) -> Result<(Self, mpsc::Receiver<Event>), Error> {
-        let mut builder = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::from_bytes(seed))
-            .relay_mode(RelayMode::Disabled)
-            .alpns(options.alpns);
-        if let Some(announcement) = options.announcement {
-            let data = UserData::try_from(announcement)
-                .map_err(|_| Error::Mdns("the announcement is too long".into()))?;
-            builder = builder.user_data_for_address_lookup(data);
-        }
-        let endpoint = builder
+        let endpoint = builder(seed, &options)?
             .bind()
             .await
             .map_err(|e| Error::Bind(e.to_string()))?;

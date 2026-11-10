@@ -1,6 +1,8 @@
 //! Running sync sessions (sync.md, when devices sync): one at a time with each visible member,
 //! started when it becomes visible, after a local write to a set it shares, and after the log
-//! changes. There are no timers besides the retries of sessions that failed.
+//! changes. There are no timers besides the retries of sessions that failed. With a coordinator
+//! configured, members are dialed through the grandfather's relay as well as directly
+//! (coordinator.md, devices).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +13,7 @@ use openvault_core::sets::SetId;
 use openvault_core::{DeviceId, Vault};
 use openvault_keystore::Keys;
 use openvault_net::sync::{self, Notice, Outcome, Role, SyncError};
-use openvault_net::{EndpointId, EndpointKey, Node};
+use openvault_net::{EndpointAddr, EndpointId, EndpointKey, Node, RelayUrl};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
@@ -23,6 +25,8 @@ const LAST_RETRY: Duration = Duration::from_secs(60 * 60);
 pub(crate) struct Engine {
     node: Arc<Node>,
     vault: Arc<Mutex<Vault<Keys>>>,
+    /// The grandfather's relay, if a coordinator is configured.
+    relay: Option<RelayUrl>,
     state: Mutex<State>,
     next_id: AtomicU64,
 }
@@ -32,6 +36,8 @@ struct State {
     sessions: HashMap<EndpointKey, Running>,
     /// The delay before the next retry, for peers whose last session failed.
     retries: HashMap<EndpointKey, Duration>,
+    /// The connection to the coordinator, which says hello again when the log grows.
+    coordinator: Option<mpsc::Sender<Notice>>,
 }
 
 struct Running {
@@ -42,10 +48,15 @@ struct Running {
 }
 
 impl Engine {
-    pub(crate) fn new(node: Arc<Node>, vault: Arc<Mutex<Vault<Keys>>>) -> Arc<Self> {
+    pub(crate) fn new(
+        node: Arc<Node>,
+        vault: Arc<Mutex<Vault<Keys>>>,
+        relay: Option<RelayUrl>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             node,
             vault,
+            relay,
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(0),
         })
@@ -65,7 +76,12 @@ impl Engine {
         let engine = self.clone();
         let task = tokio::spawn(async move {
             let result = match EndpointId::from_bytes(&peer) {
-                Ok(remote) => match engine.node.endpoint().connect(remote, sync::ALPN).await {
+                Ok(remote) => match engine
+                    .node
+                    .endpoint()
+                    .connect(engine.addr(remote), sync::ALPN)
+                    .await
+                {
                     Ok(connection) => {
                         sync::run(
                             connection,
@@ -161,10 +177,28 @@ impl Engine {
         self.state.lock().expect("poisoned").retries.remove(peer);
     }
 
+    /// Where the coordinator's connection hears of log changes.
+    pub(crate) fn set_coordinator(&self, notices: mpsc::Sender<Notice>) {
+        self.state.lock().expect("poisoned").coordinator = Some(notices);
+    }
+
     fn notify(&self, notice: Notice) {
         let state = self.state.lock().expect("poisoned");
         for running in state.sessions.values() {
             let _ = running.notices.try_send(notice);
+        }
+        if let Some(coordinator) = &state.coordinator
+            && notice == Notice::Log
+        {
+            let _ = coordinator.try_send(notice);
+        }
+    }
+
+    /// How to reach `peer`: through the relay as well, if there is one, and wherever mDNS saw it.
+    fn addr(&self, peer: EndpointId) -> EndpointAddr {
+        match &self.relay {
+            Some(url) => EndpointAddr::new(peer).with_relay_url(url.clone()),
+            None => peer.into(),
         }
     }
 

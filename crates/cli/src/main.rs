@@ -6,6 +6,7 @@
 //! it runs, and open the vault themselves otherwise.
 
 mod env_file;
+mod grandfather;
 mod join;
 mod keys;
 #[cfg(unix)]
@@ -155,6 +156,16 @@ enum Command {
         #[command(subcommand)]
         action: Option<KeysAction>,
     },
+    /// Show the grandfather this device uses to reach the vault's other devices away from home,
+    /// or set it.
+    Coordinator {
+        #[command(subcommand)]
+        action: Option<CoordinatorAction>,
+    },
+    /// Run this vault's relay and coordinator on its always-on machine, so its devices reach each
+    /// other away from home. Prints the address to give them with `openvault coordinator set`.
+    /// Runs until Ctrl-C.
+    Grandfather(grandfather::Args),
     /// Import a NAME=value file, such as latem's secrets.env, into a folder. Every name is
     /// imported as a secret unless given with --var.
     ImportEnv {
@@ -211,6 +222,15 @@ enum ServiceAction {
     Uninstall,
     /// Whether the service is installed and running, and which build it runs.
     Status,
+}
+
+#[derive(Subcommand)]
+enum CoordinatorAction {
+    /// Use the grandfather at this address, as `openvault grandfather` prints it: its relay, and
+    /// its coordinator
+    Set { address: String },
+    /// Stop using a grandfather: find other devices on the local network only
+    Unset,
 }
 
 #[derive(Subcommand)]
@@ -297,6 +317,14 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         Command::Service {
             action: Some(action),
         } => service_action(&home, action)?,
+        Command::Coordinator { action: None } => grandfather::show(&home)?,
+        Command::Coordinator {
+            action: Some(CoordinatorAction::Set { address }),
+        } => grandfather::set(&home, &address)?,
+        Command::Coordinator {
+            action: Some(CoordinatorAction::Unset),
+        } => grandfather::unset(&home)?,
+        Command::Grandfather(args) => grandfather::run(&home, args)?,
         Command::Keys { action: None } => keys::show(&home)?,
         Command::Keys {
             action: Some(KeysAction::Passphrase { remove: false }),
@@ -961,15 +989,25 @@ fn find_device<'a>(devices: &'a [DeviceSummary], query: &str) -> Result<&'a Devi
 /// Runs the service in the foreground until Ctrl-C (service.md).
 #[cfg(unix)]
 fn service(home: &Home) -> Result<()> {
+    home.require_vault()?;
+    let keys = load_keys(&home.keys())?;
+    log_to_stderr(
+        "info,iroh=warn,iroh_relay=warn,iroh_mdns_address_lookup=warn,swarm_discovery=warn",
+    );
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(openvault_service::run(&home.0, keys, VERSION))
+}
+
+/// Sends the log to stderr, filtered by `OPENVAULT_LOG` or else by `default`.
+fn log_to_stderr(default: &str) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::{EnvFilter, Layer, fmt};
 
-    home.require_vault()?;
-    let keys = load_keys(&home.keys())?;
-    let filter = EnvFilter::try_from_env("OPENVAULT_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("info,iroh=warn,iroh_mdns_address_lookup=warn,swarm_discovery=warn")
-    });
+    let filter =
+        EnvFilter::try_from_env("OPENVAULT_LOG").unwrap_or_else(|_| EnvFilter::new(default));
     tracing_subscriber::registry()
         .with(
             fmt::layer()
@@ -980,10 +1018,6 @@ fn service(home: &Home) -> Result<()> {
         // Starts mDNS again when it stops, whatever OPENVAULT_LOG leaves out (service.md).
         .with(openvault_net::discovery_watch())
         .init();
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(openvault_service::run(&home.0, keys, VERSION))
 }
 
 #[cfg(not(unix))]

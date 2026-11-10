@@ -108,6 +108,18 @@ pub enum SyncError {
     Store(#[from] openvault_core::Error),
 }
 
+impl SyncError {
+    /// The reason to send the peer before closing, if the failure is one it should hear of.
+    pub fn reason(&self) -> Option<Reason> {
+        match self {
+            Self::Refused(reason) => Some(*reason),
+            Self::Frame(FrameError::Bad(_)) => Some(Reason::BadMessage),
+            Self::Store(openvault_core::Error::Fork) => Some(Reason::Fork),
+            _ => None,
+        }
+    }
+}
+
 /// A range's upper bound, exclusive; `None` is the end of the id space.
 type Upper = Option<ItemId>;
 
@@ -202,13 +214,7 @@ async fn session<S: SyncStore>(
     };
     let result = session.drive(recv, notices, idle).await;
     if let Err(error) = &result {
-        let reason = match error {
-            SyncError::Refused(reason) => Some(*reason),
-            SyncError::Frame(FrameError::Bad(_)) => Some(Reason::BadMessage),
-            SyncError::Store(openvault_core::Error::Fork) => Some(Reason::Fork),
-            _ => None,
-        };
-        if let Some(reason) = reason {
+        if let Some(reason) = error.reason() {
             frame::send_error(&mut session.send, reason, &error.to_string()).await;
         }
     } else {
@@ -252,14 +258,11 @@ impl<S: SyncStore> Session<S> {
     async fn handle(&mut self, kind: u8, body: &[u8]) -> Result<(), SyncError> {
         match kind {
             HELLO => {
-                let mut reader = Reader(body);
-                let vault = VaultId::from_bytes(reader.array()?);
-                let head = (reader.u64()?, reader.array()?);
-                reader.finish()?;
+                let (vault, seq, hash) = wire::parse_hello(body)?;
                 if vault != self.vault {
                     return Err(SyncError::Refused(Reason::WrongVault));
                 }
-                self.peer_head = Some(head);
+                self.peer_head = Some((seq, hash));
                 self.progress().await
             }
             LOG_REQUEST => {
@@ -506,8 +509,7 @@ impl<S: SyncStore> Session<S> {
 
     async fn send_hello(&mut self) -> Result<(), SyncError> {
         let (vault, seq, hash) = blocking(|| self.store.hello())?;
-        let body = [&vault.as_bytes()[..], &seq.to_be_bytes(), &hash].concat();
-        frame::write(&mut self.send, HELLO, &body).await?;
+        frame::write(&mut self.send, HELLO, &wire::hello(vault, seq, &hash)).await?;
         Ok(())
     }
 
@@ -710,14 +712,16 @@ fn parse_reconcile(body: &[u8]) -> Result<(SetId, Vec<Range>), FrameError> {
 }
 
 /// Reads the next message and hands the stream back for the one after.
-async fn next_message(mut recv: RecvStream) -> (RecvStream, Result<(u8, Vec<u8>), FrameError>) {
+pub(crate) async fn next_message(
+    mut recv: RecvStream,
+) -> (RecvStream, Result<(u8, Vec<u8>), FrameError>) {
     let message = frame::read(&mut recv).await;
     (recv, message)
 }
 
 /// Runs a store call that may wait on the database without holding up the runtime's other
 /// tasks. Sessions run on a multi-threaded runtime.
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     tokio::task::block_in_place(f)
 }
 
@@ -730,8 +734,18 @@ mod tests {
     #[test]
     fn the_build_version_follows_the_protocols() {
         assert_eq!(
-            (env!("CARGO_PKG_VERSION_MINOR"), ALPN, crate::join::ALPN),
-            ("2", &b"openvault/sync/1"[..], &b"openvault/join/1"[..])
+            (
+                env!("CARGO_PKG_VERSION_MINOR"),
+                ALPN,
+                crate::join::ALPN,
+                crate::coord::ALPN
+            ),
+            (
+                "3",
+                &b"openvault/sync/1"[..],
+                &b"openvault/join/1"[..],
+                &b"openvault/coord/1"[..]
+            )
         );
     }
 

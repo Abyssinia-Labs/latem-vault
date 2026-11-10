@@ -8,6 +8,8 @@ pub mod api;
 #[cfg(unix)]
 pub mod client;
 #[cfg(unix)]
+mod coordinator;
+#[cfg(unix)]
 mod engine;
 pub mod handler;
 #[cfg(unix)]
@@ -16,7 +18,13 @@ mod server;
 #[cfg(unix)]
 pub use server::run;
 
+use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
+
+use anyhow::Context as _;
 use openvault_core::membership;
+use openvault_net::coord::Address;
 
 /// The files in the openvault directory.
 pub const VAULT: &str = "vault.db";
@@ -24,6 +32,21 @@ pub const KEYS: &str = "keys";
 pub const ADMIN_KEY: &str = "admin";
 pub const SOCKET: &str = "service.sock";
 pub const LOCK: &str = "service.lock";
+/// The grandfather's address, if this device uses a coordinator (coordinator.md, devices).
+pub const COORDINATOR: &str = "coordinator";
+
+/// The grandfather configured in the openvault directory `dir`, if any.
+pub fn configured_coordinator(dir: &Path) -> anyhow::Result<Option<Address>> {
+    let path = dir.join(COORDINATOR);
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(
+            text.parse()
+                .with_context(|| format!("in {}", path.display()))?,
+        )),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("can't read {}", path.display())),
+    }
+}
 
 /// This computer's host name without `.local`, as the device's name in the membership log.
 pub fn default_device_name() -> String {

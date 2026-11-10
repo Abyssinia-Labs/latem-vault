@@ -774,6 +774,33 @@ fn devices_lists_this_device() {
     assert!(devices.contains("Run `openvault service`"), "{devices}");
 }
 
+#[test]
+fn coordinator_is_set_per_device() {
+    let device = Device::new();
+    let none = device.ok(&["coordinator"]);
+    assert!(none.starts_with("None:"), "{none}");
+    assert!(none.contains("openvault grandfather --vault "), "{none}");
+
+    let id = "ab".repeat(32);
+    let error = device.fails(&["coordinator", "set", &format!("{id}@vault.example.com")]);
+    assert!(error.contains("not a grandfather's address"), "{error}");
+    device.ok(&[
+        "coordinator",
+        "set",
+        &format!("ov1:{id}@Vault.Example.com:8443"),
+    ]);
+    let shown = device.ok(&["coordinator"]);
+    assert_eq!(
+        shown.lines().next().unwrap(),
+        format!("ov1:{id}@vault.example.com:8443")
+    );
+
+    device.ok(&["coordinator", "unset"]);
+    assert!(device.ok(&["coordinator"]).starts_with("None:"));
+    let error = device.fails(&["coordinator", "unset"]);
+    assert!(error.contains("no coordinator set"), "{error}");
+}
+
 /// A joining device announces itself to the whole network, so two tests joining at once would
 /// each find the other's device. Tests take turns while they join.
 #[cfg(unix)]

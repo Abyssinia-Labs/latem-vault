@@ -7,7 +7,7 @@ Devices in a vault exchange three things directly, over iroh:
 - **grants**, which carry wrapped collection keys;
 - **records**, one set per collection.
 
-This spec covers devices on the same local network (M2). The coordinator and relay come with M3, and files and chunks with M4.
+This spec covers devices on the same local network (M2). Devices with a coordinator also reach each other through the grandfather's relay ([coordinator.md](coordinator.md)), and files and chunks come with M4.
 
 All integers are big-endian.
 

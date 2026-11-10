@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result, bail};
 use openvault_core::sets::SetId;
 use openvault_core::{DeviceId, Vault, transport_seed};
 use openvault_keystore::Keys;
-use openvault_net::{EndpointKey, Event, Node, Options};
+use openvault_net::{EndpointKey, Event, Node, Options, Relay};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{self, Request, Response};
+use crate::coordinator;
 use crate::engine::Engine;
 use crate::handler::{self, Context, transport_endpoint};
 use crate::{ADMIN_KEY, LOCK, SOCKET, VAULT};
@@ -70,8 +71,11 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
         .with_context(|| format!("can't listen on {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
 
+    let coordinator = crate::configured_coordinator(dir)?;
+    let relay = coordinator.as_ref().map(|address| address.relay_url());
     let options = Options {
         alpns: vec![openvault_net::sync::ALPN.to_vec()],
+        relay: relay.clone().map(Relay::new),
         ..Options::default()
     };
     let (node, mut events) = Node::start(&seed, options).await?;
@@ -87,12 +91,21 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
 
     let vault = Arc::new(Mutex::new(vault));
     let shared = Arc::new(Shared {
-        engine: Engine::new(node.clone(), vault.clone()),
+        engine: Engine::new(node.clone(), vault.clone(), relay),
         vault,
         admin_key: dir.join(ADMIN_KEY),
         node,
         version: version.to_owned(),
     });
+    if let Some(address) = coordinator {
+        info!("using the coordinator and relay at {}", address.hostname);
+        tokio::spawn(coordinator::keep(
+            address,
+            shared.node.clone(),
+            shared.vault.clone(),
+            shared.engine.clone(),
+        ));
+    }
     let mut terminate = signal(SignalKind::terminate())?;
     let result = loop {
         tokio::select! {

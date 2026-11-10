@@ -33,6 +33,11 @@ Each device runs one iroh endpoint (design §10):
   - Other iroh applications use their own service names, so they don't see OpenVault devices and OpenVault doesn't see them.
   - Devices that are members announce nothing besides their endpoint id and addresses. A joining device also announces its platform and name (join.md, finding the device).
 - mDNS queries go out every 5 seconds, plus a random delay that grows with the number of peers. A peer that stops answering expires after a few cycles.
+- **When mDNS stops.** swarm-discovery, under iroh's mDNS lookup, stops all of mDNS when one of its sockets fails: the device stops announcing itself and hears nobody. It happens, for instance, on a Mac whose service starts while macOS is still deciding whether it may use the local network. The only sign is a warning from swarm-discovery, so the service watches its log for it, whatever `OPENVAULT_LOG` shows. Then:
+  - The members it could see count as gone, since the stopped lookup can't say who leaves.
+  - After 5 seconds it starts a new lookup in place of the stopped one, and finds them again.
+  - If mDNS keeps stopping, the wait doubles each time, up to 5 minutes. Once mDNS has run for 10 minutes, the next wait is 5 seconds again.
+  - Each stop and each start is logged.
 - **Visible members.** A member is visible while mDNS has found an endpoint whose id is the transport key of a device in the log that isn't revoked. The service compares against the log when asked, so a change to the log needs no rescan.
 - Other OpenVault endpoints, from other vaults or joining devices, are never dialed.
 - The service logs each member that becomes visible or stops being visible, by its name (membership.md, names key). Other OpenVault endpoints are logged only at debug level (`OPENVAULT_LOG=debug`).
@@ -124,9 +129,11 @@ Each device runs one iroh endpoint (design §10):
 | Idle | One mDNS query every 5 seconds or more, each answered by every OpenVault device on the network: a few hundred bytes of multicast. No connections and no database reads. |
 | A command | One socket round trip, plus the same database reads as opening the vault directly, minus unlocking the keys. |
 | A change by another process | One extra read of the membership state, on the next request. |
+| mDNS that keeps stopping | A new lookup per wait: its sockets and one announcement. After the first few, at most one every 5 minutes. |
 
 **What to watch once it runs:**
 - mDNS packets per minute on the local network. They should stay flat as the vault grows.
+- "mDNS discovery stopped" in the service's log. Once, at startup, is a socket that wasn't ready. Again and again is a socket that keeps failing, and the device is invisible most of the time.
 - The service's resident memory. It holds one vault, the endpoint, and the 64 MiB Argon2id needs only while unlocking.
 
 ## Not in v1

@@ -17,6 +17,8 @@ openvault-crypto = { path = "../crypto" }
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "macros"] }
 tracing = "0.1"
+# For the layer that notices when mDNS stops (watch.rs).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

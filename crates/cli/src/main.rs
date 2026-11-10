@@ -916,17 +916,24 @@ fn find_device<'a>(devices: &'a [DeviceSummary], query: &str) -> Result<&'a Devi
 /// Runs the service in the foreground until Ctrl-C (service.md).
 #[cfg(unix)]
 fn service(home: &Home) -> Result<()> {
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Layer, fmt};
 
     home.require_vault()?;
     let keys = load_keys(&home.keys())?;
     let filter = EnvFilter::try_from_env("OPENVAULT_LOG").unwrap_or_else(|_| {
         EnvFilter::new("info,iroh=warn,iroh_mdns_address_lookup=warn,swarm_discovery=warn")
     });
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(filter)
-        .with_target(false)
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(io::stderr)
+                .with_target(false)
+                .with_filter(filter),
+        )
+        // Starts mDNS again when it stops, whatever OPENVAULT_LOG leaves out (service.md).
+        .with(openvault_net::discovery_watch())
         .init();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -1,6 +1,6 @@
 # Service spec, v1
 
-Status: draft, 2026-11-07. Implemented by `crates/net` (the endpoint and discovery) and `crates/service` (the service and its local API). Builds on [records.md](records.md), [membership.md](membership.md) and [keystore.md](keystore.md). Sync ([sync.md](sync.md)) and joining ([join.md](join.md)) run inside it once they are built. The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking) and [§14](../design.md#14-interfaces).
+Status: draft, 2026-11-07. Changed 2026-11-09: starting at login, and the status request. Implemented by `crates/net` (the endpoint and discovery), `crates/service` (the service and its local API) and `crates/cli` (starting at login). Builds on [records.md](records.md), [membership.md](membership.md) and [keystore.md](keystore.md). Sync ([sync.md](sync.md)) and joining ([join.md](join.md)) run inside it once they are built. The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking) and [§14](../design.md#14-interfaces).
 
 `openvault service` is the one process on a device that holds the vault open. It:
 - unlocks the device's keys once, so a passphrase is typed once per run rather than once per command;
@@ -14,7 +14,40 @@ All integers are big-endian.
 - `openvault service` runs in the foreground and logs to stderr. It stops on Ctrl-C or SIGTERM, and removes its socket as it goes.
 - It opens the vault as any command does: from the Secure Enclave, or after asking for the passphrase (keystore.md, passphrases).
 - One service runs per vault. It holds a lock on `service.lock` in the openvault directory while it runs, and a second service that can't take the lock exits. The operating system drops the lock when a service crashes, so a socket found while holding it is left over, and is replaced.
-- Starting it at login, as a LaunchAgent or a systemd user unit, comes later. The macOS app (M5) bundles it as a LaunchAgent.
+- `openvault service install` has the operating system start it at login instead (below). The macOS app (M5) will bundle it as a LaunchAgent of its own.
+
+## Starting at login
+
+`openvault service install` has the operating system start the service when the user logs in, and start it again if it stops. `openvault service uninstall` undoes that, and `openvault service status` says how things stand. It was written after the MacBook, the desktop and the mini each needed a definition written by hand to keep latem's builds working (design §18, progress).
+
+**install**
+- It refuses keys that need a passphrase, since nobody would be there to type it. It names two ways out: `openvault keys passphrase --remove` (keystore.md, changing the protection), or starting the service by hand.
+- The definition runs the binary that `install` was run from, by its absolute path. A binary in a cargo `target` directory changes with each build, so `install` warns about one.
+- `OPENVAULT_HOME`, when it's set, goes into the definition.
+- It stops if a service is already running that the operating system didn't start, such as one in a terminal. That one has to be stopped first.
+- Running it again is safe, and it's how a new build takes over: it writes the definition again and restarts the service.
+- It then waits up to 10 seconds for the socket to answer, and says whether it did.
+
+**macOS: a LaunchAgent.**
+- `~/Library/LaunchAgents/local.openvault.service.plist`, with `RunAtLoad`, `KeepAlive` and a `ThrottleInterval` of 30 seconds.
+- Output goes to `~/Library/Logs/openvault-service.log`.
+- It's loaded with `launchctl bootout` and then `bootstrap`, in the `gui/<uid>` domain. macOS can load a new file in that directory by itself, so a definition that's already loaded is restarted with `launchctl kickstart -k` instead.
+- macOS then shows a "Background Items Added" notice. It also asks, once, whether openvault may use the local network, and, with the firewall on, whether it may accept incoming connections.
+- A binary built with cargo is signed ad hoc, and macOS asks again for each new build. Until someone answers, mDNS stops and starts again (discovery).
+
+**Linux: a systemd user unit.**
+- `$XDG_CONFIG_HOME/systemd/user/openvault.service`, or `~/.config/systemd/user/openvault.service`, with `Restart=on-failure` and `RestartSec=30`, after `network-online.target`.
+- `install` runs `systemctl --user daemon-reload`, `enable` and `restart`.
+- Output goes to the journal: `journalctl --user -u openvault`.
+- Without lingering, a user's units start at login rather than at boot. `install` says so and shows `loginctl enable-linger <user>`. It doesn't run it, because it changes how the system starts.
+- Without a systemd user instance, as in some WSL setups, `install` fails and says so.
+
+**uninstall** stops the service and removes the definition. The vault is untouched.
+
+**status** says:
+- whether a definition is installed, and where;
+- whether launchd or systemd has the service running, and its process id;
+- whether the socket answers; if it does, the running service's version next to this binary's, and how many times mDNS has stopped since it started.
 
 **The store.** The service keeps one connection to the store and handles requests one at a time. Before each request it checks SQLite's `data_version`, which changes when another process has written. If it has changed, the service reloads the membership it keeps in memory. A command run while the service starts up, before the socket is there, therefore can't leave the service with a stale log.
 
@@ -75,6 +108,7 @@ Each device runs one iroh endpoint (design §10):
 | `0x0a` | review | device id (16) |
 | `0x0b` | revoke | device id (16) ‖ has phrase (u8) ‖ recovery phrase (str, only if has phrase is 1) |
 | `0x0c` | set scope | device id (16) ‖ collection (str) ‖ scope (u8, as in membership.md) ‖ has phrase (u8) ‖ recovery phrase (str, only if has phrase is 1) |
+| `0x0d` | status | — |
 
 - **set** writes every entry in one transaction, as `import-env` needs.
 - **folder** returns the current values under `folder/`, for `openvault run`.
@@ -83,6 +117,7 @@ Each device runs one iroh endpoint (design §10):
 - **review** returns what a device can read and what it wrote last, which `openvault devices revoke` shows before asking (sync.md, reviewing).
 - **revoke** revokes a device (sync.md, revoking and reducing scopes). It signs like create collection, and starts sessions as after a log entry.
 - **set scope** changes a device's scope on a collection, signed and followed by sessions in the same way. It fails before asking for a signature if the device already has that scope.
+- **status** returns the service's version, its process id, and how many times mDNS has stopped since it started (discovery). Only the service answers it. A service older than 0.2.2 answers with an error, which `openvault service status` reports as an older build.
 
 ### Responses
 
@@ -98,6 +133,7 @@ Each device runs one iroh endpoint (design §10):
 | `0x87` | review | count (u32) ‖ collections it reads: name (str) ‖ count (u32) ‖ secret names (str); then count (u32) ‖ collections: name (str) ‖ count (u32) ‖ entries it wrote last: name (str) ‖ deleted (u8) |
 | `0x88` | revoked | count (u32) ‖ collections that got a new key (str) ‖ entries written again (u32) |
 | `0x89` | scope set | new key (u8) ‖ keys granted (u32) ‖ entries written again (u32) |
+| `0x8a` | status | version (str) ‖ process id (u32) ‖ mDNS stops (u32) |
 | `0x7f` | error | code (u8) ‖ message (str) |
 
 **Device flags.**
@@ -138,7 +174,7 @@ Each device runs one iroh endpoint (design §10):
 
 ## Not in v1
 
-- Starting at login (LaunchAgent, systemd user unit).
+- Starting at login on Windows, and starting at boot without lingering on Linux.
 - Windows named pipes.
 - The web UI on `localhost` (M4).
 - Several vaults per device.

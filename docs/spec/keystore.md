@@ -4,6 +4,8 @@ Status: draft, 2026-11-04. Implemented by `crates/keystore`. Builds on [crypto.m
 
 Changed 2026-11-07: passphrase-protected key files (kind `0x03`), the default where there's no Secure Enclave.
 
+Changed 2026-11-09: a key file can gain, change or lose its passphrase.
+
 All integers are big-endian.
 
 ## Backends
@@ -16,7 +18,9 @@ A device keeps its keys in one of three backends:
 | Signing | Ed25519, in the key file | Ed25519, sealed in the key file | P-256, in the Secure Enclave |
 | Local key ([records.md](records.md#local-store)) | In the key file | Sealed in the key file | In the key file, wrapped to the Secure Enclave wrapping key |
 
-`openvault init` uses the Secure Enclave when the Mac has one, and a passphrase otherwise: Linux, Windows and WSL until TPM support (design §12). Software keys are for a device that must open the vault with nobody there to type a passphrase, such as a container. A device's backend is fixed when its keys are created. Moving to another backend means new device keys.
+`openvault init` uses the Secure Enclave when the Mac has one, and a passphrase otherwise: Linux, Windows and WSL until TPM support (design §12). Software keys are for a device that must open the vault with nobody there to type a passphrase, such as a container, or a build machine whose service starts at boot (service.md, starting at login).
+
+Secure Enclave keys never leave the Secure Enclave, so moving onto it or off it means new device keys. A key file can gain, change or lose its passphrase, though, since kinds `0x01` and `0x03` hold the same keys (changing the protection, below).
 
 | Threat | Software | Passphrase | Secure Enclave |
 | --- | --- | --- | --- |
@@ -84,6 +88,27 @@ Creating a key file writes it and then loads it back. A key that won't restore i
 
 **Forgetting it.** A forgotten passphrase can't be recovered, so the device is treated as lost. Its collections are still on the other devices and wrapped to the recovery key. It joins again as a new device, and the old one is revoked.
 
+## Changing the protection
+
+- `openvault keys` says how this device's keys are kept: in the Secure Enclave, or in a key file with or without a passphrase.
+- `openvault keys passphrase` gives a key file a passphrase, or changes the one it has. It asks for the current passphrase if there is one, then for the new one twice, by the rules for choosing one.
+- `openvault keys passphrase --remove` takes the passphrase away. It asks for the current one, says that anyone who copies the key file will then have the keys, and asks before it goes on.
+- Secure Enclave keys are refused, with the reason.
+
+**The same keys.** Only the protection changes. The device keeps its id and its transport key, nothing goes into the membership log, and the other devices see no difference.
+
+**Writing.**
+1. A `keys.new` left over from a crash is removed first: nothing reads it.
+2. The new file is written as `keys.new`, created only if absent, with mode 0600, and synced.
+3. It's loaded back with the new protection, to prove it opens to the same keys.
+4. A rename puts it in place of `keys`, and the directory is synced.
+
+If a step fails, `keys` is as it was.
+
+**Copies made earlier.** A passphrase protects the file from the moment it's added. A copy of the old file, in a backup for instance, still opens without one, and the old file's blocks can stay on the disk until they're reused. `openvault keys passphrase` says so when it adds one.
+
+**A running service** keeps the keys it unlocked, so it needn't restart. A service that the operating system starts can't type a passphrase, though (service.md, starting at login). Adding one where the service is installed says that the service won't start again by itself.
+
 ## Secure Enclave
 
 **Keys.**
@@ -144,7 +169,6 @@ It has its own file because only an administering device has one, and so the key
 
 ## Not in v1
 
-- Changing a key file's passphrase. Until then, a device that needs a new passphrase joins again as a new device.
 - TPM and Windows Hello.
 - Adding an admin key to a vault created without one, or making another device an admin. Both are an add_admin entry (membership.md), signed separately from a join (join.md, not in v1).
 - The transport key is derived from the local key (records.md, local store), so the key file doesn't hold one.

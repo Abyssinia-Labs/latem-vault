@@ -27,5 +27,6 @@ zeroize = "1.9"
 [dev-dependencies]
 tempfile = "3.27.0"
 
-[target.'cfg(unix)'.dev-dependencies]
+# The user id, for launchd's gui/<uid> domain and loginctl (login.rs).
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.191"

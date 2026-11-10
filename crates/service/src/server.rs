@@ -28,6 +28,7 @@ struct Shared {
     admin_key: PathBuf,
     node: Arc<Node>,
     engine: Arc<Engine>,
+    version: String,
 }
 
 /// What a request changed, which sync passes on.
@@ -90,6 +91,7 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
         vault,
         admin_key: dir.join(ADMIN_KEY),
         node,
+        version: version.to_owned(),
     });
     let mut terminate = signal(SignalKind::terminate())?;
     let result = loop {
@@ -181,6 +183,14 @@ async fn serve(shared: &Arc<Shared>, mut stream: UnixStream) -> Result<()> {
 }
 
 fn answer(shared: &Shared, request: Request) -> Response {
+    if let Request::Status = request {
+        return Response::Status {
+            version: shared.version.clone(),
+            pid: std::process::id(),
+            // One node per service process, so the process's count is the service's.
+            mdns_stops: u32::try_from(openvault_net::discovery_stops()).unwrap_or(u32::MAX),
+        };
+    }
     let change = match &request {
         Request::Set { collection, .. } | Request::Delete { collection, .. } => {
             Some(Change::Records(collection.clone()))

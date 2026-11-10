@@ -62,6 +62,8 @@ pub enum Request {
         /// Needed only when this device has no admin key.
         recovery_phrase: Option<Zeroizing<String>>,
     },
+    /// Which build the service is and how it's doing. Only the service answers it.
+    Status,
 }
 
 #[derive(Debug)]
@@ -87,6 +89,13 @@ pub enum Response {
         granted: u32,
         /// Entries the device wrote last, written again under the new key.
         carried: u32,
+    },
+    Status {
+        /// The service's version, as `openvault --version` prints it.
+        version: String,
+        pid: u32,
+        /// How many times mDNS has stopped since the service started.
+        mdns_stops: u32,
     },
     Error {
         code: ErrorCode,
@@ -214,6 +223,7 @@ impl Request {
                 w.u8(scope.code());
                 w.phrase(recovery_phrase.as_deref().map(String::as_str));
             }),
+            Self::Status => frame(0x0d, |_| {}),
         }
     }
 
@@ -263,6 +273,7 @@ impl Request {
                 scope: Scope::from_code(r.u8()?).ok_or(DecodeError::Bad("scope"))?,
                 recovery_phrase: r.phrase()?,
             },
+            0x0d => Self::Status,
             _ => return Err(DecodeError::Bad("unknown request")),
         };
         r.finish()?;
@@ -356,6 +367,15 @@ impl Response {
                 w.u8((*rotated).into());
                 w.put(&granted.to_be_bytes());
                 w.put(&carried.to_be_bytes());
+            }),
+            Self::Status {
+                version,
+                pid,
+                mdns_stops,
+            } => frame(0x8a, |w| {
+                w.str(version);
+                w.put(&pid.to_be_bytes());
+                w.put(&mdns_stops.to_be_bytes());
             }),
             Self::Error { code, message } => frame(0x7f, |w| {
                 w.u8(match code {
@@ -475,6 +495,11 @@ impl Response {
                 },
                 granted: u32::from_be_bytes(r.take(4)?.try_into().expect("took 4 bytes")),
                 carried: u32::from_be_bytes(r.take(4)?.try_into().expect("took 4 bytes")),
+            },
+            0x8a => Self::Status {
+                version: r.string()?,
+                pid: u32::from_be_bytes(r.take(4)?.try_into().expect("took 4 bytes")),
+                mdns_stops: u32::from_be_bytes(r.take(4)?.try_into().expect("took 4 bytes")),
             },
             0x7f => Self::Error {
                 code: match r.u8()? {
@@ -882,6 +907,23 @@ mod tests {
             panic!("not revoked");
         };
         assert_eq!((rotated, carried), (vec!["latem".to_owned()], 3));
+        let Response::Status {
+            version,
+            pid: 4242,
+            mdns_stops: 2,
+        } = round_trip_response(&Response::Status {
+            version: "0.2.2 (5664970)".into(),
+            pid: 4242,
+            mdns_stops: 2,
+        })
+        else {
+            panic!("not a status");
+        };
+        assert_eq!(version, "0.2.2 (5664970)");
+        assert!(matches!(
+            round_trip_request(&Request::Status),
+            Request::Status
+        ));
 
         let Response::Error { code, message } = round_trip_response(&Response::Error {
             code: ErrorCode::RecoveryPhraseNeeded,

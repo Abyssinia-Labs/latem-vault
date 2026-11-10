@@ -89,6 +89,19 @@ impl Keys {
         file::load(path, Some(passphrase))
     }
 
+    /// Writes the keys in the key file at `path` again, sealed with `new`, or with no passphrase
+    /// when `new` is `None`, in place of the file (keystore.md, changing the protection). They
+    /// are the same keys, so the device stays the same device. `current` opens the file if it has
+    /// a passphrase now, and `new` must pass [`check_passphrase`]. If anything fails, the file is
+    /// as it was. Secure Enclave keys give [`Error::InSecureEnclave`].
+    pub fn change_passphrase(
+        path: &Path,
+        current: Option<&str>,
+        new: Option<&str>,
+    ) -> Result<Self> {
+        file::change_passphrase(path, current, new)
+    }
+
     pub fn backend(&self) -> Backend {
         match self {
             Self::Software(_) => Backend::Software,
@@ -111,6 +124,12 @@ impl Keys {
 /// 1024 bytes.
 pub fn check_passphrase(passphrase: &str) -> Result<()> {
     file::check_passphrase(passphrase)
+}
+
+/// How the keys in the key file at `path` are kept, without opening them or asking for a
+/// passphrase.
+pub fn backend_of(path: &Path) -> Result<Backend> {
+    file::backend(path)
 }
 
 impl std::fmt::Debug for Keys {
@@ -165,6 +184,11 @@ pub enum Error {
     Passphrase(&'static str),
     #[error("{0:?} keys aren't available on this device")]
     Unavailable(Backend),
+    #[error(
+        "this device's keys are in the Secure Enclave, which they never leave, so they have no \
+         passphrase; moving them off it means joining again as a new device"
+    )]
+    InSecureEnclave,
     #[error("Secure Enclave error: {0}")]
     SecureEnclave(String),
 }
@@ -362,6 +386,93 @@ mod tests {
         let software = dir.path().join("software");
         Keys::create(&software, Backend::Software).unwrap();
         assert_eq!(load(&software).backend(), Backend::Software);
+    }
+
+    /// The same keys through every change of protection (keystore.md, changing the protection).
+    #[test]
+    fn passphrase_can_be_added_changed_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        let staged = dir.path().join("keys.new");
+        let created = Keys::create(&path, Backend::Software).unwrap();
+        let same = |keys: &Keys| {
+            assert_eq!(keys.wrap_key(), created.wrap_key());
+            assert_eq!(keys.verifying_key(), created.verifying_key());
+            assert_eq!(keys.local_key().as_bytes(), created.local_key().as_bytes());
+        };
+        assert_eq!(backend_of(&path).unwrap(), Backend::Software);
+
+        let added = Keys::change_passphrase(&path, None, Some(PASSPHRASE)).unwrap();
+        assert_eq!(added.backend(), Backend::Passphrase);
+        same(&added);
+        assert_eq!(backend_of(&path).unwrap(), Backend::Passphrase);
+        assert!(matches!(Keys::load(&path), Err(Error::NeedsPassphrase)));
+        same(&load(&path));
+
+        let other = "a different passphrase";
+        let changed = Keys::change_passphrase(&path, Some(PASSPHRASE), Some(other)).unwrap();
+        same(&changed);
+        assert!(matches!(
+            Keys::load_with_passphrase(&path, PASSPHRASE),
+            Err(Error::WrongPassphrase)
+        ));
+        same(&Keys::load_with_passphrase(&path, other).unwrap());
+
+        let removed = Keys::change_passphrase(&path, Some(other), None).unwrap();
+        assert_eq!(removed.backend(), Backend::Software);
+        same(&removed);
+        assert_eq!(backend_of(&path).unwrap(), Backend::Software);
+        same(&Keys::load(&path).unwrap());
+
+        assert!(!staged.exists());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// A change that can't be made leaves the key file as it was.
+    #[test]
+    fn changing_the_passphrase_fails_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        let staged = dir.path().join("keys.new");
+        create(&path, Backend::Passphrase);
+        let before = fs::read(&path).unwrap();
+
+        assert!(matches!(
+            Keys::change_passphrase(&path, None, None),
+            Err(Error::NeedsPassphrase)
+        ));
+        assert!(matches!(
+            Keys::change_passphrase(&path, Some("not the passphrase"), None),
+            Err(Error::WrongPassphrase)
+        ));
+        assert!(matches!(
+            Keys::change_passphrase(&path, Some(PASSPHRASE), Some("too short")),
+            Err(Error::Passphrase(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!staged.exists());
+
+        // A keys.new left by a crash doesn't stop the next change.
+        fs::write(&staged, b"half written").unwrap();
+        Keys::change_passphrase(&path, Some(PASSPHRASE), None).unwrap();
+        assert!(!staged.exists());
+        assert_eq!(backend_of(&path).unwrap(), Backend::Software);
+
+        if Backend::SecureEnclave.is_available() {
+            let enclave = dir.path().join("enclave");
+            Keys::create(&enclave, Backend::SecureEnclave).unwrap();
+            let before = fs::read(&enclave).unwrap();
+            assert!(matches!(
+                Keys::change_passphrase(&enclave, None, Some(PASSPHRASE)),
+                Err(Error::InSecureEnclave)
+            ));
+            assert_eq!(fs::read(&enclave).unwrap(), before);
+            assert_eq!(backend_of(&enclave).unwrap(), Backend::SecureEnclave);
+        }
     }
 
     #[test]

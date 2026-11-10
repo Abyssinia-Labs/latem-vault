@@ -250,7 +250,8 @@ openvault run --collection <c> --env <e> [--prefix <p>] -- <command>   variables
 openvault import-env <file> --collection <c> --env <e> [--var <name>]...   a NAME=value file, such as latem's secrets.env
 openvault import <folder> --collection <c>
 openvault open <collection>/<path>
-openvault service
+openvault keys [passphrase [--remove]]          how this device's keys are kept; give a key file a passphrase, change it or remove it
+openvault service [install|uninstall|status]    run the service, or have the system start it at login
 openvault grandfather
 ```
 
@@ -268,7 +269,7 @@ To confirm with the latem session.
 - **Variables come from OpenVault,** so every machine sees the same values and amendment A68's mismatches disappear.
 - **latem-cloud keeps INV-2.** It still sees only names, and can show "machine X lacks collection Y" by name.
 - **Onboarding.** latem's first-run "copy from which machine?" becomes `openvault join` plus scope approval.
-- **Until then:** `latem secrets copy --to HOST` remains the stopgap until milestone M2 ships.
+- **Before M2,** `latem secrets copy --to HOST` was the stopgap.
 - **From M1,** latem can take its secrets from OpenVault without a new store. Bring them in with `openvault import-env ~/.latem/secrets.env --collection latem --env <e>`, then start latem with `openvault run --collection latem --env <e> --prefix LATEM_SECRET_ -- latem …`. latem's environment provider reads `LATEM_SECRET_<NAME>` before its other stores.
 
 ## 16. Repositories and stack
@@ -368,14 +369,20 @@ The hosted product's plans and running costs are documented in `openvault-cloud`
 | M0 Spec | Threat model, protocol spec, ADRs for §19 | Crypto and wire formats are written down |
 | M1 One device | Store, collections, secrets and variables, CLI, `openvault run`, Secure Enclave and file keystores | `~/.latem/secrets.env` can be replaced on the MacBook |
 | M2 LAN | PAKE join without a coordinator, membership log, admin Touch ID, recovery key, peer sync over iroh, latem store | The Android build runs on the desktop with secrets from the MacBook |
-
-**Progress.** M1 was done on 2026-11-07. The MacBook's vault took latem's secrets from the mini, streamed over ssh into `openvault import-env -`, because latem's `secrets.env` files are on the mini and the desktop, not the MacBook. Moving those two machines off `secrets.env` comes with M2's sync. The membership log, admin Touch ID and recovery key from M2 were built during M1. On 2026-11-08 the desktop joined the MacBook's vault with a 6-digit code and synced latem's secrets over the LAN. Revoking a device followed the same day. What's left of M2 is latem's store.
 | M3 Grandfather | Coordinator, relay, `hold` storage, Docker image | The MacBook reaches the mini from outside the house |
 | M4 Files | Chunked encrypted files, import, `open` and `get`, on-demand fetch, local web UI | A signing keystore and a documents folder sync and open on every device |
 | M5 Apple apps | macOS app with File Provider; iOS app with Face ID approvals | Joins are approved from a notification |
 | M6 Hosted | `openvault-cloud`, multi-tenant coordinator, fleet, billing, push relay | A new user enrolls two devices with no port forwarding |
 
 Later: native Windows, Android, a Linux FUSE mount, a hardware security key for recovery, and an external security audit before the hosted launch.
+
+**Progress.**
+- **M1 was done on 2026-11-07.** The MacBook's vault took latem's secrets from the mini, streamed over ssh into `openvault import-env -`, because latem's `secrets.env` files are on the mini and the desktop, not the MacBook. The membership log, admin Touch ID and recovery key from M2 were built during M1.
+- **M2 was done on 2026-11-09.**
+  - On 2026-11-08 the desktop joined the MacBook's vault with a 6-digit code and synced latem's secrets over the LAN. Revoking a device followed the same day.
+  - latem reads a repository's secrets from OpenVault first since latem#60 (its A86). The secrets moved from the one `latem` collection to one collection per repository (§15).
+  - tsedal's Android preview build ran on the desktop, signed with the vault's keystore, and uploaded to Play. The mini joined too, and its iOS build signed and uploaded to TestFlight the same way.
+  - Each machine runs `openvault service` from a LaunchAgent or a systemd user unit, written by hand for now.
 
 ## 19. Open decisions
 

@@ -7,6 +7,9 @@
 
 mod env_file;
 mod join;
+mod keys;
+#[cfg(unix)]
+mod login;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -140,8 +143,18 @@ enum Command {
         scope: ScopeArg,
     },
     /// Hold the vault open, find this vault's other devices on the local network, and answer
-    /// other commands, so a passphrase is typed once. Runs until Ctrl-C.
-    Service,
+    /// other commands, so a passphrase is typed once. Runs until Ctrl-C, or have the system start
+    /// it at login with `install`.
+    Service {
+        #[command(subcommand)]
+        action: Option<ServiceAction>,
+    },
+    /// Say how this device's keys are kept: in the Secure Enclave, or in a key file with or
+    /// without a passphrase.
+    Keys {
+        #[command(subcommand)]
+        action: Option<KeysAction>,
+    },
     /// Import a NAME=value file, such as latem's secrets.env, into a folder. Every name is
     /// imported as a secret unless given with --var.
     ImportEnv {
@@ -186,6 +199,28 @@ enum DevicesAction {
     Revoke {
         /// The device's name, or the start of its id
         device: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Have the system start the service at login, and again if it stops: a LaunchAgent on
+    /// macOS, a systemd user unit on Linux. Run it again after installing a new build.
+    Install,
+    /// Stop the service and remove what `install` wrote. The vault is untouched.
+    Uninstall,
+    /// Whether the service is installed and running, and which build it runs.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum KeysAction {
+    /// Give the key file a passphrase, or change the one it has. The keys stay the same, so the
+    /// device does too.
+    Passphrase {
+        /// Take the passphrase away, so the keys open with nobody there to type it
+        #[arg(long)]
+        remove: bool,
     },
 }
 
@@ -258,7 +293,17 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 ScopeArg::Write => Scope::Write,
             },
         )?,
-        Command::Service => service(&home)?,
+        Command::Service { action: None } => service(&home)?,
+        Command::Service {
+            action: Some(action),
+        } => service_action(&home, action)?,
+        Command::Keys { action: None } => keys::show(&home)?,
+        Command::Keys {
+            action: Some(KeysAction::Passphrase { remove: false }),
+        } => keys::set_passphrase(&home)?,
+        Command::Keys {
+            action: Some(KeysAction::Passphrase { remove: true }),
+        } => keys::remove_passphrase(&home)?,
         Command::Collections { action: None } => {
             for name in home.access()?.collections()? {
                 println!("{name}");
@@ -943,6 +988,21 @@ fn service(home: &Home) -> Result<()> {
 
 #[cfg(not(unix))]
 fn service(_: &Home) -> Result<()> {
+    bail!("`openvault service` doesn't run on Windows yet")
+}
+
+/// Starting the service at login (service.md, starting at login).
+#[cfg(unix)]
+fn service_action(home: &Home, action: ServiceAction) -> Result<()> {
+    match action {
+        ServiceAction::Install => login::install(home),
+        ServiceAction::Uninstall => login::uninstall(),
+        ServiceAction::Status => login::status(home),
+    }
+}
+
+#[cfg(not(unix))]
+fn service_action(_: &Home, _: ServiceAction) -> Result<()> {
     bail!("`openvault service` doesn't run on Windows yet")
 }
 

@@ -159,6 +159,8 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
                 carried: u32::try_from(change.carried).unwrap_or(u32::MAX),
             }
         }
+        // The service answers it before a request gets here.
+        Request::Status => bail!("only a running service answers status"),
     })
 }
 

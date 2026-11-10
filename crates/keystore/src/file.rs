@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use openvault_core::SoftwareKeys;
 use openvault_crypto::passphrase::SALT_LEN;
@@ -72,6 +72,86 @@ pub(crate) fn create_with_passphrase(path: &Path, passphrase: &str) -> Result<Ke
 /// Loads the keys in `path`, using `passphrase` if the file is protected by one.
 pub(crate) fn load(path: &Path, passphrase: Option<&str>) -> Result<Keys> {
     decode(&read_private(path)?, passphrase)
+}
+
+/// How the keys in `path` are kept, read from the file's kind without opening the keys.
+pub(crate) fn backend(path: &Path) -> Result<Backend> {
+    let contents = read_private(path)?;
+    let body = contents
+        .strip_prefix(MAGIC)
+        .ok_or(Error::Format("unknown format"))?;
+    match body.first() {
+        Some(&KIND_SOFTWARE) => Ok(Backend::Software),
+        Some(&KIND_PASSPHRASE) => Ok(Backend::Passphrase),
+        Some(&KIND_SECURE_ENCLAVE) => Ok(Backend::SecureEnclave),
+        Some(_) => Err(Error::Format("unknown key kind")),
+        None => Err(Error::Format("truncated")),
+    }
+}
+
+/// Writes the keys in `path` again, sealed with `new` or with no passphrase, in place of the
+/// file (keystore.md, changing the protection). `current` opens the file if it has a passphrase.
+pub(crate) fn change_passphrase(
+    path: &Path,
+    current: Option<&str>,
+    new: Option<&str>,
+) -> Result<Keys> {
+    let keys = match load(path, current)? {
+        Keys::Software(keys) | Keys::Passphrase(keys) => keys,
+        #[cfg(target_os = "macos")]
+        Keys::SecureEnclave(_) => return Err(Error::InSecureEnclave),
+    };
+    let contents = match new {
+        Some(passphrase) => {
+            check_passphrase(passphrase)?;
+            Zeroizing::new(encode_passphrase(&keys, passphrase)?)
+        }
+        None => encode_software(&keys),
+    };
+
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".new");
+    let staged = PathBuf::from(staged);
+    // Left over from a crash; nothing reads it.
+    match fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    write_new(&staged, &contents)?;
+    // Loading it back proves it opens, and to the same keys, before it replaces the old file.
+    let loaded = match load(&staged, new) {
+        Ok(Keys::Software(loaded) | Keys::Passphrase(loaded))
+            if encode_software_body(&loaded) == encode_software_body(&keys) =>
+        {
+            loaded
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(&staged);
+            return Err(Error::Format(
+                "the new key file doesn't open to the same keys",
+            ));
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&staged);
+            return Err(e);
+        }
+    };
+    fs::rename(&staged, path)?;
+    // The rename is in the directory, which has to reach the disk too.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(match new {
+        Some(_) => Keys::Passphrase(loaded),
+        None => Keys::Software(loaded),
+    })
 }
 
 pub(crate) fn check_passphrase(passphrase: &str) -> Result<()> {

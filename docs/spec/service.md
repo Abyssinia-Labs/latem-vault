@@ -1,6 +1,6 @@
 # Service spec, v1
 
-Status: draft, 2026-11-07. Changed 2026-11-09: starting at login, and the status request. Implemented by `crates/net` (the endpoint and discovery), `crates/service` (the service and its local API) and `crates/cli` (starting at login). Builds on [records.md](records.md), [membership.md](membership.md) and [keystore.md](keystore.md). Sync ([sync.md](sync.md)) and joining ([join.md](join.md)) run inside it once they are built. The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking) and [§14](../design.md#14-interfaces).
+Status: draft, 2026-11-07. Changed 2026-11-09: starting at login, and the status request. Changed 2026-11-11: `--log`, and the Mac app's LaunchAgent. Implemented by `crates/net` (the endpoint and discovery), `crates/service` (the service and its local API) and `crates/cli` (starting at login). Builds on [records.md](records.md), [membership.md](membership.md) and [keystore.md](keystore.md). Sync ([sync.md](sync.md)) and joining ([join.md](join.md)) run inside it once they are built. The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking) and [§14](../design.md#14-interfaces).
 
 `openvault service` is the one process on a device that holds the vault open. It:
 - unlocks the device's keys once, so a passphrase is typed once per run rather than once per command;
@@ -12,9 +12,10 @@ All integers are big-endian.
 ## Running it
 
 - `openvault service` runs in the foreground and logs to stderr. It stops on Ctrl-C or SIGTERM, and removes its socket as it goes.
+- `--log FILE` appends stdout and stderr to FILE instead, from before the vault is opened, so an error at startup lands there too. A leading `~/` is the home directory, for a LaunchAgent bundled in an app, which can't name it.
 - It opens the vault as any command does: from the Secure Enclave, or after asking for the passphrase (keystore.md, passphrases).
 - One service runs per vault. It holds a lock on `service.lock` in the openvault directory while it runs, and a second service that can't take the lock exits. The operating system drops the lock when a service crashes, so a socket found while holding it is left over, and is replaced.
-- `openvault service install` has the operating system start it at login instead (below). The macOS app (M5) will bundle it as a LaunchAgent of its own.
+- `openvault service install` has the operating system start it at login instead (below), and so does the Mac app, with a LaunchAgent of its own.
 
 ## Starting at login
 
@@ -43,6 +44,13 @@ All integers are big-endian.
 - Without a systemd user instance, as in some WSL setups, `install` fails and says so.
 
 **uninstall** stops the service and removes the definition. The vault is untouched.
+
+**The Mac app** bundles this binary and starts it with a LaunchAgent of its own, in place of `install`'s (M5, `openvault-apple`):
+- The agent, `com.abyssinialabs.openvault.service`, is in the app bundle and registered with `SMAppService`. It runs `Contents/Helpers/openvault service --log ~/Library/Logs/openvault-service.log`, with `RunAtLoad`, `KeepAlive` and a `ThrottleInterval` of 30 seconds, as `install`'s does.
+- The app registers it only for a vault whose keys need no passphrase. It asks the library first (`deviceHome`: whether there's a vault, and how its keys are kept).
+- Before registering, it runs the bundled `openvault service uninstall` if `install`'s definition is there, so that two agents don't start two services for one vault.
+- The binary is signed with the app's Developer ID, so macOS keeps one answer to its local network question across builds.
+- The CLI knows the app's agent by its label. While launchd has it loaded, `install` refuses and names the switch in Login Items that turns it off. `status` says the app starts the service, and that updating the app moves it onto a new build. `uninstall` says the app starts it rather than that nothing was installed.
 
 **status** says:
 - whether a definition is installed, and where;

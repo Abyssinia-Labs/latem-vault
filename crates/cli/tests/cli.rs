@@ -642,6 +642,25 @@ impl Drop for Service {
 
 #[cfg(unix)]
 #[test]
+fn the_service_can_log_to_a_file() {
+    let device = Device::empty();
+    // Even the error before the service starts goes to the file, and `~/` is HOME.
+    let output = device
+        .command(&["service", "--log", "~/service.log"])
+        .env("HOME", device.home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let log = std::fs::read_to_string(device.home.path().join("service.log")).unwrap();
+    assert!(log.contains("no vault in"), "{log}");
+
+    let error = device.fails(&["service", "--log", "service.log", "status"]);
+    assert!(error.contains("cannot be used with"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
 fn commands_go_through_the_service() {
     use std::os::unix::fs::PermissionsExt;
 

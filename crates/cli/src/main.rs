@@ -148,9 +148,14 @@ enum Command {
     /// Hold the vault open, find this vault's other devices on the local network, and answer
     /// other commands, so a passphrase is typed once. Runs until Ctrl-C, or have the system start
     /// it at login with `install`.
+    #[command(args_conflicts_with_subcommands = true)]
     Service {
         #[command(subcommand)]
         action: Option<ServiceAction>,
+        /// Append the log to FILE instead of writing it to stderr. A leading `~/` is the home
+        /// directory, for a LaunchAgent that can't name it.
+        #[arg(long, value_name = "FILE")]
+        log: Option<PathBuf>,
     },
     /// Say how this device's keys are kept: in the Secure Enclave, or in a key file with or
     /// without a passphrase.
@@ -318,9 +323,10 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 ScopeArg::Write => Scope::Write,
             },
         )?,
-        Command::Service { action: None } => service(&home)?,
+        Command::Service { action: None, log } => service(&home, log.as_deref())?,
         Command::Service {
             action: Some(action),
+            ..
         } => service_action(&home, action)?,
         #[cfg(feature = "coordinator")]
         Command::Coordinator { action: None } => grandfather::show(&home)?,
@@ -997,7 +1003,10 @@ fn find_device<'a>(devices: &'a [DeviceSummary], query: &str) -> Result<&'a Devi
 
 /// Runs the service in the foreground until Ctrl-C (service.md).
 #[cfg(unix)]
-fn service(home: &Home) -> Result<()> {
+fn service(home: &Home, log: Option<&Path>) -> Result<()> {
+    if let Some(file) = log {
+        log_to(file)?;
+    }
     home.require_vault()?;
     let keys = load_keys(&home.keys())?;
     log::to_stderr(
@@ -1009,8 +1018,35 @@ fn service(home: &Home) -> Result<()> {
         .block_on(openvault_service::run(&home.0, keys, VERSION))
 }
 
+/// Points stdout and stderr at the end of `file`, so whatever the service prints goes there,
+/// errors before its log starts included (service.md, running it).
+#[cfg(unix)]
+fn log_to(file: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let file = match file.strip_prefix("~") {
+        Ok(rest) if file.starts_with("~/") => std::env::home_dir()
+            .context("can't find your home directory for --log")?
+            .join(rest),
+        _ => file.to_owned(),
+    };
+    let opened = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+        .with_context(|| format!("can't open {} for the log", file.display()))?;
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: both descriptors are open; dup2 replaces the second with a copy of the first.
+        if unsafe { libc::dup2(opened.as_raw_fd(), fd) } == -1 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("can't log to {}", file.display()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
-fn service(_: &Home) -> Result<()> {
+fn service(_: &Home, _: Option<&Path>) -> Result<()> {
     bail!("`openvault service` doesn't run on Windows yet")
 }
 

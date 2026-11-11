@@ -18,6 +18,9 @@ use crate::{Home, VERSION};
 
 /// The LaunchAgent's label, which also names its file.
 const LABEL: &str = "local.openvault.service";
+/// The Mac app's own LaunchAgent, which starts the bundled binary instead (service.md, the Mac
+/// app).
+const APP_LABEL: &str = "com.abyssinialabs.openvault.service";
 /// How long `install` waits for the new service to answer.
 const STARTING: Duration = Duration::from_secs(10);
 
@@ -35,6 +38,13 @@ pub fn install(home: &Home) -> Result<()> {
             "this device's keys are protected by a passphrase, and a service the system starts \
              has nobody to type it. Either remove the passphrase with `openvault keys passphrase \
              --remove`, or start `openvault service` by hand after each restart"
+        );
+    }
+    if app_state()?.is_some() {
+        bail!(
+            "the OpenVault app starts the service on this Mac, with its own copy of openvault. \
+             To have this binary start it instead, turn OpenVault off in System Settings > \
+             General > Login Items first"
         );
     }
     let definition = Definition::for_this_binary()?;
@@ -88,9 +98,13 @@ pub fn uninstall() -> Result<()> {
     stop()?;
     match fs::remove_file(&path) {
         Ok(()) => println!("Removed {}. The vault is untouched.", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("The service wasn't installed.");
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match app_state()? {
+            Some(_) => println!(
+                "`openvault service install` didn't start the service here; the OpenVault app \
+                 does. Turn it off in System Settings > General > Login Items."
+            ),
+            None => println!("The service wasn't installed."),
+        },
         Err(e) => return Err(e).with_context(|| format!("can't remove {}", path.display())),
     }
     #[cfg(target_os = "linux")]
@@ -100,12 +114,24 @@ pub fn uninstall() -> Result<()> {
 
 pub fn status(home: &Home) -> Result<()> {
     let path = definition_path()?;
-    if path.exists() {
-        println!("Installed    {}", path.display());
-    } else {
-        println!("Installed    no");
+    let app = app_state()?;
+    let installed = path.exists();
+    match (installed, &app) {
+        (true, _) => println!("Installed    {}", path.display()),
+        (false, Some(_)) => println!("Installed    by the OpenVault app ({APP_LABEL})"),
+        (false, None) => println!("Installed    no"),
     }
-    let state = system_state()?;
+    if installed && app.is_some() {
+        println!(
+            "Both this definition and the OpenVault app start the service, and only one service \
+             runs. `openvault service uninstall` removes this one."
+        );
+    }
+    let by_app = !installed && app.is_some();
+    let state = match app {
+        Some(state) if by_app => state,
+        _ => system_state()?,
+    };
     let manager = if cfg!(target_os = "macos") {
         "launchd"
     } else {
@@ -127,7 +153,11 @@ pub fn status(home: &Home) -> Result<()> {
             println!("Service      openvault {version}, pid {pid}");
             println!("This binary  openvault {VERSION}");
             println!("mDNS         stopped {mdns_stops} times since the service started");
-            if version != VERSION {
+            if version != VERSION && by_app {
+                println!(
+                    "The service runs the OpenVault app's build. Updating the app moves it on."
+                );
+            } else if version != VERSION {
                 println!(
                     "The service runs another build. `openvault service install` moves it onto \
                      this one."
@@ -369,6 +399,19 @@ mod system {
         Ok(launchd_state(&String::from_utf8_lossy(&output.stdout)))
     }
 
+    /// The Mac app's agent, when launchd has it loaded: the app registered it, and it's on in
+    /// Login Items.
+    pub fn app_state() -> Result<Option<SystemState>> {
+        let output = run(
+            "launchctl",
+            &["print", &format!("{}/{APP_LABEL}", domain())],
+        )?;
+        Ok(output
+            .status
+            .success()
+            .then(|| launchd_state(&String::from_utf8_lossy(&output.stdout))))
+    }
+
     /// Loads the agent afresh, so it runs the definition just written.
     pub fn start(path: &Path) -> Result<()> {
         let path = utf8(path)?;
@@ -497,6 +540,11 @@ mod system {
         Ok(())
     }
 
+    /// There's no Mac app here.
+    pub fn app_state() -> Result<Option<SystemState>> {
+        Ok(None)
+    }
+
     pub fn where_it_logs() -> String {
         "Its log: `journalctl --user -u openvault`.".to_owned()
     }
@@ -544,6 +592,10 @@ mod system {
         unsupported()
     }
 
+    pub fn app_state() -> Result<Option<SystemState>> {
+        Ok(None)
+    }
+
     pub fn where_it_logs() -> String {
         String::new()
     }
@@ -555,7 +607,9 @@ mod system {
 
 #[cfg(target_os = "linux")]
 use system::systemctl;
-use system::{after_install, definition_path, render, start, stop, system_state, where_it_logs};
+use system::{
+    after_install, app_state, definition_path, render, start, stop, system_state, where_it_logs,
+};
 
 #[cfg(test)]
 mod tests {

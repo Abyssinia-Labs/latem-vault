@@ -29,6 +29,8 @@ final class Listener: WatchListener, @unchecked Sendable {
 }
 
 check(version() == expected, "version \(version()), not \(expected)")
+let found = try deviceHome(home: home)
+check(found.vault && found.keys == .software, "home \(found)")
 let client = try Client(home: home)
 check(client.isRunning(), "the service isn't running")
 let vault = try client.vault()

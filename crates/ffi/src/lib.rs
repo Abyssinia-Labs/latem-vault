@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use openvault_core::membership::Scope as CoreScope;
 use openvault_core::{DeviceId, Kind as CoreKind};
+use openvault_keystore::Backend;
 use openvault_service::api::{self, ErrorCode, Request, Response};
 use openvault_service::client;
 
@@ -245,6 +246,64 @@ pub trait WatchListener: Send + Sync {
     fn on_end(&self, error: Option<String>);
 }
 
+/// How a device's keys are kept (keystore.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum KeyStorage {
+    SecureEnclave,
+    Software,
+    /// Software keys behind a passphrase, which a service started at login has nobody to type.
+    Passphrase,
+}
+
+/// What an openvault directory holds, read from its files without the service.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DeviceHome {
+    pub path: String,
+    pub vault: bool,
+    /// `None` without a key file.
+    pub keys: Option<KeyStorage>,
+}
+
+/// The openvault directory `home`, or `OPENVAULT_HOME` or `~/.openvault` without one: whether it
+/// holds a vault, and how its keys are kept. An app checks this before starting the service,
+/// which can't run without a vault or ask for a passphrase.
+#[uniffi::export]
+pub fn device_home(home: Option<String>) -> Result<DeviceHome, OpenVaultError> {
+    let home = locate(home)?;
+    let keys = home.join(openvault_service::KEYS);
+    let keys = match keys.exists() {
+        false => None,
+        true => Some(
+            match openvault_keystore::backend_of(&keys).map_err(|e| failed(e.to_string()))? {
+                Backend::SecureEnclave => KeyStorage::SecureEnclave,
+                Backend::Software => KeyStorage::Software,
+                Backend::Passphrase => KeyStorage::Passphrase,
+            },
+        ),
+    };
+    Ok(DeviceHome {
+        path: home
+            .to_str()
+            .ok_or_else(|| failed(format!("{} isn't UTF-8", home.display())))?
+            .to_owned(),
+        vault: home.join(openvault_service::VAULT).exists(),
+        keys,
+    })
+}
+
+/// `home`, or `OPENVAULT_HOME`, or `~/.openvault`, as the CLI finds it.
+fn locate(home: Option<String>) -> Result<PathBuf, OpenVaultError> {
+    Ok(match home.map(PathBuf::from) {
+        Some(home) => home,
+        None => match std::env::var_os("OPENVAULT_HOME") {
+            Some(home) => PathBuf::from(home),
+            None => std::env::home_dir()
+                .ok_or_else(|| failed("can't find the home directory"))?
+                .join(".openvault"),
+        },
+    })
+}
+
 /// The service of the vault in one openvault directory.
 #[derive(uniffi::Object)]
 pub struct Client {
@@ -256,17 +315,8 @@ impl Client {
     /// The client for the vault in `home`, or in `OPENVAULT_HOME` or `~/.openvault` without one.
     #[uniffi::constructor]
     pub fn new(home: Option<String>) -> Result<Arc<Self>, OpenVaultError> {
-        let home = match home.map(PathBuf::from) {
-            Some(home) => home,
-            None => match std::env::var_os("OPENVAULT_HOME") {
-                Some(home) => PathBuf::from(home),
-                None => std::env::home_dir()
-                    .ok_or_else(|| failed("can't find the home directory"))?
-                    .join(".openvault"),
-            },
-        };
         Ok(Arc::new(Self {
-            socket: home.join(openvault_service::SOCKET),
+            socket: locate(home)?.join(openvault_service::SOCKET),
         }))
     }
 
@@ -784,6 +834,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!((genesis.device, genesis.collection), (None, None));
+    }
+
+    #[test]
+    fn an_empty_home_has_no_vault_or_keys() {
+        let home = std::env::temp_dir().join(format!("openvault-ffi-home-{}", std::process::id()));
+        let found = device_home(Some(home.to_string_lossy().into_owned())).unwrap();
+        assert_eq!((found.vault, found.keys), (false, None));
+        assert_eq!(found.path, home.to_string_lossy());
     }
 
     #[test]

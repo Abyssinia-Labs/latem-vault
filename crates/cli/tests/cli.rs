@@ -774,6 +774,18 @@ fn devices_lists_this_device() {
     assert!(devices.contains("Run `openvault service`"), "{devices}");
 }
 
+/// Reaching devices away from home is behind the `coordinator` feature, which is off by default.
+#[cfg(not(feature = "coordinator"))]
+#[test]
+fn the_coordinator_is_left_out() {
+    let device = Device::new();
+    for command in ["coordinator", "grandfather"] {
+        let error = device.fails(&[command]);
+        assert!(error.contains("unrecognized subcommand"), "{error}");
+    }
+}
+
+#[cfg(feature = "coordinator")]
 #[test]
 fn coordinator_is_set_per_device() {
     let device = Device::new();

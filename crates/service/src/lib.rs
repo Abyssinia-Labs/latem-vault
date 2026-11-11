@@ -7,7 +7,7 @@
 pub mod api;
 #[cfg(unix)]
 pub mod client;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "coordinator"))]
 mod coordinator;
 #[cfg(unix)]
 mod engine;

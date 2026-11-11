@@ -16,7 +16,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 openvault-core = { path = "../core" }
 openvault-crypto = { path = "../crypto" }
-openvault-grandfather = { path = "../grandfather" }
+openvault-grandfather = { path = "../grandfather", optional = true }
 openvault-keystore = { path = "../keystore" }
 openvault-net = { path = "../net" }
 openvault-service = { path = "../service" }
@@ -25,6 +25,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1.9"
+
+[features]
+# `openvault grandfather` and `openvault coordinator`, for reaching the vault's devices away from
+# home (coordinator.md). Off by default: devices find each other on the local network only.
+coordinator = ["dep:openvault-grandfather", "openvault-service/coordinator"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

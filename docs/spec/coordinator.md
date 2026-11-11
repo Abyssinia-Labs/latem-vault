@@ -1,6 +1,6 @@
 # Coordinator spec, v1
 
-Status: draft, 2026-11-10. Milestone M3 (design §18), built in stages: the relay and the log copy first, then addresses and presence, then joins away from home. Builds on [service.md](service.md), [sync.md](sync.md), [join.md](join.md) and [membership.md](membership.md). The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking), [§11](../design.md#11-coordinator) and [§12](../design.md#12-platforms).
+Status: draft, 2026-11-10. Milestone M3 (design §18), built in stages: the relay and the log copy first, then addresses and presence, then joins away from home. Stage 1 is built and paused: since 0.3.2 the grandfather, `openvault coordinator` and the service's use of them are compiled only with the cargo feature `coordinator` (`cargo install --locked --path crates/cli --features coordinator`), which is off by default. A service built without it ignores a `coordinator` file, with a warning. Builds on [service.md](service.md), [sync.md](sync.md), [join.md](join.md) and [membership.md](membership.md). The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking), [§11](../design.md#11-coordinator) and [§12](../design.md#12-platforms).
 
 The grandfather is the vault's always-on machine: the Mac mini here. `openvault grandfather` runs two things there for one vault:
 - **a relay**, which forwards traffic between devices that can't reach each other directly;

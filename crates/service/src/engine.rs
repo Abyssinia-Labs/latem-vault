@@ -186,6 +186,7 @@ impl Engine {
     }
 
     /// Where the coordinator's task hears of log changes.
+    #[cfg(feature = "coordinator")]
     pub(crate) fn set_coordinator(&self, notices: mpsc::Sender<Notice>) {
         self.state.lock().expect("poisoned").coordinator = Some(notices);
     }

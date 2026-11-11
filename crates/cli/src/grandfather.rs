@@ -1,7 +1,6 @@
 //! `openvault grandfather`, and `openvault coordinator [set|unset]` on devices
 //! (coordinator.md, running the grandfather and devices).
 
-use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -10,16 +9,8 @@ use anyhow::{Context as _, Result, bail};
 use openvault_core::{Vault, VaultId};
 use openvault_net::coord::{self, Address};
 use openvault_service::{COORDINATOR, configured_coordinator};
-use tracing::field::{Field, Visit};
-use tracing::{Event, Metadata};
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::layer::{Context, Filter};
 
 use crate::Home;
-
-/// Where iroh-relay logs each HTTPS connection that failed.
-const RELAY_HTTP: &str = "iroh_relay::server::http_server";
-const CONNECTION_FAILED: &str = "failed to handle connection";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -71,7 +62,7 @@ pub fn run(home: &Home, args: Args) -> Result<()> {
             cache: data.join(ACME),
         },
     };
-    crate::log_to_stderr("info,iroh=warn,iroh_relay=warn,rustls=warn,tokio_rustls_acme=warn");
+    crate::log::to_stderr("info,iroh=warn,iroh_relay=warn,rustls=warn,tokio_rustls_acme=warn");
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -104,45 +95,6 @@ pub fn run(_: &Home, _: Args) -> Result<()> {
     bail!("`openvault grandfather` doesn't run on Windows yet")
 }
 
-/// Leaves out iroh-relay's error for each HTTPS connection that failed, when `quiet`. On a public
-/// port they come from scanners and from handshakes that end early, Let's Encrypt's among them:
-/// dozens an hour, and none from the relay itself (coordinator.md, relay). `OPENVAULT_LOG` shows
-/// them again.
-pub(crate) struct QuietConnectionErrors {
-    pub(crate) quiet: bool,
-}
-
-impl<S> Filter<S> for QuietConnectionErrors {
-    fn enabled(&self, _: &Metadata<'_>, _: &Context<'_, S>) -> bool {
-        true
-    }
-
-    // It leaves the levels to the other filter.
-    fn max_level_hint(&self) -> Option<LevelFilter> {
-        Some(LevelFilter::TRACE)
-    }
-
-    fn event_enabled(&self, event: &Event<'_>, _: &Context<'_, S>) -> bool {
-        if !self.quiet || event.metadata().target() != RELAY_HTTP {
-            return true;
-        }
-        let mut message = Message(String::new());
-        event.record(&mut message);
-        message.0 != CONNECTION_FAILED
-    }
-}
-
-/// An event's message, as it was formatted.
-struct Message(String);
-
-impl Visit for Message {
-    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        if field.name() == "message" {
-            self.0 = format!("{value:?}");
-        }
-    }
-}
-
 /// Shows the coordinator this device uses, or how to get one.
 pub fn show(home: &Home) -> Result<()> {
     home.require_vault()?;
@@ -150,7 +102,8 @@ pub fn show(home: &Home) -> Result<()> {
         Some(address) => {
             println!("{address}");
             println!(
-                "The service uses the relay at {} and keeps a connection to its coordinator.",
+                "The service uses the relay at {}, and exchanges with its coordinator when the \
+                 log changes and every 15 minutes.",
                 address.hostname
             );
         }
@@ -201,54 +154,5 @@ fn restart_note(home: &Home) {
             "The service takes this up when it starts again: `openvault service install` \
              restarts it if it's installed."
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use tracing::Subscriber;
-    use tracing_subscriber::Layer;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    use super::*;
-
-    struct Count(Arc<AtomicUsize>);
-
-    impl<S: Subscriber> Layer<S> for Count {
-        fn on_event(&self, _: &Event<'_>, _: Context<'_, S>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Logs a failed connection, a line after it, another relay error and an error from elsewhere,
-    /// twice, and returns how many got through.
-    fn logged(quiet: bool) -> usize {
-        use tracing_subscriber::EnvFilter;
-        use tracing_subscriber::filter::FilterExt as _;
-
-        // As log_to_stderr puts them together.
-        let count = Arc::new(AtomicUsize::new(0));
-        let filter = EnvFilter::new("info,iroh_relay=warn").and(QuietConnectionErrors { quiet });
-        let subscriber = tracing_subscriber::registry()
-            .with(Count(count.clone()).with_filter(filter))
-            .with(openvault_net::discovery_watch());
-        tracing::subscriber::with_default(subscriber, || {
-            for _ in 0..2 {
-                tracing::error!(target: RELAY_HTTP, error = "tls handshake eof", "{CONNECTION_FAILED}");
-                tracing::info!(target: "openvault", "the log is at entry 24");
-                tracing::error!(target: RELAY_HTTP, "failed to accept connection: too many open files");
-                tracing::error!(target: "openvault", "{CONNECTION_FAILED}");
-            }
-        });
-        count.load(Ordering::Relaxed)
-    }
-
-    #[test]
-    fn only_the_relays_failed_connections_are_left_out() {
-        assert_eq!(logged(true), 6);
-        assert_eq!(logged(false), 8);
     }
 }

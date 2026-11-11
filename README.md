@@ -6,7 +6,7 @@ This repository holds the open-source core: the Rust service and CLI, the coordi
 
 ## Status
 
-Milestones M1, one device, and M2, devices on the same network, are done: devices join with a 6-digit code, sync directly over iroh, and can be revoked, and latem reads its builds' secrets from OpenVault. M3, reaching devices from outside the network, is next. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
+Milestones M1, one device, and M2, devices on the same network, are done: devices join with a 6-digit code, sync directly over iroh, and can be revoked, and latem reads its builds' secrets from OpenVault. M3, reaching devices from outside the network, has its first stage built and paused: it is behind the cargo feature `coordinator`, off by default, so devices find each other on the local network only. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
 
 ## Try it
 

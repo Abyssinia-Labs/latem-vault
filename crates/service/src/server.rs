@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{self, Request, Response};
+#[cfg(feature = "coordinator")]
 use crate::coordinator;
 use crate::engine::Engine;
 use crate::handler::{self, Context, transport_endpoint};
@@ -71,7 +72,20 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
         .with_context(|| format!("can't listen on {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
 
+    #[cfg(feature = "coordinator")]
     let coordinator = crate::configured_coordinator(dir)?;
+    #[cfg(not(feature = "coordinator"))]
+    let coordinator: Option<openvault_net::coord::Address> = {
+        let file = dir.join(crate::COORDINATOR);
+        if file.exists() {
+            warn!(
+                "this build leaves out the coordinator (cargo feature `coordinator`), so {} is \
+                 ignored: other devices are found on the local network only",
+                file.display()
+            );
+        }
+        None
+    };
     let relay = coordinator.as_ref().map(|address| address.relay_url());
     let options = Options {
         alpns: vec![openvault_net::sync::ALPN.to_vec()],
@@ -97,6 +111,7 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
         node,
         version: version.to_owned(),
     });
+    #[cfg(feature = "coordinator")]
     let keeping = coordinator.map(|address| {
         info!("using the coordinator and relay at {}", address.hostname);
         tokio::spawn(coordinator::keep(
@@ -150,6 +165,7 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
     let _ = fs::remove_file(&socket);
     info!("service stopped");
     // Closing the endpoint ends the coordinator's connection, which isn't a failure to retry.
+    #[cfg(feature = "coordinator")]
     if let Some(keeping) = keeping {
         keeping.abort();
     }

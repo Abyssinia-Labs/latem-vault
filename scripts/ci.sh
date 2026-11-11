@@ -1,6 +1,7 @@
 #!/bin/sh
 # The checks to pass before anything lands on main: rustfmt, then clippy and the tests on this
-# Mac and in a Linux container. There's no hosted CI until the repo is public.
+# Mac and in a Linux container, as built by default and with every feature (the coordinator is
+# one, off by default). There's no hosted CI until the repo is public.
 #
 #   scripts/ci.sh          both
 #   scripts/ci.sh macos    this Mac only
@@ -16,7 +17,9 @@ macos() {
     echo "== macOS: rustfmt, clippy, tests"
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     cargo test --workspace --locked
+    cargo test --locked -p openvault-cli -p openvault-service --all-features
 }
 
 linux() {
@@ -33,7 +36,9 @@ linux() {
         sh -euc '
             rustup component add clippy
             cargo clippy --workspace --all-targets --locked -- -D warnings
+            cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
             cargo test --workspace --locked
+            cargo test --locked -p openvault-cli -p openvault-service --all-features
         '
 }
 

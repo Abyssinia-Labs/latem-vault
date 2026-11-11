@@ -252,9 +252,11 @@ openvault import <folder> --collection <c>
 openvault open <collection>/<path>
 openvault keys [passphrase [--remove]]          how this device's keys are kept; give a key file a passphrase, change it or remove it
 openvault service [install|uninstall|status]    run the service, or have the system start it at login
-openvault grandfather --hostname <name> [--vault <id>]   on the always-on machine: the relay and coordinator
-openvault coordinator [set <address>|unset]     use a grandfather, to reach the vault's devices away from home
+openvault grandfather --hostname <name> [--vault <id>]   on the always-on machine: the relay and coordinator *
+openvault coordinator [set <address>|unset]     use a grandfather, to reach the vault's devices away from home *
 ```
+
+\* Only in builds with the cargo feature `coordinator`, which is off by default ([coordinator.md](spec/coordinator.md)).
 
 The local API runs on a Unix socket or named pipe for the CLI and apps, and on `localhost` HTTP for the web UI. The web UI needs a per-session token and checks the `Host` and `Origin` headers, since any website you visit can send requests to `localhost`.
 
@@ -385,7 +387,7 @@ Later: native Windows, Android, a Linux FUSE mount, a hardware security key for 
   - latem reads a repository's secrets from OpenVault first since latem#60 (its A86). The secrets moved from the one `latem` collection to one collection per repository (§15).
   - tsedal's Android preview build ran on the desktop, signed with the vault's keystore, and uploaded to Play. The mini joined too, and its iOS build signed and uploaded to TestFlight the same way.
   - Each machine runs `openvault service` from a LaunchAgent or a systemd user unit, written by hand for now.
-- **M3 is under way** ([coordinator.md](spec/coordinator.md)). Stage 1, `openvault grandfather` with its relay and the coordinator's log copy, and `openvault coordinator set` on devices, was built on 2026-11-10. The same day it ran on the Mac mini as `grandfather.latem.dev`, with a Let's Encrypt certificate, and the MacBook, the desktop and the mini used it; the MacBook reached the coordinator and the relay from a phone's connection. Its idle traffic came out at about 2.5 KB a second per device, from iroh's keep-alives and holepunching on an open coordinator connection and from QUIC address discovery. Devices now exchange with the coordinator only when there is something to exchange and every 15 minutes, and the relay has no address discovery, which brought it to about 75 bytes a second ([coordinator.md, cost](spec/coordinator.md#cost)).
+- **M3 is under way** ([coordinator.md](spec/coordinator.md)). Stage 1, `openvault grandfather` with its relay and the coordinator's log copy, and `openvault coordinator set` on devices, was built on 2026-11-10. The same day it ran on the Mac mini as `grandfather.latem.dev`, with a Let's Encrypt certificate, and the MacBook, the desktop and the mini used it; the MacBook reached the coordinator and the relay from a phone's connection. Its idle traffic came out at about 2.5 KB a second per device, from iroh's keep-alives and holepunching on an open coordinator connection and from QUIC address discovery. Devices now exchange with the coordinator only when there is something to exchange and every 15 minutes, and the relay has no address discovery, which brought it to about 75 bytes a second ([coordinator.md, cost](spec/coordinator.md#cost)). M3 was then paused, to work on the local network first: since 0.3.2 the coordinator is built only with the cargo feature `coordinator`, which is off by default.
 
 ## 19. Open decisions
 

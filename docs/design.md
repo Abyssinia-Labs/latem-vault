@@ -231,6 +231,7 @@ For the current machines:
   - `openvault get` writes a file to stdout or to a path you name.
   - Apple platforms use File Provider; Linux gets a FUSE mount later.
 - **Placement:** keep a copy, or fetch on demand from the nearest holder.
+- The formats, sync and commands are in [files.md](spec/files.md). Its first stage, files on one device, was built in 0.4.0.
 - **Phone cache:** files stay in the app sandbox with `NSFileProtectionComplete`, expire per collection, and are wiped on the first launch after the phone is revoked.
 
 ## 14. Interfaces
@@ -243,12 +244,13 @@ openvault devices [revoke <device>]
 openvault scope <device> <collection> none|hold|read|write
 openvault collections [create <name>]
 openvault set <collection>/<name> --secret|--var    value read from stdin
-openvault get <collection>/<name>
-openvault list <collection>[/<folder>]          names and kinds, never values
+openvault get <collection>/<name> [-o <path>]   a value, or a file's bytes
+openvault list <collection>[/<folder>]          names and kinds, and files' sizes, never values
 openvault delete <collection>/<name>
 openvault run --collection <c> --env <e> [--prefix <p>] -- <command>   variables and secrets as env; files as temporary paths
 openvault import-env <file> --collection <c> --env <e> [--var <name>]...   a NAME=value file, such as latem's secrets.env
-openvault import <folder> --collection <c>
+openvault import <path> --collection <c> [--into <folder>]   a file, or a folder's files
+openvault placement <collection> [keep|on-demand]   which of a collection's file chunks this device keeps
 openvault open <collection>/<path>
 openvault keys [passphrase [--remove]]          how this device's keys are kept; give a key file a passphrase, change it or remove it
 openvault service [install|uninstall|status]    run the service, or have the system start it at login
@@ -389,6 +391,7 @@ Later: native Windows, Android, a Linux FUSE mount, a hardware security key for 
   - Each machine runs `openvault service` from a LaunchAgent or a systemd user unit, written by hand for now.
 - **M3 is under way** ([coordinator.md](spec/coordinator.md)). Stage 1, `openvault grandfather` with its relay and the coordinator's log copy, and `openvault coordinator set` on devices, was built on 2026-11-10. The same day it ran on the Mac mini as `grandfather.latem.dev`, with a Let's Encrypt certificate, and the MacBook, the desktop and the mini used it; the MacBook reached the coordinator and the relay from a phone's connection. Its idle traffic came out at about 2.5 KB a second per device, from iroh's keep-alives and holepunching on an open coordinator connection and from QUIC address discovery. Devices now exchange with the coordinator only when there is something to exchange and every 15 minutes, and the relay has no address discovery, which brought it to about 75 bytes a second ([coordinator.md, cost](spec/coordinator.md#cost)). M3 was then paused, to work on the local network first: since 0.3.2 the coordinator is built only with the cargo feature `coordinator`, which is off by default.
 - **M5 has started, with the Mac app** (SwiftUI, from the "OpenVault screens" canvas, direction D), ahead of M4's files. Stage 1 was built on 2026-11-10 in 0.3.3: the local API an app needs ([service.md, for apps](spec/service.md#for-apps)): summaries, entry details, the log, several scope changes under one Touch ID, a watch that pushes events, and joins run by the service, which `openvault approve` now uses too. Also the Swift bindings in `crates/ffi`, tested from Swift against a service by `scripts/swift-bindings.sh`. Stage 2 was built on 2026-11-11 in `openvault-apple`: the app's shell, its LaunchAgent for the bundled service, and, in 0.3.4, `openvault service --log` and `deviceHome` for it ([service.md, the Mac app](spec/service.md#starting-at-login)). The MacBook runs the service from the app since then. Stage 3 followed the same day: a collection's entries by folder, Touch ID to show or copy a secret, adding, changing and deleting entries, new collections, `.env` import, ⌘K and the whole log. For the import, 0.3.5 moved `import-env`'s parser into `openvault-core` and gave the app `parseEnv`, so both read a file the same way. Stage 4 followed: approving a device that asks to join, from Devices or a notification, scopes, revoking with the secrets to change afterwards, and a first run that makes a vault or joins one. For that, 0.3.6 moved what `init` and `join` do into `openvault-service` (`setup`), so the bindings make and join vaults without a service (`createVault`, `joinVault`; [service.md, without the service](spec/service.md#for-apps)). Next: files (M4).
+- **M4 has started** ([files.md](spec/files.md)). Stage 1 was built on 2026-11-11 in 0.4.0, store version 7: files on one device. A file is an entry of kind `0x03` whose value is its manifest; a file of up to 64 KiB is kept in it, and a larger one in 1 MiB chunks sealed with a nonce from their plaintext, so equal chunks are kept once. `import`, `get -o`, `list` with sizes, `run` with files as temporary paths, and `placement`. Chunks no current version names are deleted 30 days later. Next: chunk sync and fetching (stage 2), `open` (stage 3), the Mac app's files (stage 4), then the other machines.
 
 ## 19. Open decisions
 
@@ -398,5 +401,5 @@ Later: native Windows, Android, a Linux FUSE mount, a hardware security key for 
    - Old-epoch versions by a device that has lost `write` stop counting.
    - The remaining writers rewrite only the entries that device wrote last, so its real changes are kept.
    - File chunks are re-encrypted only on request.
-3. **Chunking: fixed size or content-defined.** Content-defined chunking deduplicates better but reveals more about file contents. I recommend fixed 1 MiB chunks.
+3. **Chunking: fixed size or content-defined.** Content-defined chunking deduplicates better but reveals more about file contents. Decided in [files.md](spec/files.md#chunks): fixed 1 MiB chunks, built in 0.4.0.
 4. **Name.** `openvault` and the `openvault-*` names are free on GitHub (Abyssinia-Labs) and crates.io. Small GitHub projects already use "OpenVault" (one is a password manager and file locker), and it is also the name of a broadband data company. Check the trademark before the hosted launch.

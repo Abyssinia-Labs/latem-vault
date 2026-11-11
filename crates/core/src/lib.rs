@@ -4,6 +4,7 @@
 //! `openvault-crypto`; device keys come from whatever implements [`DeviceKeys`].
 
 pub mod env_file;
+pub mod file;
 pub mod grant;
 mod ids;
 pub mod join;
@@ -20,8 +21,8 @@ pub use ids::{CollectionId, DeviceId, VaultId};
 pub use keys::{DeviceKeys, SoftwareKeys, transport_seed};
 pub use record::{Kind, Version};
 pub use store::{
-    Approval, CollectionInfo, Entry, EntryInfo, Received, Review, Revocation, ScopeChange, Vault,
-    Written,
+    Approval, CHUNK_RETENTION_SECS, CollectionInfo, Entry, EntryInfo, Placement, Received, Review,
+    Revocation, SWEEP_BATCH, ScopeChange, Swept, Vault, Written, WrittenChunk,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -40,7 +41,13 @@ pub enum Error {
     InvalidId,
     #[error("values are at most {} bytes", record::MAX_VALUE_LEN)]
     ValueTooLarge,
-    #[error("only secrets and variables can be set")]
+    #[error("invalid file manifest: {0}")]
+    InvalidManifest(&'static str),
+    #[error("chunk {} isn't on this device", hex::encode(&.0[..8]))]
+    ChunkMissing(file::ChunkId),
+    #[error("a chunk is at most {} bytes", file::CHUNK_SIZE)]
+    ChunkTooLarge,
+    #[error("only secrets, variables and files can be set")]
     NotSettable,
     #[error("a vault already exists at {}", .0.display())]
     VaultExists(PathBuf),

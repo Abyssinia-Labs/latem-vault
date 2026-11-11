@@ -6,7 +6,7 @@ This repository holds the open-source core: the Rust service and CLI, the coordi
 
 ## Status
 
-Milestones M1, one device, and M2, devices on the same network, are done: devices join with a 6-digit code, sync directly over iroh, and can be revoked, and latem reads its builds' secrets from OpenVault. M3, reaching devices from outside the network, has its first stage built and paused: it is behind the cargo feature `coordinator`, off by default, so devices find each other on the local network only. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
+Milestones M1, one device, and M2, devices on the same network, are done: devices join with a 6-digit code, sync directly over iroh, and can be revoked, and latem reads its builds' secrets from OpenVault. M3, reaching devices from outside the network, has its first stage built and paused: it is behind the cargo feature `coordinator`, off by default, so devices find each other on the local network only. M4, files, has its first stage built: files are kept encrypted in chunks on one device, and imported, read and passed to commands; syncing their chunks comes next. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
 
 ## Try it
 
@@ -67,6 +67,17 @@ ssh mini 'cat ~/.latem/secrets.env' | openvault import-env - --collection latem 
 ```
 
 Every name becomes a secret unless it is given with `--var`. The file is read as latem reads it: no `export`, no `$` expansion, and in double quotes only `\n`, `\r`, `\t`, `\\` and `\"`. Nothing is written if any line fails to parse, or if a name already exists (unless you pass `--overwrite`).
+
+Files, such as a signing keystore or a folder of documents, are imported as file entries ([files.md](docs/spec/files.md)):
+
+```sh
+openvault import ~/release --collection latem --into prod   # needs FileVault, or dm-crypt on Linux
+openvault list latem/prod                                    # files show their size
+openvault get latem/prod/upload.jks -o upload.jks           # readable only by you
+openvault run --collection latem --env prod -- ./gradlew bundleRelease   # UPLOAD_JKS is the keystore's path
+```
+
+A file of up to 64 KiB is kept in its record, like a secret. A larger one is cut into 1 MiB chunks, each encrypted, which are kept in `~/.openvault/chunks`. The originals stay where they were until you delete them. `run` writes the folder's files to a private temporary folder while the command runs, and deletes it after.
 
 `openvault service` holds the vault open until Ctrl-C. It finds this vault's other devices on the local network with mDNS, without relays or anything outside the network, and other commands go through it, so a passphrase is typed once rather than for every command. Without it, each command opens the vault itself.
 

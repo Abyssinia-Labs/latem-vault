@@ -1,7 +1,7 @@
 //! What each request does to the vault. The service runs it for requests on its socket, and the
 //! CLI runs it in-process when no service is running, so a command behaves the same either way.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -14,8 +14,8 @@ use openvault_net::EndpointKey;
 use zeroize::Zeroizing;
 
 use crate::api::{
-    CollectionSummary, DeviceSummary, EntryDetail, ErrorCode, Item, Listed, LogLine, Request,
-    Response, Signer, Value, VaultInfo,
+    ChunkData, CollectionSummary, DeviceSummary, EntryDetail, ErrorCode, Item, Listed, LogLine,
+    Request, Response, Signer, Value, VaultInfo,
 };
 
 /// The most log entries one log request returns (service.md, for apps).
@@ -128,24 +128,60 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
                     .iter()
                     .map(|item| (item.name.as_str(), item.kind, &item.value[..])),
             )?;
+            sweep_if_dropped(vault);
             Response::Done
         }
         Request::Delete { collection, name } => {
             let id = vault.collection(&collection)?;
-            Response::Deleted(vault.delete(id, &name)?)
+            let deleted = vault.delete(id, &name)?;
+            sweep_if_dropped(vault);
+            Response::Deleted(deleted)
         }
         Request::List { collection } => {
             let id = vault.collection(&collection)?;
+            let listed = vault.list(id)?;
+            // Only a collection with files asks which chunks are here.
+            let missing = if listed.iter().any(|info| info.kind == Kind::File) {
+                vault.missing_chunks(id)?
+            } else {
+                HashMap::new()
+            };
             Response::Listing(
-                vault
-                    .list(id)?
+                listed
                     .into_iter()
                     .map(|info| Listed {
+                        missing: missing
+                            .get(&info.name)
+                            .map_or(0, |&n| u32::try_from(n).unwrap_or(u32::MAX)),
                         name: info.name,
                         kind: info.kind,
+                        size: info.size,
                     })
                     .collect(),
             )
+        }
+        Request::WriteChunk { collection, data } => {
+            let id = vault.collection(&collection)?;
+            let written = vault.write_chunk(id, &data.0)?;
+            Response::ChunkWritten {
+                id: written.id,
+                epoch: written.epoch,
+            }
+        }
+        Request::ReadChunk {
+            collection,
+            epoch,
+            id,
+        } => {
+            let collection = vault.collection(&collection)?;
+            Response::Chunk(ChunkData(vault.read_chunk(collection, epoch, &id)?))
+        }
+        Request::Placement { collection, set } => {
+            let id = vault.collection(&collection)?;
+            if let Some(placement) = set {
+                vault.set_placement(id, placement)?;
+            }
+            Response::Placement(vault.placement(id)?)
         }
         Request::Folder { collection, folder } => {
             let id = vault.collection(&collection)?;
@@ -156,7 +192,13 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
                     .map(|entry| Item {
                         name: entry.name,
                         kind: entry.kind,
-                        value: entry.value,
+                        // A manifest can be up to 1 MiB, so a folder's would soon outgrow a
+                        // message: `run` gets each file's on its own.
+                        value: if entry.kind == Kind::File {
+                            Zeroizing::new(Vec::new())
+                        } else {
+                            entry.value
+                        },
                     })
                     .collect(),
             )
@@ -313,6 +355,22 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
         | Request::Approve { .. }
         | Request::Refuse { .. } => bail!("only a running service answers that"),
     })
+}
+
+/// Sweeps chunks no current version names (files.md, dropping chunks) after a write that left
+/// some unreferenced: one batch, since the service sweeps the rest when it starts. A failure is
+/// logged, since the write itself went through.
+fn sweep_if_dropped(vault: &mut Vault<Keys>) {
+    if !vault.chunks_dropped() {
+        return;
+    }
+    match vault.sweep_chunks() {
+        Ok(swept) if swept.deleted > 0 => {
+            tracing::info!(deleted = swept.deleted, more = swept.more, "swept chunks");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("sweeping chunks failed: {e:#}"),
+    }
 }
 
 /// Every collection on this device, with its counts, key and the devices with a scope on it.

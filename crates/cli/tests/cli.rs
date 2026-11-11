@@ -433,7 +433,7 @@ fn run_rejects_unusable_folders() {
     let device = Device::new();
     let run =
         |env: &str| device.fails(&["run", "--collection", "latem", "--env", env, "--", "true"]);
-    assert!(run("prod").contains("has no secrets or variables"));
+    assert!(run("prod").contains("has no secrets, variables or files"));
 
     device.set("latem/prod/nested/KEY", "--secret", b"x");
     assert!(run("prod").contains("can't be an environment variable"));
@@ -638,6 +638,268 @@ impl Drop for Service {
             self.terminate();
         }
     }
+}
+
+/// A folder to import: a keystore, a key in a subfolder, a script, a 2.5 MiB file, and Finder's
+/// litter.
+fn release_folder(device: &Device) -> std::path::PathBuf {
+    let dir = device.home.path().join("src/release");
+    std::fs::create_dir_all(dir.join("ios")).unwrap();
+    std::fs::write(dir.join("upload.jks"), vec![7u8; 3000]).unwrap();
+    std::fs::write(
+        dir.join("ios/AuthKey_ABC.p8"),
+        b"-----BEGIN PRIVATE KEY-----",
+    )
+    .unwrap();
+    std::fs::write(dir.join("big.bin"), big_file()).unwrap();
+    std::fs::write(dir.join("sign.sh"), b"#!/bin/sh\necho signed\n").unwrap();
+    std::fs::write(dir.join(".DS_Store"), b"").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("sign.sh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+/// 2.5 MiB that differ from one MiB to the next.
+fn big_file() -> Vec<u8> {
+    (0..(5usize << 19))
+        .map(|i| (i / 1000 % 251) as u8)
+        .collect()
+}
+
+fn chunk_files(device: &Device) -> usize {
+    let dir = device.home.path().join("chunks");
+    std::fs::read_dir(&dir)
+        .map(|dirs| {
+            dirs.flatten()
+                .map(|sub| std::fs::read_dir(sub.path()).unwrap().count())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn files_are_imported_read_and_run_with() {
+    let device = Device::new();
+    let dir = release_folder(&device);
+    let dir = dir.to_str().unwrap();
+    let import = |args: &[&str]| {
+        let mut all = vec![
+            "import",
+            dir,
+            "--collection",
+            "latem",
+            "--disk-not-encrypted",
+        ];
+        all.extend_from_slice(args);
+        device.ok(&all)
+    };
+    let output = import(&[]);
+    assert!(
+        output.contains("Imported 4 files (2.5 MiB) into latem."),
+        "{output}"
+    );
+    assert!(output.contains(".DS_Store: it's Finder's"), "{output}");
+    assert!(output.contains("The originals are still in"), "{output}");
+    assert_eq!(
+        device.ok(&["list", "latem/release"]),
+        "file    release/big.bin  2.5 MiB\n\
+         file    release/ios/AuthKey_ABC.p8  27 B\n\
+         file    release/sign.sh  22 B\n\
+         file    release/upload.jks  2.9 KiB\n"
+    );
+    // The 2.5 MiB file is three chunks; the rest are in their manifests.
+    assert_eq!(chunk_files(&device), 3);
+
+    // To stdout, or to a private file with its time and executable bit.
+    let output = device.run(&["get", "latem/release/upload.jks"]);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, vec![7u8; 3000]);
+    let out = device.home.path().join("out.bin");
+    device.ok(&["get", "latem/release/big.bin", "-o", out.to_str().unwrap()]);
+    assert!(std::fs::read(&out).unwrap() == big_file());
+    let script = device.home.path().join("sign.sh");
+    device.ok(&[
+        "get",
+        "latem/release/sign.sh",
+        "-o",
+        script.to_str().unwrap(),
+    ]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&out), mode(&script)), (0o600, 0o700));
+    }
+    // Kept to the second.
+    let secs = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    assert_eq!(
+        secs(&script),
+        secs(&std::path::Path::new(dir).join("sign.sh"))
+    );
+
+    // Importing again writes nothing; a change near the end writes only the last chunk.
+    let output = import(&[]);
+    assert!(
+        output
+            .contains("Imported 0 files (0 B) into latem; 4 files already had the same contents."),
+        "{output}"
+    );
+    let mut changed = big_file();
+    *changed.last_mut().unwrap() ^= 1;
+    std::fs::write(format!("{dir}/big.bin"), &changed).unwrap();
+    assert!(import(&[]).contains("Imported 1 file (2.5 MiB)"));
+    assert_eq!(chunk_files(&device), 4);
+
+    // `run` writes the folder's files somewhere private, and deletes them after.
+    let output = device.ok(&[
+        "run",
+        "--collection",
+        "latem",
+        "--env",
+        "release",
+        "--",
+        "sh",
+        "-c",
+        r#"wc -c < "$UPLOAD_JKS" | tr -d ' '; "$SIGN_SH"; cat "$AUTHKEY_ABC_P8"; echo; dirname "$BIG_BIN""#,
+    ]);
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        &lines[..3],
+        ["3000", "signed", "-----BEGIN PRIVATE KEY-----"],
+        "{output}"
+    );
+    let run_dir = std::path::Path::new(lines[3]);
+    assert!(
+        run_dir.starts_with(std::env::temp_dir().canonicalize().unwrap())
+            || run_dir.starts_with(std::env::temp_dir()),
+        "{output}"
+    );
+    assert!(!run_dir.exists(), "{} is left behind", run_dir.display());
+    // The command's exit status is run's.
+    let status = device
+        .run(&[
+            "run",
+            "--collection",
+            "latem",
+            "--env",
+            "release",
+            "--",
+            "sh",
+            "-c",
+            "exit 3",
+        ])
+        .status;
+    assert_eq!(status.code(), Some(3));
+
+    // A secret and a file can't set the same variable.
+    device.set("latem/release/UPLOAD_JKS", "--secret", b"x");
+    let error = device.fails(&[
+        "run",
+        "--collection",
+        "latem",
+        "--env",
+        "release",
+        "--",
+        "true",
+    ]);
+    assert!(error.contains("would both set UPLOAD_JKS"), "{error}");
+    // Nor can a file take a secret's name.
+    let error = device.fails(&[
+        "import",
+        &device.file("UPLOAD_JKS", b"x"),
+        "--collection",
+        "latem",
+        "--into",
+        "release",
+        "--disk-not-encrypted",
+    ]);
+    assert!(
+        error.contains("is a secret; a file can't take its name"),
+        "{error}"
+    );
+
+    // A single file goes at the top, or into a folder.
+    let single = device.file("notes.txt", b"hello");
+    device.ok(&[
+        "import",
+        &single,
+        "--collection",
+        "latem",
+        "--disk-not-encrypted",
+    ]);
+    assert_eq!(device.ok(&["get", "latem/notes.txt"]), "hello");
+    device.ok(&["delete", "latem/release/big.bin"]);
+    assert!(
+        device
+            .fails(&["get", "latem/release/big.bin"])
+            .contains("doesn't exist")
+    );
+
+    assert_eq!(
+        device.ok(&["placement", "latem"]),
+        "latem: keep. Every current file's chunks stay here.\n"
+    );
+    assert!(
+        device
+            .ok(&["placement", "latem", "on-demand"])
+            .contains("latem: on demand.")
+    );
+    assert!(device.ok(&["placement", "latem"]).contains("on demand"));
+}
+
+#[cfg(unix)]
+#[test]
+fn files_go_through_the_service() {
+    let device = Device::new();
+    let dir = release_folder(&device);
+    let service = Service::start(&device);
+    let output = device.ok(&[
+        "import",
+        dir.to_str().unwrap(),
+        "--collection",
+        "latem",
+        "--into",
+        "prod",
+        "--disk-not-encrypted",
+    ]);
+    assert!(
+        output.contains("Imported 4 files"),
+        "{output}\n{}",
+        service.log()
+    );
+    let output = device.run(&["get", "latem/prod/big.bin"]);
+    assert!(output.stdout == big_file(), "{}", service.log());
+    let output = device.ok(&[
+        "run",
+        "--collection",
+        "latem",
+        "--env",
+        "prod",
+        "--",
+        "sh",
+        "-c",
+        r#"wc -c < "$BIG_BIN" | tr -d ' '"#,
+    ]);
+    assert_eq!(output, format!("{}\n", 5 << 19));
+    assert!(
+        device
+            .ok(&["list", "latem"])
+            .contains("file    prod/big.bin  2.5 MiB\n")
+    );
+    assert!(service.stop(), "the service didn't exit cleanly");
 }
 
 #[cfg(unix)]

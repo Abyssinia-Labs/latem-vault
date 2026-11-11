@@ -630,11 +630,13 @@ impl Client {
         })?)
     }
 
-    /// A collection's current entries, with variables' values but never secrets'.
+    /// A collection's current secrets and variables, with variables' values but never secrets'.
+    /// Files aren't listed yet: the app shows them from M4's stage 4 (files.md).
     pub fn entries(&self, collection: String) -> Result<Vec<Entry>, OpenVaultError> {
         match self.call(&Request::EntryDetails { collection })? {
             Response::EntryDetails(details) => Ok(details
                 .into_iter()
+                .filter(|detail| detail.kind != CoreKind::File)
                 .map(|detail| Entry {
                     kind: detail.kind.into(),
                     value: (detail.kind == CoreKind::Var).then(|| detail.value.to_vec()),
@@ -647,13 +649,18 @@ impl Client {
         }
     }
 
-    /// One entry's value, or `None` if it doesn't exist.
+    /// A secret's or variable's value, or `None` if it doesn't exist (or is a file, which the
+    /// app doesn't show yet).
     pub fn get(&self, collection: String, name: String) -> Result<Option<Value>, OpenVaultError> {
         match self.call(&Request::Get { collection, name })? {
-            Response::Entry(value) => Ok(value.map(|value| Value {
-                kind: value.kind.into(),
-                value: value.value.to_vec(),
-            })),
+            Response::Entry(value) => {
+                Ok(value
+                    .filter(|value| value.kind != CoreKind::File)
+                    .map(|value| Value {
+                        kind: value.kind.into(),
+                        value: value.value.to_vec(),
+                    }))
+            }
             other => Err(unexpected(other)),
         }
     }
@@ -1024,8 +1031,9 @@ impl From<CoreKind> for Kind {
     fn from(kind: CoreKind) -> Self {
         match kind {
             CoreKind::Var => Self::Variable,
-            // Collection entries never cross the local API.
-            CoreKind::Secret | CoreKind::Collection => Self::Secret,
+            // Collection entries never cross the local API, and files are left out above until
+            // the app shows them.
+            CoreKind::Secret | CoreKind::Collection | CoreKind::File => Self::Secret,
         }
     }
 }

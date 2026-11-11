@@ -11,6 +11,7 @@
 //! keystore crate, which produces and consumes the same encodings.
 
 pub mod aead;
+pub mod chunk;
 pub mod hash;
 pub mod pake;
 pub mod passphrase;
@@ -19,6 +20,7 @@ pub mod sign;
 pub mod wrap;
 
 pub use aead::SymmetricKey;
+pub use chunk::{ChunkKeys, chunk_id};
 pub use passphrase::{PassphraseCost, passphrase_key};
 pub use recovery::RecoveryKey;
 pub use sign::{Signature, SignatureContext, SigningKey, VerifyingKey};

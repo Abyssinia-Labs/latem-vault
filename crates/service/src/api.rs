@@ -5,8 +5,9 @@
 
 use std::io::{self, Read, Write};
 
+use openvault_core::file::ChunkId;
 use openvault_core::membership::Scope;
-use openvault_core::{DeviceId, Kind, Review, VaultId, Written};
+use openvault_core::{DeviceId, Kind, Placement, Review, VaultId, Written};
 use zeroize::Zeroizing;
 
 /// The longest message, type and body: a folder of large values still fits.
@@ -103,6 +104,22 @@ pub enum Request {
     Refuse {
         session: u32,
     },
+    /// Seals a piece of a file and keeps it (files.md, the service).
+    WriteChunk {
+        collection: String,
+        data: ChunkData,
+    },
+    /// A chunk a file's manifest names, opened.
+    ReadChunk {
+        collection: String,
+        epoch: u32,
+        id: ChunkId,
+    },
+    /// This device's placement for a collection, after setting it if `set` is given.
+    Placement {
+        collection: String,
+        set: Option<Placement>,
+    },
 }
 
 #[derive(Debug)]
@@ -156,6 +173,22 @@ pub enum Response {
         /// Entries the device wrote last, written again under the new keys.
         carried: u32,
     },
+    ChunkWritten {
+        id: ChunkId,
+        /// The collection key it's sealed under, which its manifest names.
+        epoch: u32,
+    },
+    Chunk(ChunkData),
+    Placement(Placement),
+}
+
+/// A piece of a file, in the clear: at most a chunk, which never shows in debug output.
+pub struct ChunkData(pub Zeroizing<Vec<u8>>);
+
+impl std::fmt::Debug for ChunkData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ChunkData({} bytes)", self.0.len())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,7 +303,7 @@ pub struct JoinRequestSummary {
     pub hardware: bool,
 }
 
-/// A secret or variable with its name.
+/// A secret, variable or file with its name. A file's value is its manifest.
 pub struct Item {
     pub name: String,
     pub kind: Kind,
@@ -286,6 +319,10 @@ pub struct Value {
 pub struct Listed {
     pub name: String,
     pub kind: Kind,
+    /// A file's size in bytes; 0 for anything else.
+    pub size: u64,
+    /// How many of a file's chunks this device doesn't hold.
+    pub missing: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -436,6 +473,23 @@ impl Request {
                 w.phrase(recovery_phrase.as_deref().map(String::as_str));
             }),
             Self::Refuse { session } => frame(0x18, |w| w.put(&session.to_be_bytes())),
+            Self::WriteChunk { collection, data } => frame(0x19, |w| {
+                w.str(collection);
+                w.bytes(&data.0);
+            }),
+            Self::ReadChunk {
+                collection,
+                epoch,
+                id,
+            } => frame(0x1a, |w| {
+                w.str(collection);
+                w.put(&epoch.to_be_bytes());
+                w.put(id);
+            }),
+            Self::Placement { collection, set } => frame(0x1b, |w| {
+                w.str(collection);
+                w.u8(set.map_or(0, Placement::code));
+            }),
         }
     }
 
@@ -513,6 +567,22 @@ impl Request {
                 recovery_phrase: r.phrase()?,
             },
             0x18 => Self::Refuse { session: r.u32()? },
+            0x19 => Self::WriteChunk {
+                collection: r.string()?,
+                data: ChunkData(r.value()?),
+            },
+            0x1a => Self::ReadChunk {
+                collection: r.string()?,
+                epoch: r.u32()?,
+                id: r.array()?,
+            },
+            0x1b => Self::Placement {
+                collection: r.string()?,
+                set: match r.u8()? {
+                    0 => None,
+                    code => Some(Placement::from_code(code).ok_or(DecodeError::Bad("placement"))?),
+                },
+            },
             _ => return Err(DecodeError::Bad("unknown request")),
         };
         r.finish()?;
@@ -552,6 +622,10 @@ impl Response {
                 for entry in listed {
                     w.str(&entry.name);
                     w.kind(entry.kind);
+                    if entry.kind == Kind::File {
+                        w.put(&entry.size.to_be_bytes());
+                        w.put(&entry.missing.to_be_bytes());
+                    }
                 }
             }),
             Self::Deleted(existed) => frame(0x85, |w| w.u8((*existed).into())),
@@ -721,6 +795,12 @@ impl Response {
                 w.put(&granted.to_be_bytes());
                 w.put(&carried.to_be_bytes());
             }),
+            Self::ChunkWritten { id, epoch } => frame(0x94, |w| {
+                w.put(id);
+                w.put(&epoch.to_be_bytes());
+            }),
+            Self::Chunk(data) => frame(0x95, |w| w.bytes(&data.0)),
+            Self::Placement(placement) => frame(0x96, |w| w.u8(placement.code())),
         }
     }
 
@@ -749,9 +829,17 @@ impl Response {
                 let count = r.count()?;
                 let mut listed = Vec::with_capacity(count);
                 for _ in 0..count {
+                    let (name, kind) = (r.string()?, r.kind()?);
+                    let (size, missing) = if kind == Kind::File {
+                        (r.u64()?, r.u32()?)
+                    } else {
+                        (0, 0)
+                    };
                     listed.push(Listed {
-                        name: r.string()?,
-                        kind: r.kind()?,
+                        name,
+                        kind,
+                        size,
+                        missing,
                     });
                 }
                 Self::Listing(listed)
@@ -960,6 +1048,14 @@ impl Response {
                 granted: r.u32()?,
                 carried: r.u32()?,
             },
+            0x94 => Self::ChunkWritten {
+                id: r.array()?,
+                epoch: r.u32()?,
+            },
+            0x95 => Self::Chunk(ChunkData(r.value()?)),
+            0x96 => {
+                Self::Placement(Placement::from_code(r.u8()?).ok_or(DecodeError::Bad("placement"))?)
+            }
             _ => return Err(DecodeError::Bad("unknown response")),
         };
         r.finish()?;
@@ -1183,6 +1279,7 @@ impl<'a> Reader<'a> {
         match self.u8()? {
             0x01 => Ok(Kind::Secret),
             0x02 => Ok(Kind::Var),
+            0x03 => Ok(Kind::File),
             _ => Err(DecodeError::Bad("kind")),
         }
     }
@@ -1213,6 +1310,7 @@ fn kind_code(kind: Kind) -> u8 {
     match kind {
         Kind::Secret => 0x01,
         Kind::Var => 0x02,
+        Kind::File => 0x03,
         Kind::Collection => unreachable!("collection entries never cross the local API"),
     }
 }
@@ -1627,6 +1725,88 @@ mod tests {
         else {
             panic!("not a wrong code");
         };
+    }
+
+    #[test]
+    fn file_messages_round_trip() {
+        let Request::WriteChunk { collection, data } = round_trip_request(&Request::WriteChunk {
+            collection: "docs".into(),
+            data: ChunkData(Zeroizing::new(vec![9; 1 << 20])),
+        }) else {
+            panic!("write chunk");
+        };
+        assert_eq!((collection.as_str(), data.0.len()), ("docs", 1 << 20));
+        assert_eq!(format!("{data:?}"), "ChunkData(1048576 bytes)");
+        let Request::ReadChunk {
+            collection,
+            epoch,
+            id,
+        } = round_trip_request(&Request::ReadChunk {
+            collection: "docs".into(),
+            epoch: 3,
+            id: [4; 32],
+        })
+        else {
+            panic!("read chunk");
+        };
+        assert_eq!((collection.as_str(), epoch, id), ("docs", 3, [4; 32]));
+        for set in [None, Some(Placement::Keep), Some(Placement::OnDemand)] {
+            let Request::Placement { set: back, .. } = round_trip_request(&Request::Placement {
+                collection: "docs".into(),
+                set,
+            }) else {
+                panic!("placement");
+            };
+            assert_eq!(back, set);
+        }
+
+        let Response::ChunkWritten { id, epoch } = round_trip_response(&Response::ChunkWritten {
+            id: [1; 32],
+            epoch: 2,
+        }) else {
+            panic!("chunk written");
+        };
+        assert_eq!((id, epoch), ([1; 32], 2));
+        let Response::Chunk(data) = round_trip_response(&Response::Chunk(ChunkData(
+            Zeroizing::new(b"piece".to_vec()),
+        ))) else {
+            panic!("chunk");
+        };
+        assert_eq!(&data.0[..], b"piece");
+        let Response::Placement(placement) =
+            round_trip_response(&Response::Placement(Placement::OnDemand))
+        else {
+            panic!("placement");
+        };
+        assert_eq!(placement, Placement::OnDemand);
+
+        // A listing gives a file's size and how many of its chunks aren't here.
+        let listed = vec![
+            Listed {
+                name: "prod/REGION".into(),
+                kind: Kind::Var,
+                size: 0,
+                missing: 0,
+            },
+            Listed {
+                name: "release/upload.jks".into(),
+                kind: Kind::File,
+                size: 3 << 20,
+                missing: 2,
+            },
+        ];
+        let Response::Listing(back) = round_trip_response(&Response::Listing(listed.clone()))
+        else {
+            panic!("listing");
+        };
+        assert_eq!(back, listed);
+        let Response::Entry(Some(value)) = round_trip_response(&Response::Entry(Some(Value {
+            kind: Kind::File,
+            value: Zeroizing::new(b"manifest".to_vec()),
+        }))) else {
+            panic!("entry");
+        };
+        assert_eq!(value.kind, Kind::File);
     }
 
     #[test]

@@ -28,6 +28,7 @@ All integers are big-endian.
 | --- | --- | --- |
 | Symmetric key | raw | 32 |
 | Sealed value | `nonce (24) ‖ ciphertext ‖ tag (16)` | plaintext + 40 |
+| Sealed chunk ([files.md](files.md#chunks)) | the same, with the nonce taken from the plaintext | plaintext + 40 |
 | Wrapping public key | `kem_id (2) ‖ public key` | 34 (X25519), 67 (P-256) |
 | Wrapping private key (file keystore) | `kem_id (2) ‖ private key (32)` | 34 |
 | Wrapped key | `kem_id (2) ‖ enc ‖ ciphertext (48)` | 82 (X25519), 115 (P-256) |
@@ -40,6 +41,8 @@ All integers are big-endian.
 `alg` is `0x01` for Ed25519 and `0x02` for ECDSA P-256 with SHA-256. ECDSA signatures are fixed-width `r ‖ s`; a hardware signer that returns DER converts before storing.
 
 Decoders reject unknown identifiers, wrong lengths, and public keys that aren't valid points.
+
+Every other value is sealed with a random nonce. A file's chunks take theirs from a keyed hash of the plaintext, under keys derived from the collection key with the labels `openvault v1 chunk key` and `openvault v1 chunk nonce key`, so the same piece seals to the same bytes and is stored once. That shows which chunks are equal, and nothing else (files.md, chunks).
 
 ## Records
 

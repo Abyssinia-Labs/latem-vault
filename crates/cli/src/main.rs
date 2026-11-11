@@ -5,6 +5,7 @@
 //! `openvault service` runs, its socket (`service.sock`). Commands go through the service when
 //! it runs, and open the vault themselves otherwise.
 
+mod files;
 #[cfg(feature = "coordinator")]
 mod grandfather;
 mod join;
@@ -13,7 +14,7 @@ mod log;
 #[cfg(unix)]
 mod login;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
@@ -22,10 +23,11 @@ use std::process::{self, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use openvault_core::file::Manifest;
 use openvault_core::membership::Scope;
 use openvault_core::names::is_env_name;
 use openvault_core::record::MAX_VALUE_LEN;
-use openvault_core::{Kind, Vault, env_file, names};
+use openvault_core::{Kind, Placement, Vault, env_file, names};
 use openvault_keystore::{Backend, Keys};
 use openvault_service::api::{DeviceSummary, ErrorCode, Item, Listed, Request, Response, Value};
 use openvault_service::handler::{self, unexpected};
@@ -75,22 +77,28 @@ enum Command {
         #[command(flatten)]
         kind: KindArg,
     },
-    /// Print the value of a secret or variable.
+    /// Print the value of a secret or variable, or write out a file.
     Get {
         /// `<collection>/<name>`
         entry: String,
+        /// Write it to this path instead of stdout, readable only by you
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
     },
-    /// List the names in a collection, or in one folder of it. Values aren't shown.
+    /// List the names in a collection, or in one folder of it, with files' sizes. Values aren't
+    /// shown.
     List {
         /// `<collection>` or `<collection>/<folder>`
         path: String,
     },
-    /// Delete a secret or variable.
+    /// Delete a secret, variable or file.
     Delete {
         /// `<collection>/<name>`
         entry: String,
     },
-    /// Run a command with a folder's secrets and variables as environment variables.
+    /// Run a command with a folder's secrets and variables as environment variables. Its files
+    /// are written to a private temporary folder while the command runs, each path in a variable
+    /// named after the file: `prod/upload.jks` sets `UPLOAD_JKS`.
     Run {
         #[arg(long)]
         collection: String,
@@ -190,6 +198,35 @@ enum Command {
         #[arg(long)]
         overwrite: bool,
     },
+    /// Import a file, or a folder's files, as file entries. A file already there with the same
+    /// contents is left as it is. The originals are left in place.
+    Import {
+        /// A file or a folder
+        path: PathBuf,
+        #[arg(long)]
+        collection: String,
+        /// The folder to import into [default: a folder's own name; a file goes at the top]
+        #[arg(long, value_name = "FOLDER")]
+        into: Option<String>,
+        /// Import even though this device's disk isn't encrypted (FileVault, or dm-crypt on
+        /// Linux), so what's read may stay on it in the clear
+        #[arg(long)]
+        disk_not_encrypted: bool,
+    },
+    /// Show or set which of a collection's file chunks this device keeps.
+    Placement {
+        collection: String,
+        #[arg(value_enum)]
+        placement: Option<PlacementArg>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PlacementArg {
+    /// Every current file's chunks
+    Keep,
+    /// Chunks of files read lately, up to 2 GiB
+    OnDemand,
 }
 
 #[derive(Subcommand)]
@@ -360,7 +397,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 if kind.secret { Kind::Secret } else { Kind::Var },
             )?;
         }
-        Command::Get { entry } => get(&home, &entry)?,
+        Command::Get { entry, output } => get(&home, &entry, output.as_deref())?,
         Command::List { path } => list(&home, &path)?,
         Command::Delete { entry } => delete(&home, &entry)?,
         Command::Run {
@@ -376,6 +413,29 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             vars,
             overwrite,
         } => import_env(&home, &file, &collection, &env, &vars, overwrite)?,
+        Command::Import {
+            path,
+            collection,
+            into,
+            disk_not_encrypted,
+        } => files::import(
+            &home,
+            &path,
+            &collection,
+            into.as_deref(),
+            disk_not_encrypted,
+        )?,
+        Command::Placement {
+            collection,
+            placement,
+        } => files::placement(
+            &home,
+            &collection,
+            placement.map(|placement| match placement {
+                PlacementArg::Keep => Placement::Keep,
+                PlacementArg::OnDemand => Placement::OnDemand,
+            }),
+        )?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1064,12 +1124,21 @@ fn set(home: &Home, entry: &str, kind: Kind) -> Result<()> {
     )
 }
 
-fn get(home: &Home, entry: &str) -> Result<()> {
+fn get(home: &Home, entry: &str, output: Option<&Path>) -> Result<()> {
     let (collection, name) = split_entry(entry)?;
-    let entry = home
-        .access()?
+    let mut access = home.access()?;
+    let entry = access
         .get(collection, name)?
         .ok_or_else(|| anyhow!("{collection}/{name} doesn't exist"))?;
+    if entry.kind == Kind::File {
+        let manifest = Manifest::decode(&entry.value)?;
+        return files::get(&mut access, collection, name, &manifest, output);
+    }
+    if let Some(path) = output {
+        return files::write_out(path, false, now_secs(), |file| {
+            Ok(file.write_all(&entry.value)?)
+        });
+    }
     let mut stdout = io::stdout().lock();
     stdout.write_all(&entry.value)?;
     if stdout.is_terminal() {
@@ -1096,7 +1165,16 @@ fn list(home: &Home, path: &str) -> Result<()> {
             .as_ref()
             .is_none_or(|prefix| info.name.starts_with(prefix))
         {
-            println!("{:<6}  {}", kind_label(info.kind), info.name);
+            if info.kind == Kind::File {
+                let here = match info.missing {
+                    0 => String::new(),
+                    1 => ", 1 chunk not here".into(),
+                    n => format!(", {n} chunks not here"),
+                };
+                println!("file    {}  {}{here}", info.name, size_label(info.size));
+            } else {
+                println!("{:<6}  {}", kind_label(info.kind), info.name);
+            }
         }
     }
     Ok(())
@@ -1123,14 +1201,19 @@ fn run(
     if !prefix.is_empty() && !is_env_name(prefix) {
         bail!("--prefix must be letters, digits and '_', not starting with a digit");
     }
-    let entries = home.access()?.folder(collection, folder)?;
-    if entries.is_empty() {
-        bail!("{collection}/{folder}/ has no secrets or variables");
+    let mut access = home.access()?;
+    let (files, entries): (Vec<Item>, Vec<Item>) = access
+        .folder(collection, folder)?
+        .into_iter()
+        .partition(|item| item.kind == Kind::File);
+    if entries.is_empty() && files.is_empty() {
+        bail!("{collection}/{folder}/ has no secrets, variables or files");
     }
 
     let (program, args) = command.split_first().expect("clap requires a command");
     let mut child = process::Command::new(program);
     child.args(args);
+    let mut taken = HashSet::new();
     for entry in &entries {
         // Checked without the prefix, so a name is usable the same way with or without one.
         let var = &entry.name[folder.len() + 1..];
@@ -1145,8 +1228,23 @@ fn run(
             format!("{prefix}{var}"),
             env_value(&entry.value).with_context(|| format!("{collection}/{}", entry.name))?,
         );
+        taken.insert(var.to_owned());
     }
-    exec(child, program)
+    if files.is_empty() {
+        return exec(child, program);
+    }
+    #[cfg(unix)]
+    return files::run_with_files(
+        &mut access,
+        collection,
+        folder,
+        prefix,
+        &files,
+        &taken,
+        child,
+    );
+    #[cfg(not(unix))]
+    bail!("`run` with files needs a Unix system for now")
 }
 
 fn import_env(
@@ -1271,11 +1369,33 @@ fn read_env_file(file: &Path) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 fn kind_label(kind: Kind) -> &'static str {
-    if kind == Kind::Secret {
-        "secret"
-    } else {
-        "var"
+    match kind {
+        Kind::Secret => "secret",
+        Kind::File => "file",
+        Kind::Var | Kind::Collection => "var",
     }
+}
+
+/// `512 B`, `2.1 KiB`, `12.0 MiB`.
+fn size_label(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
+}
+
+/// Seconds since 1970, for a value written out with `get -o`.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
 }
 
 /// Replaces this process with the command, so it keeps the terminal, signals and exit status,

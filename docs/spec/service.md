@@ -97,7 +97,7 @@ Each device runs one iroh endpoint (design §10):
 **Fields.**
 - `str`: `u16 length ‖ UTF-8`.
 - `bytes`: `u32 length ‖ bytes`.
-- `kind`: u8, the record kind (records.md): `0x01` secret, `0x02` var.
+- `kind`: u8, the record kind (records.md): `0x01` secret, `0x02` var, `0x03` file (since 0.4.0). A file's value is its manifest (files.md).
 - Collections are named, not given by id.
 
 ### Requests
@@ -135,7 +135,7 @@ Each device runs one iroh endpoint (design §10):
 | `0x81` | names | count (u32) ‖ names (str) |
 | `0x82` | entry | found (u8) ‖ kind ‖ value (bytes), with kind and value only if found is 1 |
 | `0x83` | entries | count (u32) ‖ entries: name (str) ‖ kind ‖ value (bytes) |
-| `0x84` | listing | count (u32) ‖ entries: name (str) ‖ kind |
+| `0x84` | listing | count (u32) ‖ entries: name (str) ‖ kind ‖ for a file only: size (u64) ‖ chunks not here (u32) |
 | `0x85` | deleted | existed (u8) |
 | `0x86` | devices | count (u32) ‖ devices: id (16) ‖ flags (u8) ‖ platform (str) ‖ name (str) |
 | `0x87` | review | count (u32) ‖ collections it reads: name (str) ‖ count (u32) ‖ secret names (str); then count (u32) ‖ collections: name (str) ‖ count (u32) ‖ entries it wrote last: name (str) ‖ deleted (u8) |
@@ -156,6 +156,28 @@ Each device runs one iroh endpoint (design §10):
 - A name that doesn't open, or breaks the name rules, comes back with an empty platform and name. The CLI then shows the device id instead (membership.md, names key).
 - Error codes: `0x01` is any error, whose message the CLI prints. `0x02` is "recovery phrase needed". `0x03` is "wrong code" (for apps, below).
 - Buffers that hold values are wiped after use, on both sides.
+
+### Files
+
+Since 0.4.0 ([files.md](files.md#the-service)). get, set, delete, list and folder take files too. get returns a file's manifest as its value, and set writes one, which fails unless this device holds every chunk it names. folder and entry details list a file with an empty value: a manifest can be up to 1 MiB, so `run` gets each file's on its own.
+
+| Type | Request | Body |
+| --- | --- | --- |
+| `0x19` | write chunk | collection (str) ‖ data (bytes, 1 B to 1 MiB) |
+| `0x1a` | read chunk | collection (str) ‖ epoch (u32) ‖ chunk id (32) |
+| `0x1b` | placement | collection (str) ‖ placement (u8: `0x00` leave it, `0x01` keep, `0x02` on demand) |
+
+| Type | Response | Body |
+| --- | --- | --- |
+| `0x94` | chunk written | chunk id (32) ‖ epoch (u32) |
+| `0x95` | chunk | data (bytes) |
+| `0x96` | placement | placement (u8) |
+
+- **write chunk** seals a piece of a file under the collection's current key and keeps it (files.md, local store). It answers with its id and the epoch it's sealed under, which the manifest names. The CLI sends a file this way one piece at a time, then sets its manifest.
+- **read chunk** checks a chunk against its id and opens it under the epoch its manifest names. It fails if this device doesn't hold it.
+- **placement** returns this device's placement for a collection, after setting it unless the request says `0x00`.
+- A set or delete that leaves chunks no current version names sweeps one batch of those due (files.md, dropping chunks). The service also sweeps when it starts.
+- The Swift bindings leave files out of entries until the Mac app shows them (files.md, M4 stage 4).
 
 ### For apps
 

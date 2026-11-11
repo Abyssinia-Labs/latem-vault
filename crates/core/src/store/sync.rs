@@ -5,9 +5,10 @@
 use openvault_crypto::SymmetricKey;
 use rusqlite::{OptionalExtension, Transaction, params};
 
+use super::files::named_chunks;
 use super::{
-    UPSERT_ENTRY, Vault, add_to_set, collection_label_aad, ensure_collection, entry_label_aad,
-    insert_grant, keep_own_key, meta, read_log, save_log, set_summary, wrap_context,
+    UPSERT_ENTRY, Vault, add_to_set, collection_label_aad, ensure_collection, insert_grant,
+    keep_own_key, meta, read_log, save_log, set_summary, wrap_context,
 };
 use crate::grant::Grant;
 use crate::membership::{Change, LogEntry, Membership, Scope};
@@ -410,11 +411,8 @@ impl<K: DeviceKeys> Vault<K> {
     ) -> Result<()> {
         let header = record.header();
         let tag = self.entry_tag(collection, &body.name);
-        let label = self.cache_key.seal(
-            &entry_label_aad(collection, &tag),
-            &[&[body.kind.code()][..], body.name.as_bytes()].concat(),
-        );
-        tx.execute(
+        let label = self.entry_label(collection, &tag, body, header.deleted);
+        let current = tx.execute(
             UPSERT_ENTRY,
             params![
                 &collection.as_bytes()[..],
@@ -425,7 +423,15 @@ impl<K: DeviceKeys> Vault<K> {
                 header.deleted,
                 label
             ],
-        )?;
+        )? > 0;
+        if current {
+            self.set_file_chunks(
+                tx,
+                collection,
+                &tag,
+                &named_chunks(body.kind, header.deleted, &body.value),
+            )?;
+        }
         if body.kind != Kind::Collection {
             return Ok(());
         }

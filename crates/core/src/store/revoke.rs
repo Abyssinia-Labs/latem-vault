@@ -401,6 +401,8 @@ impl<K: DeviceKeys> Vault<K> {
                 "DELETE FROM entries WHERE collection_id = ?1 AND name_tag = ?2",
                 params![&collection.as_bytes()[..], &tag[..]],
             )?;
+            // Whatever becomes current below names its own chunks again.
+            self.set_file_chunks(tx, collection, tag, &[])?;
         }
         let mut statement = tx.prepare("SELECT record FROM records WHERE collection_id = ?1")?;
         let mut rows = statement.query([&collection.as_bytes()[..]])?;
@@ -448,7 +450,8 @@ impl<K: DeviceKeys> Vault<K> {
         for row in rows {
             let (tag, label, deleted, record_id) = row?;
             let tag: Hash = tag.try_into().map_err(|_| Error::Corrupt("name tag"))?;
-            let (kind, name) = self.open_entry_label(collection, &tag, &label)?;
+            let super::Label { kind, name, .. } =
+                self.open_entry_label(collection, &tag, &label)?;
             written.push(Current {
                 name,
                 kind,

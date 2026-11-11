@@ -741,7 +741,7 @@ mod tests {
                 crate::coord::ALPN
             ),
             (
-                "3",
+                "4",
                 &b"openvault/sync/1"[..],
                 &b"openvault/join/1"[..],
                 &b"openvault/coord/1"[..]

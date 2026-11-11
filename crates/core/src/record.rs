@@ -4,6 +4,7 @@ use openvault_crypto::hash::{self, Hash, contexts};
 use openvault_crypto::{Signature, SignatureContext, SymmetricKey, VerifyingKey};
 use zeroize::Zeroizing;
 
+use crate::file::{Content, Manifest};
 use crate::{CollectionId, DeviceId, DeviceKeys, Error, Result, names};
 
 const FORMAT: u8 = 0x01;
@@ -27,6 +28,8 @@ pub struct Version {
 pub enum Kind {
     Secret,
     Var,
+    /// A file, whose value is its manifest (files.md).
+    File,
     /// The collection's own entry: an empty name, whose value is the collection's name.
     Collection,
 }
@@ -36,6 +39,7 @@ impl Kind {
         match self {
             Self::Secret => 0x01,
             Self::Var => 0x02,
+            Self::File => 0x03,
             Self::Collection => 0x10,
         }
     }
@@ -44,6 +48,7 @@ impl Kind {
         match code {
             0x01 => Some(Self::Secret),
             0x02 => Some(Self::Var),
+            0x03 => Some(Self::File),
             0x10 => Some(Self::Collection),
             _ => None,
         }
@@ -143,7 +148,8 @@ impl Body {
         Ok(Self::new(kind, name, value))
     }
 
-    fn check(&self, deleted: bool) -> Result<()> {
+    /// `epoch` is the record's: a file's chunks can't be sealed under a later key.
+    fn check(&self, deleted: bool, epoch: u32) -> Result<()> {
         if self.value.len() > MAX_VALUE_LEN {
             return Err(Error::ValueTooLarge);
         }
@@ -159,6 +165,21 @@ impl Body {
                 .map_err(|_| Error::InvalidRecord("collection name isn't UTF-8"))
                 .and_then(names::check_collection),
             Kind::Secret | Kind::Var => names::check_entry(&self.name),
+            Kind::File => {
+                names::check_entry(&self.name)?;
+                if !deleted
+                    && let Content::Chunks {
+                        epoch: sealed_under,
+                        ..
+                    } = Manifest::decode(&self.value)?.content
+                    && sealed_under > epoch
+                {
+                    return Err(Error::InvalidManifest(
+                        "its chunks are sealed under a later key than its record",
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -191,7 +212,7 @@ impl Record {
         key: &SymmetricKey,
         author: &impl DeviceKeys,
     ) -> Result<Self> {
-        body.check(deleted)?;
+        body.check(deleted, epoch)?;
         let mut header = Header {
             collection,
             epoch,
@@ -265,7 +286,7 @@ impl Record {
         self.verify(author)?;
         let plaintext = key.open(&self.header_bytes[..AAD_LEN], &self.sealed)?;
         let body = Body::decode(&plaintext)?;
-        body.check(self.header.deleted)?;
+        body.check(self.header.deleted, self.header.epoch)?;
         Ok(body)
     }
 }
@@ -398,6 +419,56 @@ mod tests {
             seal(Body::new(Kind::Secret, "big", &vec![0; MAX_VALUE_LEN + 1])),
             Err(Error::ValueTooLarge)
         ));
+
+        // A file's value must be a manifest, except once it's deleted.
+        let manifest = crate::file::Manifest {
+            size: 2,
+            executable: false,
+            mtime: 0,
+            content: crate::file::Content::Inline(Zeroizing::new(b"hi".to_vec())),
+        };
+        assert!(seal(Body::new(Kind::File, "docs/a.txt", &manifest.encode())).is_ok());
+        assert!(matches!(
+            seal(Body::new(Kind::File, "docs/a.txt", b"not a manifest")),
+            Err(Error::InvalidManifest(_))
+        ));
+        let deleted = Body::new(Kind::File, "docs/a.txt", b"");
+        assert!(
+            Record::seal(
+                CollectionId::random(),
+                0,
+                version,
+                true,
+                &deleted,
+                &key,
+                &keys
+            )
+            .is_ok()
+        );
+        // Its chunks are sealed under the record's key, or an earlier one.
+        let chunked = |epoch| crate::file::Manifest {
+            size: 1,
+            executable: false,
+            mtime: 0,
+            content: Content::Chunks {
+                epoch,
+                ids: vec![[1; 32]],
+            },
+        };
+        let at = |record_epoch, chunk_epoch| {
+            let body = Body::new(Kind::File, "f", &chunked(chunk_epoch).encode());
+            Record::seal(
+                CollectionId::random(),
+                record_epoch,
+                version,
+                false,
+                &body,
+                &key,
+                &keys,
+            )
+        };
+        assert!(at(2, 2).is_ok() && at(2, 1).is_ok());
+        assert!(matches!(at(1, 2), Err(Error::InvalidManifest(_))));
     }
 
     #[test]

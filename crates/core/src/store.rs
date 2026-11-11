@@ -1,14 +1,17 @@
 //! The local store: one SQLite database per vault (records.md, local store).
 
+mod files;
 mod revoke;
 mod sync;
 
+pub use files::{CHUNK_RETENTION_SECS, Placement, SWEEP_BATCH, Swept, WrittenChunk};
 pub use revoke::{Review, Revocation, ScopeChange, Written};
 pub use sync::Received;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use openvault_crypto::hash::{Hash, contexts, derive_key, keyed_hash};
@@ -18,6 +21,7 @@ use rusqlite::{
 };
 use zeroize::Zeroizing;
 
+use crate::file::Manifest;
 use crate::grant::Grant;
 use crate::join::JoinRequest;
 use crate::membership::{
@@ -36,8 +40,10 @@ use crate::{CollectionId, DeviceId, DeviceKeys, Error, Result, VaultId, names, t
 /// membership from the log and signs a grant for each collection key the device holds. Opening a
 /// version 4 store rebuilds the collections table and adds up its sets. Opening a version 5
 /// store lists the records it kept without their key, and keeps the key of each grant to this
-/// device it holds, which a device that joined with version 4 didn't.
-const SCHEMA_VERSION: i64 = 6;
+/// device it holds, which a device that joined with version 4 didn't. Version 7 added files'
+/// chunks (files.md, local store); opening an older store opens again every record that isn't
+/// current, since a build before files kept file records without decoding them.
+const SCHEMA_VERSION: i64 = 7;
 
 /// Every grant this device knows of, its own and other devices' (sync.md, who stores grants).
 const GRANTS_SCHEMA: &str = "
@@ -153,7 +159,7 @@ ON CONFLICT (collection_id, name_tag) DO UPDATE SET
 WHERE (excluded.lamport, excluded.device_id) > (entries.lamport, entries.device_id)
 ";
 
-/// A secret or variable, decrypted.
+/// A secret, variable or file, decrypted. A file's value is its manifest (files.md).
 pub struct Entry {
     pub name: String,
     pub kind: Kind,
@@ -178,6 +184,16 @@ impl std::fmt::Debug for Entry {
 pub struct EntryInfo {
     pub name: String,
     pub kind: Kind,
+    /// A file's size in bytes; 0 for anything else.
+    pub size: u64,
+}
+
+/// What an entry's label holds: its kind and name, and a file's size, so listing needs no
+/// collection key.
+pub(crate) struct Label {
+    pub kind: Kind,
+    pub name: String,
+    pub size: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,6 +219,10 @@ pub struct Vault<K: DeviceKeys> {
     /// SQLite's `data_version` when `membership` was last loaded, which changes when another
     /// connection writes.
     data_version: i64,
+    /// The directory chunks are kept in, beside the database.
+    chunks: PathBuf,
+    /// Whether chunks became unreferenced since the last finished sweep.
+    dropped: AtomicBool,
 }
 
 impl<K: DeviceKeys> Vault<K> {
@@ -233,7 +253,15 @@ impl<K: DeviceKeys> Vault<K> {
             Ok(conn)
         };
         match init() {
-            Ok(conn) => Self::new(conn, keys, vault_id, device_id, recovery, Some(membership)),
+            Ok(conn) => Self::new(
+                conn,
+                path,
+                keys,
+                vault_id,
+                device_id,
+                recovery,
+                Some(membership),
+            ),
             Err(e) => {
                 let _ = std::fs::remove_file(path);
                 Err(e)
@@ -265,13 +293,14 @@ impl<K: DeviceKeys> Vault<K> {
             return Err(Error::WrongKeys);
         }
         let membership = load_membership(&conn, vault_id, device_id, &keys)?;
-        let mut vault = Self::new(conn, keys, vault_id, device_id, recovery, membership)?;
+        let mut vault = Self::new(conn, path, keys, vault_id, device_id, recovery, membership)?;
         vault.open_waiting()?;
         Ok(vault)
     }
 
     fn new(
         conn: Connection,
+        path: &Path,
         keys: K,
         vault_id: VaultId,
         device_id: DeviceId,
@@ -293,6 +322,8 @@ impl<K: DeviceKeys> Vault<K> {
             collection_keys: HashMap::new(),
             membership,
             data_version,
+            chunks: path.with_file_name("chunks"),
+            dropped: AtomicBool::new(false),
         })
     }
 
@@ -544,7 +575,15 @@ impl<K: DeviceKeys> Vault<K> {
             Ok(conn)
         };
         match init() {
-            Ok(conn) => Self::new(conn, keys, vault_id, device, recovery, Some(membership)),
+            Ok(conn) => Self::new(
+                conn,
+                path,
+                keys,
+                vault_id,
+                device,
+                recovery,
+                Some(membership),
+            ),
             Err(e) => {
                 let _ = std::fs::remove_file(path);
                 Err(e)
@@ -721,7 +760,8 @@ impl<K: DeviceKeys> Vault<K> {
         Ok(collections)
     }
 
-    /// Sets a secret or variable, replacing any current value.
+    /// Sets a secret, variable or file, replacing any current value. A file's value is its
+    /// manifest, and this device must hold every chunk it names.
     pub fn set(
         &mut self,
         collection: CollectionId,
@@ -732,7 +772,7 @@ impl<K: DeviceKeys> Vault<K> {
         self.set_all(collection, [(name, kind, value)])
     }
 
-    /// Sets several secrets and variables in one transaction, so either all of them are
+    /// Sets several secrets, variables and files in one transaction, so either all of them are
     /// written or none are.
     pub fn set_all<'a>(
         &mut self,
@@ -755,7 +795,8 @@ impl<K: DeviceKeys> Vault<K> {
         self.write(collection, &bodies, false)
     }
 
-    /// The current value of a secret or variable, or `None` if it doesn't exist or was deleted.
+    /// The current value of a secret, variable or file, or `None` if it doesn't exist or was
+    /// deleted.
     pub fn get(&mut self, collection: CollectionId, name: &str) -> Result<Option<Entry>> {
         names::check_entry(name)?;
         self.epoch(collection)?;
@@ -785,7 +826,7 @@ impl<K: DeviceKeys> Vault<K> {
         }))
     }
 
-    /// Deletes a secret or variable. Returns whether there was one to delete.
+    /// Deletes a secret, variable or file. Returns whether there was one to delete.
     pub fn delete(&mut self, collection: CollectionId, name: &str) -> Result<bool> {
         names::check_entry(name)?;
         self.epoch(collection)?;
@@ -801,12 +842,13 @@ impl<K: DeviceKeys> Vault<K> {
         let Some((false, label)) = current else {
             return Ok(false);
         };
-        let (kind, _) = self.open_entry_label(collection, &tag, &label)?;
+        let kind = self.open_entry_label(collection, &tag, &label)?.kind;
         self.write(collection, &[Body::new(kind, name, b"")], true)?;
         Ok(true)
     }
 
-    /// The names and kinds of a collection's current secrets and variables, by name.
+    /// The names and kinds of a collection's current secrets, variables and files, by name, with
+    /// files' sizes.
     ///
     /// Reads only the index, so it needs no collection key.
     pub fn list(&self, collection: CollectionId) -> Result<Vec<EntryInfo>> {
@@ -821,16 +863,16 @@ impl<K: DeviceKeys> Vault<K> {
         for row in rows {
             let (tag, label) = row?;
             let tag: Hash = tag.try_into().map_err(|_| Error::Corrupt("name tag"))?;
-            let (kind, name) = self.open_entry_label(collection, &tag, &label)?;
+            let Label { kind, name, size } = self.open_entry_label(collection, &tag, &label)?;
             if kind != Kind::Collection {
-                entries.push(EntryInfo { name, kind });
+                entries.push(EntryInfo { name, kind, size });
             }
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
 
-    /// The current secrets and variables under `folder/`, such as every entry in `prod/`.
+    /// The current secrets, variables and files under `folder/`, such as every entry in `prod/`.
     pub fn entries_in(&mut self, collection: CollectionId, folder: &str) -> Result<Vec<Entry>> {
         let prefix = format!("{folder}/");
         let names: Vec<String> = self
@@ -852,6 +894,11 @@ impl<K: DeviceKeys> Vault<K> {
             && membership.scope(self.device_id, collection) != Scope::Write
         {
             return Err(Error::ReadOnly);
+        }
+        if !deleted {
+            for body in bodies.iter().filter(|body| body.kind == Kind::File) {
+                self.check_chunks(collection, epoch, &Manifest::decode(&body.value)?)?;
+            }
         }
         let key = self.take_key(collection, epoch)?;
         let result = self.commit_records(collection, epoch, &key, bodies, deleted);
@@ -910,10 +957,7 @@ impl<K: DeviceKeys> Vault<K> {
         add_to_set(tx, SetId::records(collection), &record_id)?;
 
         let tag = self.entry_tag(collection, &body.name);
-        let label = self.cache_key.seal(
-            &entry_label_aad(collection, &tag),
-            &[&[body.kind.code()][..], body.name.as_bytes()].concat(),
-        );
+        let label = self.entry_label(collection, &tag, body, deleted);
         tx.execute(
             UPSERT_ENTRY,
             params![
@@ -925,6 +969,13 @@ impl<K: DeviceKeys> Vault<K> {
                 deleted,
                 label
             ],
+        )?;
+        // A local write is always the newest version.
+        self.set_file_chunks(
+            tx,
+            collection,
+            &tag,
+            &files::named_chunks(body.kind, deleted, &body.value),
         )?;
         tx.execute(
             "UPDATE meta SET value = ?1 WHERE key = 'clock'",
@@ -1015,21 +1066,49 @@ impl<K: DeviceKeys> Vault<K> {
         Ok(VerifyingKey::from_bytes(&bytes)?)
     }
 
+    /// `kind ‖ name`, or `kind ‖ size ‖ name` for a file, sealed with the cache key.
+    fn entry_label(
+        &self,
+        collection: CollectionId,
+        tag: &Hash,
+        body: &Body,
+        deleted: bool,
+    ) -> Vec<u8> {
+        let mut plaintext = Vec::with_capacity(9 + body.name.len());
+        plaintext.push(body.kind.code());
+        if body.kind == Kind::File {
+            let size = if deleted {
+                0
+            } else {
+                crate::file::size_of(&body.value).unwrap_or(0)
+            };
+            plaintext.extend_from_slice(&size.to_be_bytes());
+        }
+        plaintext.extend_from_slice(body.name.as_bytes());
+        self.cache_key
+            .seal(&entry_label_aad(collection, tag), &plaintext)
+    }
+
     fn open_entry_label(
         &self,
         collection: CollectionId,
         tag: &Hash,
         label: &[u8],
-    ) -> Result<(Kind, String)> {
+    ) -> Result<Label> {
+        const CORRUPT: Error = Error::Corrupt("entry label");
         let plaintext = self
             .cache_key
             .open(&entry_label_aad(collection, tag), label)?;
-        let (&kind, name) = plaintext
-            .split_first()
-            .ok_or(Error::Corrupt("entry label"))?;
-        let kind = Kind::from_code(kind).ok_or(Error::Corrupt("entry label"))?;
-        let name = String::from_utf8(name.to_vec()).map_err(|_| Error::Corrupt("entry label"))?;
-        Ok((kind, name))
+        let (&kind, rest) = plaintext.split_first().ok_or(CORRUPT)?;
+        let kind = Kind::from_code(kind).ok_or(CORRUPT)?;
+        let (size, name) = if kind == Kind::File {
+            let (size, name) = rest.split_first_chunk::<8>().ok_or(CORRUPT)?;
+            (u64::from_be_bytes(*size), name)
+        } else {
+            (0, rest)
+        };
+        let name = String::from_utf8(name.to_vec()).map_err(|_| CORRUPT)?;
+        Ok(Label { kind, name, size })
     }
 
     fn entry_tag(&self, collection: CollectionId, name: &str) -> Hash {
@@ -1063,7 +1142,7 @@ fn connect(path: &Path) -> Result<Connection> {
 fn upgrade(conn: &mut Connection, keys: &impl DeviceKeys) -> Result<()> {
     match user_version(conn)? {
         SCHEMA_VERSION => return Ok(()),
-        1..=5 => {}
+        1..=6 => {}
         other => return Err(Error::UnsupportedStore(other)),
     }
     // Rebuilding the collections table needs foreign keys off, which can only change outside a
@@ -1111,9 +1190,10 @@ fn upgrade_in_transaction(conn: &mut Connection, keys: &impl DeviceKeys) -> Resu
         sum_sets(&tx)?;
     }
     tx.execute_batch(WAITING_SCHEMA)?;
+    tx.execute_batch(files::FILES_SCHEMA)?;
     // Before the keys below arrive, so the records they open are on the list.
-    list_waiting(&tx, &keys.wrap_key())?;
-    if !log.is_empty() {
+    list_waiting(&tx)?;
+    if version < 6 && !log.is_empty() {
         keep_granted_keys(&tx, &log, keys)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1142,10 +1222,11 @@ CREATE TABLE IF NOT EXISTS sets (
 ) STRICT;
 ";
 
-/// Lists each record kept without being opened, because this device had no key for its epoch:
-/// the upgrade to version 6, which added the list. Opening the vault opens the ones whose key it
-/// has by then.
-fn list_waiting(tx: &Transaction<'_>, wrap_key: &WrapKey) -> Result<()> {
+/// Lists each record that isn't an entry's current version as waiting to be opened: the upgrade
+/// to version 6, which added the list for records kept without their key, and to version 7, since
+/// an older build kept file records it couldn't decode. Opening the vault opens the ones whose
+/// key it has by then; the rest wait for their key.
+fn list_waiting(tx: &Transaction<'_>) -> Result<()> {
     // Only records that aren't an entry's current version, and of those, each is parsed.
     let mut waiting = Vec::new();
     {
@@ -1164,16 +1245,8 @@ fn list_waiting(tx: &Transaction<'_>, wrap_key: &WrapKey) -> Result<()> {
     }
     for (id, collection, epoch) in waiting {
         tx.execute(
-            "INSERT OR IGNORE INTO waiting SELECT ?1, ?2, ?3 WHERE NOT EXISTS (
-                 SELECT 1 FROM collection_keys
-                 WHERE collection_id = ?2 AND epoch = ?3 AND recipient = ?4
-             )",
-            params![
-                &id[..],
-                &collection.as_bytes()[..],
-                epoch,
-                wrap_key.as_bytes()
-            ],
+            "INSERT OR IGNORE INTO waiting VALUES (?1, ?2, ?3)",
+            params![&id[..], &collection.as_bytes()[..], epoch],
         )?;
     }
     Ok(())
@@ -1281,6 +1354,7 @@ fn init_store(
     tx.execute_batch(LOG_SCHEMA)?;
     tx.execute_batch(GRANTS_SCHEMA)?;
     tx.execute_batch(WAITING_SCHEMA)?;
+    tx.execute_batch(files::FILES_SCHEMA)?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     for (key, value) in [
         ("vault_id", &vault.as_bytes()[..]),
@@ -1919,7 +1993,7 @@ mod tests {
     /// store (README, versions). Change both together.
     #[test]
     fn the_build_version_follows_the_store_version() {
-        assert_eq!((env!("CARGO_PKG_VERSION_MINOR"), SCHEMA_VERSION), ("3", 6));
+        assert_eq!((env!("CARGO_PKG_VERSION_MINOR"), SCHEMA_VERSION), ("4", 7));
     }
 
     #[test]
@@ -2586,11 +2660,13 @@ mod tests {
             [
                 EntryInfo {
                     name: "prod/SENTRY_DSN".into(),
-                    kind: Kind::Var
+                    kind: Kind::Var,
+                    size: 0,
                 },
                 EntryInfo {
                     name: "prod/STRIPE_KEY".into(),
-                    kind: Kind::Secret
+                    kind: Kind::Secret,
+                    size: 0,
                 },
             ]
         );
@@ -3058,5 +3134,364 @@ mod tests {
             let found = file.windows(needle.len()).any(|w| w == needle.as_bytes());
             assert!(!found, "{needle} is in the database file");
         }
+    }
+
+    /// Seals `pieces` as chunks and a file of them, as `import` does.
+    fn write_file<K: DeviceKeys>(
+        vault: &mut Vault<K>,
+        collection: CollectionId,
+        name: &str,
+        pieces: &[&[u8]],
+    ) -> crate::file::Manifest {
+        let written: Vec<WrittenChunk> = pieces
+            .iter()
+            .map(|piece| vault.write_chunk(collection, piece).unwrap())
+            .collect();
+        let manifest = crate::file::Manifest {
+            size: pieces.iter().map(|piece| piece.len() as u64).sum(),
+            executable: false,
+            mtime: 1_762_819_200,
+            content: crate::file::Content::Chunks {
+                epoch: written[0].epoch,
+                ids: written.iter().map(|chunk| chunk.id).collect(),
+            },
+        };
+        vault
+            .set(collection, name, Kind::File, &manifest.encode())
+            .unwrap();
+        manifest
+    }
+
+    /// A chunk of `CHUNK_SIZE` bytes, the last piece `last` long.
+    fn pieces(fill: &[u8], last: usize) -> Vec<Vec<u8>> {
+        let mut pieces: Vec<Vec<u8>> = fill
+            .iter()
+            .map(|&byte| vec![byte; crate::file::CHUNK_SIZE])
+            .collect();
+        pieces.last_mut().unwrap().truncate(last);
+        pieces
+    }
+
+    fn unreferenced<K: DeviceKeys>(vault: &Vault<K>) -> Vec<ItemId> {
+        let mut statement = vault
+            .conn
+            .prepare("SELECT chunk_id FROM chunks WHERE unreferenced IS NOT NULL ORDER BY chunk_id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|id| id.unwrap().try_into().unwrap())
+            .collect()
+    }
+
+    fn held<K: DeviceKeys>(vault: &Vault<K>) -> i64 {
+        vault
+            .conn
+            .query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn files_are_kept_in_chunks_and_read_back() {
+        let s = setup();
+        let mut vault = s.create();
+        let docs = vault.create_collection("docs", &s.admin()).unwrap();
+        // Two equal pieces seal to one chunk.
+        let pieces = pieces(b"aab", 1000);
+        let refs: Vec<&[u8]> = pieces.iter().map(Vec::as_slice).collect();
+        let manifest = write_file(&mut vault, docs, "2026/scan.pdf", &refs);
+        let ids = manifest.chunks();
+        assert_eq!(
+            (ids.len(), ids[0] == ids[1], ids[1] == ids[2]),
+            (3, true, false)
+        );
+        assert_eq!(held(&vault), 2);
+        assert!(unreferenced(&vault).is_empty());
+
+        // Each chunk is a private file under its id, in the directory beside the store.
+        for id in ids {
+            let path = vault.chunk_path(id);
+            assert!(path.starts_with(s.path.with_file_name("chunks")));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+        }
+
+        assert_eq!(
+            vault.list(docs).unwrap(),
+            [EntryInfo {
+                name: "2026/scan.pdf".into(),
+                kind: Kind::File,
+                size: 2 * crate::file::CHUNK_SIZE as u64 + 1000,
+            }]
+        );
+        assert!(vault.missing_chunks(docs).unwrap().is_empty());
+        let entry = vault.get(docs, "2026/scan.pdf").unwrap().unwrap();
+        let read = crate::file::Manifest::decode(&entry.value).unwrap();
+        assert!(read == manifest);
+        let crate::file::Content::Chunks { epoch, ids } = &read.content else {
+            panic!("chunked");
+        };
+        for (id, piece) in ids.iter().zip(&pieces) {
+            assert_eq!(&vault.read_chunk(docs, *epoch, id).unwrap()[..], &piece[..]);
+        }
+        assert!(matches!(
+            vault.read_chunk(docs, epoch + 1, &ids[0]),
+            Err(Error::ChunkMissing(_))
+        ));
+
+        // A small file is in its manifest.
+        let inline = crate::file::Manifest {
+            size: 5,
+            executable: true,
+            mtime: 0,
+            content: crate::file::Content::Inline(Zeroizing::new(b"hello".to_vec())),
+        };
+        vault
+            .set(docs, "run.sh", Kind::File, &inline.encode())
+            .unwrap();
+        let entry = vault.get(docs, "run.sh").unwrap().unwrap();
+        assert!(crate::file::Manifest::decode(&entry.value).unwrap() == inline);
+        assert_eq!(vault.list(docs).unwrap()[1].size, 5);
+
+        // The store holds none of it in the clear.
+        drop(vault);
+        let file = std::fs::read(&s.path).unwrap();
+        for needle in ["scan.pdf", "hello", "run.sh"] {
+            assert!(
+                !file.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                "{needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_manifest_names_only_chunks_this_device_holds() {
+        let s = setup();
+        let mut vault = s.create();
+        let docs = vault.create_collection("docs", &s.admin()).unwrap();
+        let other = vault.create_collection("other", &s.admin()).unwrap();
+        let chunk = vault.write_chunk(docs, b"piece").unwrap();
+        let manifest = |epoch, id| crate::file::Manifest {
+            size: 5,
+            executable: false,
+            mtime: 0,
+            content: crate::file::Content::Chunks {
+                epoch,
+                ids: vec![id],
+            },
+        };
+        let set = |vault: &mut Vault<&SoftwareKeys>, collection, m: crate::file::Manifest| {
+            vault.set(collection, "f", Kind::File, &m.encode())
+        };
+        assert!(matches!(
+            set(&mut vault, docs, manifest(0, [7; 32])),
+            Err(Error::ChunkMissing(_))
+        ));
+        assert!(matches!(
+            set(&mut vault, other, manifest(0, chunk.id)),
+            Err(Error::ChunkMissing(_))
+        ));
+        assert!(set(&mut vault, docs, manifest(1, chunk.id)).is_err());
+        std::fs::remove_file(vault.chunk_path(&chunk.id)).unwrap();
+        assert!(matches!(
+            set(&mut vault, docs, manifest(0, chunk.id)),
+            Err(Error::ChunkMissing(_))
+        ));
+        // Writing it again puts the file back.
+        assert_eq!(vault.write_chunk(docs, b"piece").unwrap(), chunk);
+        set(&mut vault, docs, manifest(0, chunk.id)).unwrap();
+
+        assert!(matches!(
+            vault.write_chunk(docs, b""),
+            Err(Error::ChunkTooLarge)
+        ));
+        assert!(matches!(
+            vault.write_chunk(docs, &vec![0; crate::file::CHUNK_SIZE + 1]),
+            Err(Error::ChunkTooLarge)
+        ));
+        assert!(matches!(
+            vault.set(docs, "g", Kind::File, b"not a manifest"),
+            Err(Error::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn chunks_no_version_names_are_swept_after_30_days() {
+        let s = setup();
+        let mut vault = s.create();
+        let docs = vault.create_collection("docs", &s.admin()).unwrap();
+        let now = files_now();
+        let later = now + CHUNK_RETENTION_SECS + 60;
+        let one = vec![1; crate::file::CHUNK_SIZE];
+        let first = write_file(&mut vault, docs, "a", &[&one, b"two"]);
+        assert!(!vault.chunks_dropped());
+        // A new version keeps "one" and drops "two".
+        let second = write_file(&mut vault, docs, "a", &[&one, b"three"]);
+        assert!(vault.chunks_dropped());
+        assert_eq!(unreferenced(&vault), [first.chunks()[1]]);
+        // It isn't due for 30 days.
+        assert_eq!(vault.sweep_chunks_at(now).unwrap(), Swept::default());
+        assert!(!vault.chunks_dropped());
+
+        let two = vault.chunk_path(&first.chunks()[1]);
+        assert!(two.exists());
+        let swept = vault.sweep_chunks_at(later).unwrap();
+        assert_eq!(
+            swept,
+            Swept {
+                deleted: 1,
+                more: false
+            }
+        );
+        assert!(!two.exists());
+        assert_eq!(held(&vault), 2);
+
+        // Another file naming a chunk keeps it; deleting the last one drops it.
+        let third = write_file(&mut vault, docs, "b", &[&one]);
+        assert_eq!(third.chunks()[0], second.chunks()[0]);
+        assert!(vault.delete(docs, "a").unwrap());
+        assert_eq!(unreferenced(&vault), [second.chunks()[1]]);
+        assert!(vault.delete(docs, "b").unwrap());
+        assert_eq!(unreferenced(&vault).len(), 2);
+        // Naming one again before it's swept takes it off.
+        write_file(&mut vault, docs, "c", &[&one]);
+        assert_eq!(unreferenced(&vault), [second.chunks()[1]]);
+
+        // A chunk no manifest ever named, as when an import stops halfway, goes too.
+        vault.write_chunk(docs, b"abandoned").unwrap();
+        assert_eq!(unreferenced(&vault).len(), 2);
+        assert_eq!(vault.sweep_chunks_at(later).unwrap().deleted, 2);
+        assert_eq!(held(&vault), 1);
+
+        // A sweep deletes at most a batch, and says when there's more.
+        for i in 0..=SWEEP_BATCH as u32 {
+            let mut id = [0; 32];
+            id[..4].copy_from_slice(&i.to_be_bytes());
+            vault
+                .conn
+                .execute(
+                    "INSERT INTO chunks VALUES (?1, ?2, 0, 1, 0, 0)",
+                    params![&id[..], &docs.as_bytes()[..]],
+                )
+                .unwrap();
+        }
+        let swept = vault.sweep_chunks_at(later).unwrap();
+        assert_eq!(
+            swept,
+            Swept {
+                deleted: SWEEP_BATCH,
+                more: true
+            }
+        );
+        assert_eq!(
+            vault.sweep_chunks_at(later).unwrap(),
+            Swept {
+                deleted: 1,
+                more: false
+            }
+        );
+        assert_eq!(held(&vault), 1);
+    }
+
+    fn files_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[test]
+    fn placement_is_kept_per_collection() {
+        let s = setup();
+        let mut vault = s.create();
+        let docs = vault.create_collection("docs", &s.admin()).unwrap();
+        assert_eq!(vault.placement(docs).unwrap(), Placement::Keep);
+        vault.set_placement(docs, Placement::OnDemand).unwrap();
+        drop(vault);
+        let mut vault = s.open();
+        assert_eq!(vault.placement(docs).unwrap(), Placement::OnDemand);
+        vault.set_placement(docs, Placement::Keep).unwrap();
+        assert_eq!(vault.placement(docs).unwrap(), Placement::Keep);
+        let rows: i64 = vault
+            .conn
+            .query_row("SELECT count(*) FROM placements", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert!(vault.placement(CollectionId::random()).is_err());
+    }
+
+    #[test]
+    fn a_file_from_another_device_waits_for_its_chunks() {
+        let s = setup();
+        let joiner_keys = SoftwareKeys::generate();
+        let (mut admin, mut joined, latem, _) = joined_pair(&s, &joiner_keys);
+        let manifest = write_file(&mut admin, latem, "release/upload.jks", &[b"jks"]);
+        send_missing(&admin, &mut joined);
+        let listed = joined.list(latem).unwrap();
+        let file = listed.iter().find(|e| e.kind == Kind::File).unwrap();
+        assert_eq!((file.name.as_str(), file.size), ("release/upload.jks", 3));
+        assert_eq!(
+            joined.missing_chunks(latem).unwrap(),
+            HashMap::from([("release/upload.jks".to_owned(), 1)])
+        );
+        assert!(matches!(
+            joined.read_chunk(latem, 0, &manifest.chunks()[0]),
+            Err(Error::ChunkMissing(_))
+        ));
+        // A device that reads can't write its own chunks.
+        assert!(matches!(
+            joined.write_chunk(latem, b"x"),
+            Err(Error::ReadOnly)
+        ));
+    }
+
+    #[test]
+    fn version_6_stores_open_the_file_records_they_kept() {
+        let s = setup();
+        let id = {
+            let mut vault = s.create();
+            let id = vault.create_collection("docs", &s.admin()).unwrap();
+            let inline = crate::file::Manifest {
+                size: 2,
+                executable: false,
+                mtime: 0,
+                content: crate::file::Content::Inline(Zeroizing::new(b"hi".to_vec())),
+            };
+            vault
+                .set(id, "a.txt", Kind::File, &inline.encode())
+                .unwrap();
+            vault.set(id, "B", Kind::Var, b"1").unwrap();
+            // A build before files kept the record without making it current.
+            vault
+                .conn
+                .execute(
+                    "DELETE FROM entries WHERE name_tag = ?1",
+                    [&vault.entry_tag(id, "a.txt")[..]],
+                )
+                .unwrap();
+            vault
+                .conn
+                .execute_batch(
+                    "DROP TABLE chunks; DROP TABLE file_chunks; DROP TABLE placements;
+                     PRAGMA user_version = 6;",
+                )
+                .unwrap();
+            id
+        };
+        let mut vault = s.open();
+        assert_eq!(user_version(&vault.conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(waiting(&vault), 0);
+        let names: Vec<String> = vault
+            .list(id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["B", "a.txt"]);
+        assert!(vault.get(id, "a.txt").unwrap().is_some());
     }
 }

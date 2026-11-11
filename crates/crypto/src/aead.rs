@@ -9,7 +9,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{Error, random_bytes};
 
-const NONCE_LEN: usize = 24;
+pub(crate) const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 
 /// A 256-bit key for XChaCha20-Poly1305: a collection key, or a file key.
@@ -31,7 +31,17 @@ impl SymmetricKey {
 
     /// Encrypts `plaintext`, authenticating `aad` with it.
     pub fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        let nonce = random_bytes::<NONCE_LEN>();
+        self.seal_with_nonce(&random_bytes::<NONCE_LEN>(), aad, plaintext)
+    }
+
+    /// [`seal`](Self::seal) with a given nonce, which must never repeat for another plaintext
+    /// under this key: chunks derive theirs from the plaintext (`chunk`).
+    pub(crate) fn seal_with_nonce(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Vec<u8> {
         let ciphertext = self
             .cipher()
             .encrypt(

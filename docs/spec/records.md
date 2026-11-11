@@ -48,7 +48,7 @@ The body's AAD is the first 46 header bytes (everything before `body_hash`), so 
 **Body** (plaintext):
 
 ```
-kind    u8      0x01 secret, 0x02 var, 0x10 collection; 0x03 file is reserved for M4
+kind    u8      0x01 secret, 0x02 var, 0x03 file (files.md), 0x10 collection
 name    u16 length ‖ UTF-8
 value   u32 length ‖ bytes
 ```
@@ -73,14 +73,16 @@ Each device keeps one SQLite database per vault, readable only by its user (mode
 - every record, as received;
 - the records it couldn't open yet because their key hadn't arrived;
 - an index of each entry's current version;
+- from files on, the chunks it holds, which chunks each current file names, and its placements ([files.md](files.md#local-store));
 - the membership log and the state it leads to ([membership.md](membership.md#keeping-the-log)).
 
-The database's `user_version` is the store version: 1 in M1, 2 since the membership log, 3 since device names in the log are sealed (membership.md, names key), 4 since grants (sync.md, grants), 5 since sync, and 6 since records can wait for their key.
+The database's `user_version` is the store version: 1 in M1, 2 since the membership log, 3 since device names in the log are sealed (membership.md, names key), 4 since grants (sync.md, grants), 5 since sync, 6 since records can wait for their key, and 7 since files.
 - Opening a version 1 store upgrades it by adding the empty log and grants tables. Starting its log later grants the keys it holds.
 - A version 2 store opens only if its log is empty. Entries written before names were sealed can't be read, so that vault is created again.
 - Opening a version 3 store adds the grants table, rebuilds the kept membership from the log (it gained the epoch history, membership.md), and turns each wrapped key the device holds, for itself or the recovery key, into a grant it signs.
 - Opening a version 4 store rebuilds the collections table so that a collection's name tag and label may be empty, adds the sets table and an index on each collection's record ids, and adds up the sets from the records and grants already there.
-- Opening a version 5 store adds the waiting list (below). It lists each record that isn't an entry's current version and whose key this device doesn't hold. It then keeps the key of each grant to this device that it holds without the key: a device that joined with version 4 kept its grants only. The records whose key the device now has are opened when the vault opens.
+- Opening a version 5 store adds the waiting list (below). It then keeps the key of each grant to this device that it holds without the key: a device that joined with version 4 kept its grants only.
+- Opening a version 5 or 6 store adds the tables for files (files.md, local store), and lists each record that isn't an entry's current version as waiting. A build before 0.4 kept file records it couldn't decode, and a device that joined with version 4 kept records it had no key for. The ones whose key the device has are opened when the vault opens, and the rest wait for their key. Older versions opened again change nothing, since only a newer version becomes current.
 
 A grant is kept by its id, with its collection, epoch and recipient. Creating a collection writes this device's and the recovery key's grants in the same transaction.
 
@@ -97,11 +99,11 @@ The index never stores a name in the clear. Each device has a 32-byte **local ke
 | Key | Derivation | Use |
 | --- | --- | --- |
 | Index key | `BLAKE3.derive_key("openvault v1 local index key", local key)` | `name_tag` = `BLAKE3.keyed_hash(index key, "entry" ‖ 0x00 ‖ collection_id ‖ name)`, or `"collection" ‖ 0x00 ‖ name` for collection names |
-| Cache key | `BLAKE3.derive_key("openvault v1 local cache key", local key)` | seals the kind and name in the index, so listing doesn't need collection keys |
+| Cache key | `BLAKE3.derive_key("openvault v1 local cache key", local key)` | seals the kind and name in the index, so listing doesn't need collection keys: `kind ‖ name`, or `kind ‖ size (u64) ‖ name` for a file |
 | Transport key | Ed25519 with seed `BLAKE3.derive_key("openvault v1 transport key", local key)` | the device's iroh identity, named in its add_device entry (design §7) |
 
 Looking up an entry costs one index read and one record read. Listing a collection reads its index rows and decrypts their names with the cache key. Neither scans history.
 
 ## Not in v1
 
-History pruning (N versions or D days), and files and chunks. The format leaves room for both: pruning works on headers alone, and files are kind `0x03`. Receiving records from other devices is in [sync.md](sync.md); received records go through the same version rule as local writes.
+History pruning (N versions or D days). The format leaves room for it: pruning works on headers alone. Files and their chunks are in [files.md](files.md). Receiving records from other devices is in [sync.md](sync.md); received records go through the same version rule as local writes.

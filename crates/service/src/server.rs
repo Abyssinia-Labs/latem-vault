@@ -143,6 +143,12 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
         watchers: AtomicUsize::new(0),
         joins: Mutex::new(Joins::default()),
     });
+    // Chunks that went unreferenced 30 days ago go now, a batch at a time (files.md, dropping
+    // chunks), so requests get the vault between batches.
+    {
+        let vault = shared.vault.clone();
+        tokio::task::spawn_blocking(move || sweep(&vault));
+    }
     #[cfg(feature = "coordinator")]
     let keeping = coordinator.map(|address| {
         info!("using the coordinator and relay at {}", address.hostname);
@@ -327,6 +333,28 @@ fn answer(shared: &Shared, request: Request) -> Response {
         }
     }
     response
+}
+
+/// Sweeps chunks that are due until none are left, releasing the vault between batches.
+fn sweep(vault: &Mutex<Vault<Keys>>) {
+    let mut deleted = 0;
+    loop {
+        match vault.lock().expect("poisoned").sweep_chunks() {
+            Ok(swept) => {
+                deleted += swept.deleted;
+                if !swept.more {
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!("sweeping chunks failed: {e:#}");
+                break;
+            }
+        }
+    }
+    if deleted > 0 {
+        info!(deleted, "swept chunks no file has named for 30 days");
+    }
 }
 
 /// Tells watching apps that `what` may have changed. Nobody watching isn't an error.

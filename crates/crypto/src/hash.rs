@@ -36,6 +36,9 @@ pub mod contexts {
     pub const JOIN_SESSION: &str = "openvault v1 join session";
     pub const GRANT_ID: &str = "openvault v1 grant id";
     pub const SYNC_FINGERPRINT: &str = "openvault v1 sync fingerprint";
+    pub const CHUNK_KEY: &str = "openvault v1 chunk key";
+    pub const CHUNK_NONCE_KEY: &str = "openvault v1 chunk nonce key";
+    pub const CHUNK_ID: &str = "openvault v1 chunk id";
 }
 
 #[cfg(test)]

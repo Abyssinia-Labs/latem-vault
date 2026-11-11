@@ -358,6 +358,7 @@ Estimates to check against real usage once there is any:
 - **Coordinator:** a handful of directory writes per device per day (network changes), log reads only after a change, and mailbox traffic only during joins. Mailbox expiry keeps the SQLite file bounded.
 - **Relay:** the variable cost, equal to the bytes of connections that can't go direct.
 - **Device to device:** idle peers exchange root hashes only: bytes per minute per pair.
+- **An idle device with a coordinator:** its relay connection, pinged every 15 seconds, an HTTPS probe to the relay every 20 to 26 seconds, and an exchange with the coordinator every 15 minutes: about 75 bytes a second, measured. It keeps no connection to the coordinator open, since iroh keeps every path of an open connection alive every 5 seconds.
 
 What to watch: relay egress; coordinator database size (a growing file means mailbox expiry isn't working).
 
@@ -384,7 +385,7 @@ Later: native Windows, Android, a Linux FUSE mount, a hardware security key for 
   - latem reads a repository's secrets from OpenVault first since latem#60 (its A86). The secrets moved from the one `latem` collection to one collection per repository (§15).
   - tsedal's Android preview build ran on the desktop, signed with the vault's keystore, and uploaded to Play. The mini joined too, and its iOS build signed and uploaded to TestFlight the same way.
   - Each machine runs `openvault service` from a LaunchAgent or a systemd user unit, written by hand for now.
-- **M3 is under way** ([coordinator.md](spec/coordinator.md)). Stage 1, `openvault grandfather` with its relay and the coordinator's log copy, and `openvault coordinator set` on devices, was built on 2026-11-10 and tested on one machine.
+- **M3 is under way** ([coordinator.md](spec/coordinator.md)). Stage 1, `openvault grandfather` with its relay and the coordinator's log copy, and `openvault coordinator set` on devices, was built on 2026-11-10. The same day it ran on the Mac mini as `grandfather.latem.dev`, with a Let's Encrypt certificate, and the MacBook, the desktop and the mini used it; the MacBook reached the coordinator and the relay from a phone's connection. Its idle traffic came out at about 2.5 KB a second per device, from iroh's keep-alives and holepunching on an open coordinator connection and from QUIC address discovery. Devices now exchange with the coordinator only when there is something to exchange and every 15 minutes, and the relay has no address discovery, which brought it to about 75 bytes a second ([coordinator.md, cost](spec/coordinator.md#cost)).
 
 ## 19. Open decisions
 

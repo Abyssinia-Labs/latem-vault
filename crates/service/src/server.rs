@@ -97,15 +97,15 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
         node,
         version: version.to_owned(),
     });
-    if let Some(address) = coordinator {
+    let keeping = coordinator.map(|address| {
         info!("using the coordinator and relay at {}", address.hostname);
         tokio::spawn(coordinator::keep(
             address,
             shared.node.clone(),
             shared.vault.clone(),
             shared.engine.clone(),
-        ));
-    }
+        ))
+    });
     let mut terminate = signal(SignalKind::terminate())?;
     let result = loop {
         tokio::select! {
@@ -149,6 +149,10 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
 
     let _ = fs::remove_file(&socket);
     info!("service stopped");
+    // Closing the endpoint ends the coordinator's connection, which isn't a failure to retry.
+    if let Some(keeping) = keeping {
+        keeping.abort();
+    }
     shared.node.close().await;
     drop(lock);
     result

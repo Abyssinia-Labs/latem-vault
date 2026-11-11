@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use iroh_relay::server::{
-    Access, AccessControl, AcmeConfig, CertConfig, ClientRequest, QuicConfig, RelayConfig, Server,
+    Access, AccessControl, AcmeConfig, CertConfig, ClientRequest, RelayConfig, Server,
     ServerConfig, TlsConfig, reloading_resolver,
 };
 use openvault_net::EndpointKey;
@@ -50,10 +50,9 @@ impl AccessControl for Admitted {
     }
 }
 
-/// Starts the relay: HTTPS on `https`, and QUIC address discovery on `quic`.
+/// Starts the relay: HTTPS on `https`, with no QUIC address discovery (coordinator.md, relay).
 pub(crate) async fn spawn(
     https: SocketAddr,
-    quic: SocketAddr,
     certificate: &Certificate,
     admitted: Admitted,
 ) -> anyhow::Result<Server> {
@@ -94,9 +93,8 @@ pub(crate) async fn spawn(
     relay.access = Arc::new(admitted);
     let mut config = ServerConfig::default();
     config.relay = Some(relay);
-    config.quic = Some(QuicConfig::new(quic));
     config.metrics_addr = None;
     Server::spawn(config)
         .await
-        .with_context(|| format!("can't start the relay on {https} and {quic}"))
+        .with_context(|| format!("can't start the relay on {https}"))
 }

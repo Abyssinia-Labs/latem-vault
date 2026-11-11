@@ -24,7 +24,6 @@ pub use iroh::tls::CaTlsConfig;
 pub use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use iroh::{NetReportConfig, RelayConfig, RelayMap, RelayMode, SecretKey};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
-use iroh_relay::RelayQuicConfig;
 use n0_future::StreamExt;
 use n0_future::boxed::BoxStream;
 use tokio::sync::mpsc;
@@ -93,8 +92,6 @@ impl Default for Options {
 #[derive(Clone, Debug)]
 pub struct Relay {
     pub url: RelayUrl,
-    /// The UDP port of its QUIC address discovery: [`coord::QAD_PORT`] but in tests.
-    pub quic_port: u16,
     /// What its certificate is checked against: the usual roots but in tests.
     pub roots: CaTlsConfig,
 }
@@ -103,7 +100,6 @@ impl Relay {
     pub fn new(url: RelayUrl) -> Self {
         Self {
             url,
-            quic_port: coord::QAD_PORT,
             roots: CaTlsConfig::default(),
         }
     }
@@ -119,10 +115,9 @@ pub fn builder(seed: &[u8; 32], options: &Options) -> Result<Builder, Error> {
     builder = match &options.relay {
         None => builder.relay_mode(RelayMode::Disabled),
         Some(relay) => {
-            let config = RelayConfig::new(
-                relay.url.clone(),
-                Some(RelayQuicConfig::new(relay.quic_port)),
-            );
+            // No QUIC address discovery: iroh would keep a connection to it open from every
+            // device. Its HTTPS probes, which name the home relay, stay (coordinator.md, relay).
+            let config = RelayConfig::new(relay.url.clone(), None);
             // The relay's plain-HTTP side isn't reachable (coordinator.md, relay).
             let mut report = NetReportConfig::default();
             report.captive_portal_check = false;

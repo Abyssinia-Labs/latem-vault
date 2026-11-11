@@ -15,7 +15,7 @@ use openvault_crypto::RecoveryKey;
 use openvault_grandfather::{Certificate, Config, Grandfather, Listen};
 use openvault_net::coord::{self, Address};
 use openvault_net::frame::Reason;
-use openvault_net::sync::{self, Notice, Role, SyncError};
+use openvault_net::sync::{self, Role, SyncError};
 use openvault_net::{CaTlsConfig, EndpointAddr, Options, Relay, RelayUrl};
 use tokio::sync::mpsc;
 
@@ -120,7 +120,6 @@ async fn grandfather(dir: &std::path::Path, vault: Option<VaultId>) -> (Grandfat
         listen: Listen {
             https: loopback,
             coordinator: vec![loopback],
-            quic: loopback,
         },
     })
     .await
@@ -130,7 +129,6 @@ async fn grandfather(dir: &std::path::Path, vault: Option<VaultId>) -> (Grandfat
         .unwrap();
     let relay = Relay {
         url,
-        quic_port: grandfather.quic_addr().unwrap().port(),
         roots: CaTlsConfig::custom_roots([cert.cert.der().clone()]),
     };
     (grandfather, relay)
@@ -168,32 +166,17 @@ async fn relay_only(seed: &[u8; 32], relay: &Relay) -> Endpoint {
         .unwrap()
 }
 
-/// A device's connection to the coordinator, running until the returned sender is dropped.
-/// Notices sent on it reach the session.
-fn connect(
-    endpoint: Endpoint,
-    address: Address,
-    store: Arc<Store>,
-) -> (
-    mpsc::Sender<Notice>,
-    tokio::task::JoinHandle<Result<(), SyncError>>,
-) {
-    let (send, mut notices) = mpsc::channel(8);
-    let task = tokio::spawn(async move {
-        let connection = coord::connect(&endpoint, &address).await?;
-        coord::run(connection, store, &mut notices, || {}).await
-    });
-    (send, task)
-}
-
-async fn until(what: &str, mut done: impl FnMut() -> bool) {
-    tokio::time::timeout(WAIT, async {
-        while !done() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+/// One exchange between a device and the coordinator, as its service has at start, when its log
+/// changes and every 15 minutes.
+async fn exchange(
+    endpoint: &Endpoint,
+    address: &Address,
+    store: &Arc<Store>,
+) -> Result<(), SyncError> {
+    let connection = coord::connect(endpoint, address).await?;
+    tokio::time::timeout(WAIT, coord::exchange(connection, store.clone(), || {}))
+        .await
+        .expect("an exchange ends")
 }
 
 fn head(store: &Store) -> u64 {
@@ -223,12 +206,11 @@ async fn members_sync_through_the_relay_and_strangers_are_refused() {
 
     // The admin gives the coordinator the log.
     let admin_direct = direct(&v.admin_seed).await;
-    let (_keep, _session) = connect(admin_direct, coordinator(&grandfather), v.admin.clone());
-    let expected = head(&v.admin);
-    until("the coordinator has the log", || {
-        grandfather.log_head() == Some(expected)
-    })
-    .await;
+    exchange(&admin_direct, &coordinator(&grandfather), &v.admin)
+        .await
+        .unwrap();
+    assert_eq!(grandfather.log_head(), Some(head(&v.admin)));
+    admin_direct.close().await;
 
     // Now both members get in, and sync with no direct path between them.
     let admin = relay_only(&v.admin_seed, &relay).await;
@@ -306,44 +288,33 @@ async fn the_coordinator_keeps_a_checked_log_for_devices_that_are_behind() {
     let (grandfather, _relay) = grandfather(v.dir.path(), Some(vault)).await;
     let address = coordinator(&grandfather);
 
-    // The admin connects and stays connected; a new collection reaches the coordinator.
+    // The admin gives the coordinator the log, and later a new collection; each exchange ends
+    // once the coordinator has what the admin has.
     let admin_direct = direct(&v.admin_seed).await;
-    let (admin_notices, _admin) = connect(admin_direct, address.clone(), v.admin.clone());
-    until("the coordinator has the log", || {
-        grandfather.log_head() == Some(head(&v.admin))
-    })
-    .await;
+    exchange(&admin_direct, &address, &v.admin).await.unwrap();
+    assert_eq!(grandfather.log_head(), Some(head(&v.admin)));
     v.admin
         .lock()
         .unwrap()
         .create_collection("ssh", &v.recovery.admin_signing_key())
         .unwrap();
-    admin_notices.send(Notice::Log).await.unwrap();
+    exchange(&admin_direct, &address, &v.admin).await.unwrap();
     let expected = head(&v.admin);
-    until("the coordinator has the new entry", || {
-        grandfather.log_head() == Some(expected)
-    })
-    .await;
+    assert_eq!(grandfather.log_head(), Some(expected));
 
-    // The joined device is behind, and catches up from the coordinator alone.
+    // The joined device is behind, and catches up from the coordinator alone. A second exchange
+    // finds the logs level at once.
     assert!(head(&v.joined) < expected);
     let joined_direct = direct(&v.joined_seed).await;
-    let (_joined_notices, _joined) =
-        connect(joined_direct.clone(), address.clone(), v.joined.clone());
-    until("the joined device catches up", || {
-        head(&v.joined) == expected
-    })
-    .await;
+    exchange(&joined_direct, &address, &v.joined).await.unwrap();
+    assert_eq!(head(&v.joined), expected);
+    exchange(&joined_direct, &address, &v.joined).await.unwrap();
 
     // Another vault's device is refused.
     let other = vaults(0);
     let other_direct = direct(&other.admin_seed).await;
-    let (_other_notices, other_session) = connect(other_direct, address.clone(), other.admin);
     assert!(matches!(
-        tokio::time::timeout(WAIT, other_session)
-            .await
-            .unwrap()
-            .unwrap(),
+        exchange(&other_direct, &address, &other.admin).await,
         Err(SyncError::Refused(Reason::WrongVault))
     ));
 
@@ -353,17 +324,16 @@ async fn the_coordinator_keeps_a_checked_log_for_devices_that_are_behind() {
         .unwrap()
         .revoke_device(v.joined_id, &v.recovery.admin_signing_key())
         .unwrap();
-    admin_notices.send(Notice::Log).await.unwrap();
+    exchange(&admin_direct, &address, &v.admin).await.unwrap();
     let revoked = head(&v.admin);
-    until("the coordinator has the revocation", || {
-        grandfather.log_head() == Some(revoked)
-    })
-    .await;
-    let (_again_notices, again) = connect(joined_direct, address, v.joined.clone());
+    assert_eq!(grandfather.log_head(), Some(revoked));
     assert!(matches!(
-        tokio::time::timeout(WAIT, again).await.unwrap().unwrap(),
+        exchange(&joined_direct, &address, &v.joined).await,
         Err(SyncError::Refused(Reason::NotAMember))
     ));
+    for endpoint in [admin_direct, joined_direct, other_direct] {
+        endpoint.close().await;
+    }
 
     // The copy lasts across a restart, and stays the vault's.
     let data = v.dir.path().to_owned();
@@ -384,7 +354,6 @@ async fn the_coordinator_keeps_a_checked_log_for_devices_that_are_behind() {
         listen: Listen {
             https: ([127, 0, 0, 1], 0).into(),
             coordinator: vec![([127, 0, 0, 1], 0).into()],
-            quic: ([127, 0, 0, 1], 0).into(),
         },
     })
     .await;

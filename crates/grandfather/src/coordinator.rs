@@ -1,6 +1,6 @@
 //! The coordinator's side of `openvault/coord/1` (coordinator.md, coordinator): a session per
-//! device connection, which brings the logs level and keeps the device's hellos coming while the
-//! connection lasts.
+//! device connection, which brings the logs level and says hello again once they are, which tells
+//! the device it can close.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -191,8 +191,8 @@ impl Session<'_> {
         self.progress().await
     }
 
-    /// Requests entries while the device is ahead, or everything while this copy is empty, and
-    /// checks the device is a member once the logs are level.
+    /// Requests entries while the device is ahead, or everything while this copy is empty. Once
+    /// the logs are level, checks the device is a member and says hello.
     async fn progress(&mut self) -> Result<(), SyncError> {
         let Some((peer_seq, peer_hash)) = self.peer_head else {
             return Ok(());
@@ -206,7 +206,8 @@ impl Session<'_> {
                     return Err(SyncError::Store(openvault_core::Error::Fork));
                 }
                 self.received = 0;
-                return self.require_member();
+                self.require_member()?;
+                return self.send_hello().await;
             }
             // The device is behind, and will ask; the request checks it's a member.
             Some(_) => return Ok(()),

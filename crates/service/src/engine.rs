@@ -164,8 +164,16 @@ impl Engine {
         }
     }
 
-    /// The log has new entries: every visible member hears of them.
+    /// The log has new entries: every visible member hears of them, and so does the coordinator.
     pub(crate) fn log_changed(self: &Arc<Self>) {
+        self.log_grew();
+        if let Some(coordinator) = &self.state.lock().expect("poisoned").coordinator {
+            let _ = coordinator.try_send(Notice::Log);
+        }
+    }
+
+    /// Entries from the coordinator grew the log: every visible member hears of them.
+    pub(crate) fn log_grew(self: &Arc<Self>) {
         self.notify(Notice::Log);
         for peer in self.visible_members() {
             self.dial(peer);
@@ -177,7 +185,7 @@ impl Engine {
         self.state.lock().expect("poisoned").retries.remove(peer);
     }
 
-    /// Where the coordinator's connection hears of log changes.
+    /// Where the coordinator's task hears of log changes.
     pub(crate) fn set_coordinator(&self, notices: mpsc::Sender<Notice>) {
         self.state.lock().expect("poisoned").coordinator = Some(notices);
     }
@@ -186,11 +194,6 @@ impl Engine {
         let state = self.state.lock().expect("poisoned");
         for running in state.sessions.values() {
             let _ = running.notices.try_send(notice);
-        }
-        if let Some(coordinator) = &state.coordinator
-            && notice == Notice::Log
-        {
-            let _ = coordinator.try_send(notice);
         }
     }
 

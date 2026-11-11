@@ -57,12 +57,10 @@ pub struct Listen {
     pub https: SocketAddr,
     /// The coordinator, on UDP: one socket per address family.
     pub coordinator: Vec<SocketAddr>,
-    /// The relay's QUIC address discovery, on UDP.
-    pub quic: SocketAddr,
 }
 
 impl Listen {
-    /// Every interface: TCP and UDP on `port`, and UDP [`coord::QAD_PORT`].
+    /// Every interface: TCP and UDP on `port`.
     pub fn all(port: u16) -> Self {
         Self {
             https: (Ipv6Addr::UNSPECIFIED, port).into(),
@@ -70,7 +68,6 @@ impl Listen {
                 (std::net::Ipv4Addr::UNSPECIFIED, port).into(),
                 (Ipv6Addr::UNSPECIFIED, port).into(),
             ],
-            quic: (Ipv6Addr::UNSPECIFIED, coord::QAD_PORT).into(),
         }
     }
 }
@@ -99,7 +96,6 @@ impl Grandfather {
             .secret_key(key)
             .alpns(vec![coord::ALPN.to_vec()])
             .relay_mode(RelayMode::Disabled)
-            .transport_config(coord::transport_config())
             .clear_ip_transports();
         // A host without IPv6 still runs it, over IPv4.
         for addr in &config.listen.coordinator {
@@ -114,7 +110,6 @@ impl Grandfather {
 
         let relay = relay::spawn(
             config.listen.https,
-            config.listen.quic,
             &config.certificate,
             Admitted {
                 coordinator: id,
@@ -157,11 +152,6 @@ impl Grandfather {
     /// Where the relay's HTTPS listens.
     pub fn https_addr(&self) -> Option<SocketAddr> {
         self.relay.https_addr()
-    }
-
-    /// Where the relay's QUIC address discovery listens.
-    pub fn quic_addr(&self) -> Option<SocketAddr> {
-        self.relay.quic_addr()
     }
 
     /// Where the coordinator listens.

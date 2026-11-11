@@ -1000,20 +1000,24 @@ fn service(home: &Home) -> Result<()> {
         .block_on(openvault_service::run(&home.0, keys, VERSION))
 }
 
-/// Sends the log to stderr, filtered by `OPENVAULT_LOG` or else by `default`.
+/// Sends the log to stderr, filtered by `OPENVAULT_LOG` or else by `default` and without the
+/// relay's connection errors.
 fn log_to_stderr(default: &str) {
+    use tracing_subscriber::filter::FilterExt as _;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::{EnvFilter, Layer, fmt};
 
-    let filter =
-        EnvFilter::try_from_env("OPENVAULT_LOG").unwrap_or_else(|_| EnvFilter::new(default));
+    let (filter, quiet) = match EnvFilter::try_from_env("OPENVAULT_LOG") {
+        Ok(filter) => (filter, false),
+        Err(_) => (EnvFilter::new(default), true),
+    };
     tracing_subscriber::registry()
         .with(
             fmt::layer()
                 .with_writer(io::stderr)
                 .with_target(false)
-                .with_filter(filter),
+                .with_filter(filter.and(grandfather::QuietConnectionErrors { quiet })),
         )
         // Starts mDNS again when it stops, whatever OPENVAULT_LOG leaves out (service.md).
         .with(openvault_net::discovery_watch())

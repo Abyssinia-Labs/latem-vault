@@ -1,7 +1,7 @@
 //! The device's side of the coordinator protocol (coordinator.md): on one stream of a connection
 //! with ALPN `openvault/coord/1`, a device and the grandfather's coordinator exchange hellos and
-//! bring their logs level. The device keeps the connection open while its service runs, and says
-//! hello again whenever its log grows.
+//! bring their logs level, and the device closes the connection. It connects when its log grows,
+//! and now and then to hear of entries it doesn't have.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -9,14 +9,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::endpoint::{ConnectOptions, Connection, QuicTransportConfig, RecvStream, SendStream};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use openvault_crypto::hash::Hash;
-use tokio::sync::mpsc;
 
 use crate::EndpointKey;
 use crate::frame::{self, FrameError, Reason};
-use crate::sync::{Notice, SyncError, SyncStore, blocking, next_message};
+use crate::sync::{SyncError, SyncStore, blocking};
 use crate::wire::{self, HELLO, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST};
 
 pub const ALPN: &[u8] = b"openvault/coord/1";
@@ -25,34 +24,14 @@ pub const ALPN: &[u8] = b"openvault/coord/1";
 /// for the coordinator.
 pub const DEFAULT_PORT: u16 = 443;
 
-/// The UDP port of the relay's QUIC address discovery, as iroh's relays use.
-pub const QAD_PORT: u16 = 7842;
-
-/// How often a quiet connection to the coordinator sends a keep-alive, which holds it open
-/// through home routers (coordinator.md, lifetime).
-pub const KEEP_ALIVE: Duration = Duration::from_secs(25);
-
-/// How long a connection to the coordinator lasts without hearing from it.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-
 /// The head hash in the hello of a coordinator that has no log yet.
 pub const NO_LOG: Hash = [0; 32];
 
+/// How long a device waits for the coordinator's next message before giving up on an exchange.
+pub const QUIET: Duration = Duration::from_secs(30);
+
 /// The most log entries a device takes from the coordinator before the logs are level again.
 const MAX_LOG: usize = 4096;
-
-/// The QUIC settings of a connection to the coordinator, on either side: keep-alives every
-/// [`KEEP_ALIVE`] instead of iroh's 5 seconds, since the connection lasts as long as the service.
-pub fn transport_config() -> QuicTransportConfig {
-    QuicTransportConfig::builder()
-        .keep_alive_interval(KEEP_ALIVE)
-        .default_path_keep_alive_interval(KEEP_ALIVE)
-        .default_path_max_idle_timeout(IDLE_TIMEOUT)
-        .max_idle_timeout(Some(
-            IDLE_TIMEOUT.try_into().expect("a timeout QUIC can carry"),
-        ))
-        .build()
-}
 
 /// A grandfather's address: `ov1:<endpoint id in hex>@<hostname>[:<port>]`
 /// (coordinator.md, running the grandfather).
@@ -165,29 +144,26 @@ pub async fn connect(endpoint: &Endpoint, address: &Address) -> Result<Connectio
         .await
         .map_err(|e| SyncError::Connect(format!("can't look up {}: {e}", address.hostname)))?;
     let addr = EndpointAddr::from_parts(id, addrs.into_iter().map(TransportAddr::Ip));
-    let options = ConnectOptions::new().with_transport_config(transport_config());
     endpoint
-        .connect_with_opts(addr, ALPN, options)
-        .await
-        .map_err(|e| SyncError::Connect(e.to_string()))?
+        .connect(addr, ALPN)
         .await
         .map_err(|e| SyncError::Connect(e.to_string()))
 }
 
-/// Runs the device's side on `connection` until the connection fails or the coordinator ends it.
-/// [`Notice::Log`] on `notices` says this device's log has grown; `grew` is called when entries
-/// from the coordinator grow it.
-pub async fn run<S: SyncStore>(
+/// Brings this device's log and the coordinator's level on `connection`, then closes it
+/// (coordinator.md, devices). The coordinator says hello first, and again once the logs are level
+/// and it has checked this device is a member: that second hello ends the exchange. `grew` is
+/// called when entries from the coordinator grow this device's log.
+pub async fn exchange<S: SyncStore>(
     connection: Connection,
     store: Arc<S>,
-    notices: &mut mpsc::Receiver<Notice>,
     grew: impl Fn(),
 ) -> Result<(), SyncError> {
     let (mut send, recv) = connection
         .open_bi()
         .await
         .map_err(|e| SyncError::Connect(e.to_string()))?;
-    let result = drive(&mut send, recv, &*store, notices, &grew).await;
+    let result = drive(&mut send, recv, &*store, &grew).await;
     if let Err(error) = &result
         && let Some(reason) = error.reason()
     {
@@ -199,83 +175,88 @@ pub async fn run<S: SyncStore>(
 
 async fn drive<S: SyncStore>(
     send: &mut SendStream,
-    recv: RecvStream,
+    mut recv: RecvStream,
     store: &S,
-    notices: &mut mpsc::Receiver<Notice>,
     grew: &impl Fn(),
 ) -> Result<(), SyncError> {
     let (vault, ..) = blocking(|| store.hello())?;
     send_hello(send, store).await?;
-    // One read stays in flight across the loop, as in a sync session.
-    let mut reading = Box::pin(next_message(recv));
     let mut coordinator_head = None;
+    let mut hellos = 0;
     let mut requested = false;
     let mut received = 0;
     loop {
-        tokio::select! {
-            (recv, message) = &mut reading => {
-                let (kind, body) = match message {
-                    Ok(message) => message,
-                    Err(FrameError::Peer { reason, .. }) => return Err(SyncError::Refused(reason)),
-                    Err(e) => return Err(e.into()),
-                };
-                reading.set(next_message(recv));
-                match kind {
-                    HELLO => {
-                        let (theirs, seq, hash) = wire::parse_hello(&body)?;
-                        if theirs != vault {
-                            return Err(SyncError::Refused(Reason::WrongVault));
-                        }
-                        coordinator_head = Some((seq, hash));
-                    }
-                    // The coordinator isn't a member, but it's the endpoint this device was told
-                    // to use, and the log isn't secret from it (coordinator.md, logs).
-                    LOG_REQUEST => {
-                        let (from, max) = wire::parse_log_request(&body)?;
-                        let entries = blocking(|| store.log_from(from, max.min(LOG_BATCH)))?;
-                        frame::write(send, LOG_ENTRIES, &wire::log_entries(&entries)).await?;
-                        continue;
-                    }
-                    LOG_ENTRIES => {
-                        requested = false;
-                        let entries = wire::parse_log_entries(&body)?;
-                        if entries.is_empty() {
-                            return Err(FrameError::Bad("no log entries").into());
-                        }
-                        received += entries.len();
-                        if received > MAX_LOG {
-                            return Err(FrameError::Bad("too many log entries").into());
-                        }
-                        if blocking(|| store.append_log(&entries))? > 0 {
-                            grew();
-                        }
-                    }
-                    _ => return Err(FrameError::Bad("unexpected message").into()),
+        let (kind, body) = match tokio::time::timeout(QUIET, frame::read(&mut recv)).await {
+            Ok(Ok(message)) => message,
+            Ok(Err(FrameError::Peer { reason, .. })) => return Err(SyncError::Refused(reason)),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(FrameError::Bad("the coordinator stopped answering").into()),
+        };
+        // Its first hello comes before it has read this device's, so only a later one can say
+        // the logs are level.
+        let mut answered = false;
+        match kind {
+            HELLO => {
+                let (theirs, seq, hash) = wire::parse_hello(&body)?;
+                if theirs != vault {
+                    return Err(SyncError::Refused(Reason::WrongVault));
                 }
-                let Some((seq, hash)) = coordinator_head else { continue };
-                if hash == NO_LOG && seq == 0 {
-                    // It has no log yet, and asks for this device's.
-                    continue;
+                coordinator_head = Some((seq, hash));
+                hellos += 1;
+                answered = hellos > 1;
+            }
+            // The coordinator isn't a member, but it's the endpoint this device was told to use,
+            // and the log isn't secret from it (coordinator.md, logs).
+            LOG_REQUEST => {
+                let (from, max) = wire::parse_log_request(&body)?;
+                let entries = blocking(|| store.log_from(from, max.min(LOG_BATCH)))?;
+                frame::write(send, LOG_ENTRIES, &wire::log_entries(&entries)).await?;
+                continue;
+            }
+            LOG_ENTRIES => {
+                requested = false;
+                let entries = wire::parse_log_entries(&body)?;
+                if entries.is_empty() {
+                    return Err(FrameError::Bad("no log entries").into());
                 }
-                let (_, mine, my_hash) = blocking(|| store.hello())?;
-                if seq > mine {
-                    if !requested {
-                        let max = LOG_BATCH.min(u16::try_from(seq - mine).unwrap_or(LOG_BATCH));
-                        frame::write(send, LOG_REQUEST, &wire::log_request(mine + 1, max)).await?;
-                        requested = true;
-                    }
-                } else if seq == mine {
-                    if hash != my_hash {
-                        return Err(SyncError::Store(openvault_core::Error::Fork));
-                    }
-                    received = 0;
+                received += entries.len();
+                if received > MAX_LOG {
+                    return Err(FrameError::Bad("too many log entries").into());
+                }
+                if blocking(|| store.append_log(&entries))? > 0 {
+                    grew();
                 }
             }
-            notice = notices.recv() => match notice {
-                Some(Notice::Log) => send_hello(send, store).await?,
-                Some(Notice::Changed(_)) => {}
-                None => return Ok(()),
-            },
+            _ => return Err(FrameError::Bad("unexpected message").into()),
+        }
+        let Some((seq, hash)) = coordinator_head else {
+            continue;
+        };
+        if hash == NO_LOG && seq == 0 {
+            // It has no log yet, and asks for this device's.
+            continue;
+        }
+        let (_, mine, my_hash) = blocking(|| store.hello())?;
+        if seq > mine {
+            if !requested {
+                let max = LOG_BATCH.min(u16::try_from(seq - mine).unwrap_or(LOG_BATCH));
+                frame::write(send, LOG_REQUEST, &wire::log_request(mine + 1, max)).await?;
+                requested = true;
+            }
+        } else if seq == mine {
+            if hash != my_hash {
+                return Err(SyncError::Store(openvault_core::Error::Fork));
+            }
+            if answered {
+                return Ok(());
+            }
+            if kind == LOG_ENTRIES {
+                // Caught up: the coordinator's next hello answers this one.
+                send_hello(send, store).await?;
+            }
+        } else if answered {
+            // This device's log grew during the exchange: the coordinator asks for the rest.
+            send_hello(send, store).await?;
         }
     }
 }

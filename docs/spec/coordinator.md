@@ -33,7 +33,7 @@ openvault grandfather install [same options]     start it at login, as service.m
 - **Its data directory** is `--data`, by default `grandfather` in the openvault directory.
 - **Its identity.** At its first start it creates an iroh secret key in `grandfather.key` in its data directory (mode 0600). Its endpoint id is the coordinator's identity. It is not a device: it isn't in the log and holds no collection keys.
 - **Its address**, which devices are given, is `ov1:<endpoint id in hex>@<hostname>[:<port>]`, with the port left out when it's 443. `openvault grandfather` prints it when it starts.
-- **Its ports.** The port is TCP for the relay's HTTPS and UDP for the coordinator. UDP 7842 is the relay's QUIC address discovery, as iroh's relays use.
+- **Its port.** The port is TCP for the relay's HTTPS and UDP for the coordinator. The relay has no QUIC address discovery, so there is no UDP 7842 (relay, below).
 - **One vault.** `--vault` names it at the first start, and the data directory remembers it. The coordinator takes only a log whose genesis has that vault id (membership.md, creating a vault), so a device of another vault can't take it over.
   - Until a device gives it the log, it takes the first genesis with that id. The vault id isn't secret (sync.md's hello carries it), so an endpoint that got there first could leave it holding another log. Devices would then be refused, which costs availability only; removing `coordinator.db` starts it over.
 - **Where it runs.**
@@ -41,12 +41,13 @@ openvault grandfather install [same options]     start it at login, as service.m
   - **On the Mac mini, natively,** with `openvault grandfather install`. Docker Desktop on macOS passes connections through its own network, so the relay would see that network's address instead of each device's, and could no longer tell devices their own public address, which hole punching needs.
 - **Reaching it from outside.**
   - `--hostname` must resolve to the home connection's public address (an A record, and an AAAA record where IPv6 works), kept current by dynamic DNS.
-  - The router forwards TCP and UDP on the port, and UDP 7842, to the grandfather.
+  - The router forwards TCP and UDP on the port to the grandfather.
 - **TLS.** Without `--cert`, the relay gets a certificate for `--hostname` from Let's Encrypt, answering its challenge on the port (TLS-ALPN-01), so the port must be 443 as seen from outside. It keeps the certificate in the data directory. With `--cert` and `--key`, it uses those PEM files and reads them again every hour, for a certificate issued another way, such as a DNS challenge.
 
 ## Relay
 
-- **The server** is iroh's relay (`iroh-relay`), run in the same process. It speaks HTTPS on the port, and answers QUIC address discovery on UDP 7842, which tells a device its own public address.
+- **The server** is iroh's relay (`iroh-relay`), run in the same process. It speaks HTTPS on the port.
+- **No QUIC address discovery.** iroh's relays usually answer it on UDP 7842, telling a device its public address for holepunching, and iroh keeps a connection to it open from every device: about 0.6 KB a second each when measured. Without it, devices behind different NATs reach each other through the relay. Devices still send the relay an HTTPS probe every 20 to 26 seconds, which is how iroh picks it as their home relay.
 - Its plain-HTTP side, which iroh's relays offer for captive-portal checks, listens on the loopback interface only. Devices skip that check.
 - **What it sees.** Traffic between two devices is QUIC, encrypted end to end between their transport keys. The relay sees which endpoints talk, when, and how much.
 - **Who may use it.** It admits:
@@ -57,6 +58,7 @@ openvault grandfather install [same options]     start it at login, as service.m
   It denies everyone else, so it isn't a free relay for the internet. iroh tries a refused connection again about every 16 seconds.
 - **When the list is read.** The relay checks an endpoint when it connects. A device revoked while connected keeps its connection until it drops; other devices refuse it anyway (sync.md), and a revoked device's own service leaves the relay (devices, below).
 - **Presence.** The relay knows which admitted endpoints are connected. That is what "online" means here, and it is kept in memory only, never written.
+- **Its log** leaves out iroh-relay's error for each HTTPS connection that failed. On a public port 443 those come from scanners and from handshakes that end early, Let's Encrypt's checks among them: 35 in the first hour of the first run, none of them the relay's own fault. `OPENVAULT_LOG` shows them again.
 
 ## Coordinator
 
@@ -67,7 +69,7 @@ The coordinator is an iroh endpoint with ALPN `openvault/coord/1`, listening on 
 - Any other endpoint may only post to the join board.
 - A revoked device gets error "not a member" (sync.md) after hello, and nothing else.
 
-**Lifetime.** A device keeps one connection to the coordinator while its service runs. A QUIC keep-alive every 25 seconds holds it open through the home router. If the connection fails, the device logs why and connects again after 30 seconds, doubling up to an hour, as for sync retries.
+**Lifetime.** A device connects to the coordinator for an exchange and closes the connection once the logs are level: when its service starts, when its own log changes, and every 15 minutes to hear of entries it doesn't have. It keeps no connection open: an open iroh connection keeps every path alive every 5 seconds and retries holepunching between the address pairs both sides have every 5 seconds, which iroh's settings can't turn down, and measured about 1.9 KB a second per device. If an exchange fails, the device logs why and tries again after 30 seconds, doubling up to an hour, as for sync retries; changes to its log meanwhile wait for that. A service that is stopping ends an exchange without a retry.
 
 ### Messages
 
@@ -90,8 +92,10 @@ Framing, hello, the log messages and errors are sync.md's. The rest:
 - Devices answer the coordinator's requests: it's the endpoint in the address they were given, and the log isn't secret from it (what the grandfather sees, below). The coordinator answers members only.
 - A coordinator with no log yet sends hello with seq 0 and a hash of zeros, and requests from seq 0.
 - The coordinator checks each entry as a device does (membership.md, accepting an entry), so it keeps only a log that admins signed.
-- Once the logs are level, a device that isn't a member in the copy gets error "not a member".
-- A device sends hello again when its log grows. When the coordinator's log grows, it sends hello to every other device connected to it, so they catch up while no other member is online.
+- Once the logs are level, a device that isn't a member in the copy gets error "not a member". Otherwise the coordinator sends hello again, and the device closes the connection. Its first hello comes before it has read the device's, so only a later one ends the exchange.
+- A device that took entries from the coordinator sends hello once it has caught up, for that answer. One whose log grew during the exchange sends hello again, and the coordinator asks for the rest.
+- A device waits at most 30 seconds for the coordinator's next message.
+- When the coordinator's log grows, it sends hello to every other device connected to it at the time. Other devices hear of the entries at their next exchange, or from a member they sync with.
 - The copy also tells the relay who the members are.
 - A fork is refused like any other entry that doesn't extend the chain. The coordinator keeps the log it has.
 
@@ -122,7 +126,7 @@ Framing, hello, the log messages and errors are sync.md's. The rest:
 - The endpoint's relay is the grandfather's relay, from the address.
 - It dials members with the relay's url as well as the addresses mDNS finds.
 - It adds a coordinator address lookup next to mDNS. Replacing a stopped mDNS (service.md, discovery) then replaces only the mDNS lookup.
-- It connects to the coordinator at start: hello, logs, address, watch.
+- It exchanges with the coordinator at start, when its log changes, and every 15 minutes (lifetime, above). In stage 1 an exchange is hello and logs.
 - If the coordinator says this device isn't a member, the service logs it, stops using the relay, and stops connecting to the coordinator until it starts again.
 - **Reachable members.** A member is reachable while mDNS shows it or the coordinator says it's online. Every rule in sync.md about visible members applies to reachable ones: sessions start when a member becomes reachable and after local writes and log entries, retries stop when it isn't reachable, and a member that isn't reachable is never dialed.
 
@@ -171,10 +175,10 @@ The join board and presence are in memory only.
 
 | Case | Cost |
 | --- | --- |
-| Idle, per device | One connection to the coordinator, kept alive every 25 seconds: about 3,500 small packets a day each way, well under 1 MB. No database reads. |
+| Idle, per device | About 75 bytes a second to the grandfather, in and out together: some 6 MB a day. The relay connection is pinged every 15 seconds, about 6 B/s. iroh sends the relay an HTTPS probe every 20 to 26 seconds, about 50 B/s. An exchange with the coordinator every 15 minutes is about 16 KB in all: about 17 B/s. No database reads. Measured on 2026-11-10 on the MacBook, over 12 minutes of nothing changing. Before exchanges and without address discovery taken out, it was about 2.5 KB a second: 1.9 KB/s for an open coordinator connection, and 0.6 KB/s for QUIC address discovery (lifetime and relay, above). |
 | A refused endpoint | A TLS connection to the relay about every 16 seconds, until it's a member. A revoked device's service stops after the coordinator refuses it. |
 | A network change | One address message, and one row write if the address changed. |
-| A log entry | Each connected device's hello and log exchange: one paged read of at most 64 entries. |
+| A log entry | An exchange from the device that made it, and from each other device at its next one: one paged read of at most 64 entries each. |
 | Presence | One online message per change, to each watching device. Nothing written. |
 | Joining | One board entry in memory for up to 10 minutes; the join's own traffic through the relay if it can't go direct. |
 | Relay | The bytes of sessions that can't go direct: the only cost that grows with data. |
@@ -182,8 +186,14 @@ The join board and presence are in memory only.
 **What to watch once it runs:**
 - `coordinator.db`'s size. It should stay about the log's size plus one row per device. Growth means addresses are being written when they don't change.
 - Bytes relayed per day. They should follow writes, and fall when direct paths work.
-- Coordinator connections, against the number of devices.
+- Coordinator connections: about 4 an hour per device while nothing changes, more after local log changes and failures.
+- A device's bytes a second to the grandfather while nothing changes: about 75 (`nettop -p <pid>` on the device). Kilobytes a second mean a connection is being kept open.
 - Address writes per device per day: a handful.
+
+## Not settled
+
+- **Presence and addresses (stage 2).** Watching, as above, keeps a connection to the coordinator open, which is what cost 1.9 KB a second per device. Stage 2 needs another way: a device could ask for addresses and who's online during an exchange, or dial a member through the relay when there is something to sync, which reaches it whenever it's connected to the relay and needs no presence at all.
+- **HTTPS probes.** iroh probes the relay every 20 to 26 seconds, which is how it keeps the relay as the home relay: about 50 bytes a second per device. It offers no setting to probe less often, and without probes a device has no home relay.
 
 ## Not in v1
 

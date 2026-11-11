@@ -9,13 +9,15 @@ use std::io::{self, ErrorKind};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use openvault_core::membership::Scope as CoreScope;
+use openvault_core::membership::{DeviceName, Scope as CoreScope};
 use openvault_core::{DeviceId, Kind as CoreKind, env_file};
-use openvault_keystore::Backend;
+use openvault_crypto::pake;
+use openvault_keystore::{Backend, Keys};
 use openvault_service::api::{self, ErrorCode, Request, Response};
-use openvault_service::client;
+use openvault_service::{client, setup};
+use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
@@ -294,6 +296,9 @@ pub struct DeviceHome {
     pub vault: bool,
     /// `None` without a key file.
     pub keys: Option<KeyStorage>,
+    /// Whether a join was begun here and not finished: [`join_vault`] resumes it, and
+    /// [`forget_join`] drops it.
+    pub joining: bool,
 }
 
 /// The openvault directory `home`, or `OPENVAULT_HOME` or `~/.openvault` without one: whether it
@@ -320,7 +325,214 @@ pub fn device_home(home: Option<String>) -> Result<DeviceHome, OpenVaultError> {
             .to_owned(),
         vault: home.join(openvault_service::VAULT).exists(),
         keys,
+        joining: setup::join_in_progress(&home),
     })
+}
+
+/// This computer's host name without `.local`, as a new device's name in the log.
+#[uniffi::export]
+pub fn default_device_name() -> String {
+    openvault_service::default_device_name()
+}
+
+/// Whether this Mac has a Secure Enclave for a new device's keys, which `init` and `join` then
+/// use unless told otherwise.
+#[uniffi::export]
+pub fn secure_enclave_available() -> bool {
+    Backend::SecureEnclave.is_available()
+}
+
+/// A vault [`create_vault`] made.
+#[derive(Debug, uniffi::Record)]
+pub struct NewVault {
+    pub vault: String,
+    pub device: String,
+    /// The recovery key's fingerprint, as [`VaultInfo`] gives it: `d06a 5f28`.
+    pub recovery: String,
+    /// The 24 words, to show once.
+    pub phrase: String,
+    /// Whether this device got an admin key: only with the Secure Enclave.
+    pub admin: bool,
+}
+
+/// Makes a vault in `home` with this device as its first member, as `openvault init` does
+/// (service.md, without the service). With the Secure Enclave the device gets an admin key too.
+/// `passphrase` is for [`KeyStorage::Passphrase`]. No service runs yet; start one after.
+#[uniffi::export]
+pub fn create_vault(
+    home: Option<String>,
+    keys: KeyStorage,
+    name: String,
+    passphrase: Option<String>,
+) -> Result<NewVault, OpenVaultError> {
+    let home = locate(home)?;
+    let passphrase = passphrase.map(Zeroizing::new);
+    if let Some(passphrase) = &passphrase {
+        openvault_keystore::check_passphrase(passphrase).map_err(|e| failed(e.to_string()))?;
+    }
+    DeviceName {
+        platform: std::env::consts::OS.into(),
+        name: name.clone(),
+    }
+    .check()
+    .map_err(|e| failed(e.to_string()))?;
+    let created = setup::create(
+        &home,
+        backend(keys),
+        passphrase.as_ref().map(|p| p.as_str()),
+        &name,
+    )
+    .map_err(|e| failed(format!("{e:#}")))?;
+    let recovery = openvault_crypto::hash::hash(created.vault.recovery_key().as_bytes());
+    Ok(NewVault {
+        vault: created.vault.vault_id().to_string(),
+        device: created.vault.device_id().to_string(),
+        recovery: fingerprint(&recovery[..4]),
+        phrase: created.recovery.to_phrase().to_string(),
+        admin: created.admin,
+    })
+}
+
+/// What happens while a joiner waits.
+#[derive(Debug, uniffi::Enum)]
+pub enum JoinProgress {
+    /// An admin typed a wrong code; `left` more tries before the join ends.
+    WrongCode { left: u8 },
+    /// An admin's session failed for another reason.
+    Failed { message: String },
+    /// The code matched, and the admin is choosing what this device may open.
+    CodeAccepted,
+}
+
+/// Hears a join's progress, on the library's thread.
+#[uniffi::export(with_foreign)]
+pub trait JoinListener: Send + Sync {
+    fn on_progress(&self, progress: JoinProgress);
+    /// Called once: `None` once this device is in the vault, otherwise why it isn't.
+    fn on_end(&self, error: Option<String>);
+}
+
+/// A join [`join_vault`] started: the code to show, until the listener hears the end.
+#[derive(uniffi::Object)]
+pub struct Joining {
+    code: Zeroizing<String>,
+    device: String,
+    stop: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+#[uniffi::export]
+impl Joining {
+    /// The 6 digits to type on an admin device.
+    pub fn code(&self) -> String {
+        self.code.to_string()
+    }
+
+    /// This device's id, as the admin will see it.
+    pub fn device(&self) -> String {
+        self.device.clone()
+    }
+
+    /// Stops waiting; the listener hears that it stopped. Dropping the join stops it too.
+    pub fn stop(&self) {
+        if let Some(stop) = self.stop.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+/// Starts joining a vault from `home`, as `openvault join` does: makes this device's keys with
+/// `keys`, or loads those of a join in progress, and announces it on the local network with a
+/// 6-digit code for an admin to type. It returns at once; the join runs on its own thread, on an
+/// endpoint of its own, for up to 10 minutes. Once `listener` hears it ended without an error,
+/// the vault is in `home`, and a service can start.
+#[uniffi::export]
+pub fn join_vault(
+    home: Option<String>,
+    keys: KeyStorage,
+    name: String,
+    passphrase: Option<String>,
+    listener: Arc<dyn JoinListener>,
+) -> Result<Arc<Joining>, OpenVaultError> {
+    let home = locate(home)?;
+    let name = DeviceName {
+        platform: std::env::consts::OS.into(),
+        name,
+    };
+    name.check().map_err(|e| failed(e.to_string()))?;
+    let passphrase = passphrase.map(Zeroizing::new);
+    let (keys, device) = setup::joining_keys(
+        &home,
+        backend(keys),
+        || match &passphrase {
+            Some(passphrase) => {
+                openvault_keystore::check_passphrase(passphrase)?;
+                Ok(passphrase.clone())
+            }
+            None => anyhow::bail!("keys behind a passphrase need one"),
+        },
+        |path| {
+            Ok(match &passphrase {
+                Some(passphrase) => Keys::load_with_passphrase(path, passphrase)?,
+                None => Keys::load(path)?,
+            })
+        },
+    )
+    .map_err(|e| failed(format!("{e:#}")))?;
+    let code = Zeroizing::new(pake::new_code());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let (stop, stopped) = oneshot::channel();
+    let joining = Arc::new(Joining {
+        code: code.clone(),
+        device: device.to_string(),
+        stop: Mutex::new(Some(stop)),
+    });
+    std::thread::Builder::new()
+        .name("openvault join".into())
+        .spawn(move || {
+            let progress = |progress| {
+                listener.on_progress(match progress {
+                    setup::JoinProgress::WrongCode { left } => {
+                        JoinProgress::WrongCode { left: left as u8 }
+                    }
+                    setup::JoinProgress::Failed(message) => JoinProgress::Failed { message },
+                    setup::JoinProgress::CodeAccepted => JoinProgress::CodeAccepted,
+                })
+            };
+            let stopped = async {
+                // A dropped sender stops the join as a sent stop does.
+                let _ = stopped.await;
+            };
+            let joined = runtime.block_on(setup::join(
+                &home, keys, device, &name, &code, progress, stopped,
+            ));
+            listener.on_end(joined.err().map(|e| format!("{e:#}")));
+        })?;
+    Ok(joining)
+}
+
+/// Forgets a join begun in `home` and not finished, so this device can make a vault, or join
+/// with other keys.
+#[uniffi::export]
+pub fn forget_join(home: Option<String>) -> Result<(), OpenVaultError> {
+    setup::forget_join(&locate(home)?).map_err(|e| failed(format!("{e:#}")))
+}
+
+fn backend(keys: KeyStorage) -> Backend {
+    match keys {
+        KeyStorage::SecureEnclave => Backend::SecureEnclave,
+        KeyStorage::Software => Backend::Software,
+        KeyStorage::Passphrase => Backend::Passphrase,
+    }
+}
+
+/// A recovery fingerprint's 4 bytes as the screens show them: `d06a 5f28`.
+fn fingerprint(bytes: &[u8]) -> String {
+    format!(
+        "{:02x}{:02x} {:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
 }
 
 /// `home`, or `OPENVAULT_HOME`, or `~/.openvault`, as the CLI finds it.
@@ -376,10 +588,7 @@ impl Client {
             Response::Vault(info) => Ok(VaultInfo {
                 vault: info.vault.to_string(),
                 device: info.device.to_string(),
-                recovery: format!(
-                    "{:02x}{:02x} {:02x}{:02x}",
-                    info.recovery[0], info.recovery[1], info.recovery[2], info.recovery[3]
-                ),
+                recovery: fingerprint(&info.recovery),
                 log_head: info.log_head,
                 admin: info.admin,
             }),
@@ -832,6 +1041,8 @@ impl From<Kind> for CoreKind {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -891,6 +1102,102 @@ mod tests {
         let found = device_home(Some(home.to_string_lossy().into_owned())).unwrap();
         assert_eq!((found.vault, found.keys), (false, None));
         assert_eq!(found.path, home.to_string_lossy());
+    }
+
+    #[test]
+    fn a_vault_is_made_without_the_service() {
+        let home = temp_home("create");
+        let path = Some(home.to_string_lossy().into_owned());
+        let made = create_vault(path.clone(), KeyStorage::Software, "Studio".into(), None).unwrap();
+        assert_eq!(made.phrase.split(' ').count(), 24);
+        assert_eq!(made.recovery.len(), 9);
+        assert!(!made.admin, "only the Secure Enclave gets an admin key");
+        let found = device_home(path.clone()).unwrap();
+        assert_eq!(
+            (found.vault, found.keys, found.joining),
+            (true, Some(KeyStorage::Software), false)
+        );
+        let again = create_vault(path, KeyStorage::Software, "Studio".into(), None).unwrap_err();
+        assert!(again.to_string().starts_with("there is already a vault"));
+        assert!(matches!(
+            create_vault(
+                None,
+                KeyStorage::Passphrase,
+                "x".into(),
+                Some("short".into())
+            ),
+            Err(OpenVaultError::Failed { .. })
+        ));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// Records what a join's listener hears.
+    #[derive(Default)]
+    struct Heard {
+        ended: std::sync::Mutex<Option<Option<String>>>,
+        done: std::sync::Condvar,
+    }
+
+    impl JoinListener for Heard {
+        fn on_progress(&self, _progress: JoinProgress) {}
+
+        fn on_end(&self, error: Option<String>) {
+            *self.ended.lock().unwrap() = Some(error);
+            self.done.notify_all();
+        }
+    }
+
+    #[test]
+    fn a_join_waits_until_stopped_and_can_be_forgotten() {
+        let home = temp_home("join");
+        let path = Some(home.to_string_lossy().into_owned());
+        let heard = Arc::new(Heard::default());
+        let joining = join_vault(
+            path.clone(),
+            KeyStorage::Software,
+            "Studio".into(),
+            None,
+            heard.clone(),
+        )
+        .unwrap();
+        assert!(joining.code().len() == 6 && joining.code().bytes().all(|b| b.is_ascii_digit()));
+        let found = device_home(path.clone()).unwrap();
+        assert_eq!((found.vault, found.joining), (false, true));
+
+        joining.stop();
+        let ended = heard
+            .done
+            .wait_timeout_while(heard.ended.lock().unwrap(), Duration::from_secs(10), |e| {
+                e.is_none()
+            })
+            .unwrap()
+            .0
+            .clone();
+        assert_eq!(ended, Some(Some("stopped waiting".into())));
+
+        // Joining again resumes as the same device, with the same keys.
+        let again = join_vault(
+            path.clone(),
+            KeyStorage::Software,
+            "Studio".into(),
+            None,
+            Arc::new(Heard::default()),
+        )
+        .unwrap();
+        assert_eq!(again.device(), joining.device());
+        drop(again);
+        forget_join(path.clone()).unwrap();
+        let found = device_home(path.clone()).unwrap();
+        assert_eq!((found.keys, found.joining), (None, false));
+        assert!(forget_join(path).is_err());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    fn temp_home(name: &str) -> PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("openvault-ffi-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        home
     }
 
     #[test]

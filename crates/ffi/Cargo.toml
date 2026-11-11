@@ -18,9 +18,12 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
+anyhow = "1.0.104"
 openvault-core = { path = "../core" }
+openvault-crypto = { path = "../crypto" }
 openvault-keystore = { path = "../keystore" }
 openvault-service = { path = "../service" }
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 uniffi = { version = "0.32.2", features = ["cli"] }
 zeroize = "1.9"

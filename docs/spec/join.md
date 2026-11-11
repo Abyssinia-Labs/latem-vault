@@ -1,6 +1,6 @@
 # Join spec, v1
 
-Status: draft, 2026-11-07. Implemented on the local network: the PAKE in `crates/crypto` (`pake`), the request, approval and the joiner's store in `crates/core` (`join`, `Vault::approve_join`, `Vault::join`), the messages in `crates/net` (`join`), and the commands in `crates/cli`. Builds on [membership.md](membership.md), [keystore.md](keystore.md) and [sync.md](sync.md), whose connections and message framing it uses. The design is in [design §8](../design.md#8-joining).
+Status: draft, 2026-11-07. Implemented on the local network: the PAKE in `crates/crypto` (`pake`), the request, approval and the joiner's store in `crates/core` (`join`, `Vault::approve_join`, `Vault::join`), the messages in `crates/net` (`join`), the joiner's side in `crates/service` (`setup`), which the CLI and the apps share, and the commands in `crates/cli`. Builds on [membership.md](membership.md), [keystore.md](keystore.md) and [sync.md](sync.md), whose connections and message framing it uses. The design is in [design §8](../design.md#8-joining).
 
 A new device joins a vault in one sitting:
 
@@ -24,12 +24,13 @@ openvault approve [--write|--read|--hold <collection>]...   on an admin device
 - Waits up to 10 minutes for an admin, showing the code.
 - Running it again on the same device reuses the keys and the device id, and shows a new code.
 - It runs its own endpoint, with ALPN `openvault/join/1`. There is no vault yet for a service to hold.
+- The Mac app joins the same way, through its bindings (service.md, without the service). It can also forget a join in progress, to make a vault instead or join with other keys. An admin that had approved it then has a device that never arrives, to revoke.
 
 **approve**
 - Looks for devices waiting to join on the local network for up to 15 seconds. It picks the device itself if there is only one, and otherwise asks which.
 - Asks for that device's code and shows the device for review.
 - Scopes come from its flags. A device approved without any has none until `openvault scope` sets them.
-- It opens the vault itself and runs its own endpoint, which mDNS doesn't announce, even while `openvault service` runs. The service sees the new entries on its next request (service.md, the store).
+- While `openvault service` runs, it asks the service, which checks the code and signs (service.md, for apps). Otherwise it opens the vault itself and runs its own endpoint, which mDNS doesn't announce.
 - A vault without a membership log yet can't approve anyone. Creating a collection starts the log (membership.md, creating a vault).
 
 ## Finding the device

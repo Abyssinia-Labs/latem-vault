@@ -14,6 +14,7 @@ mod engine;
 pub mod handler;
 #[cfg(unix)]
 mod server;
+pub mod setup;
 
 #[cfg(unix)]
 pub use server::run;

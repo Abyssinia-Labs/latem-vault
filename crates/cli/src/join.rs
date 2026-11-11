@@ -4,44 +4,34 @@
 //! goes through the service when one runs (service.md, for apps), and otherwise runs its own
 //! endpoint and opens the vault itself.
 
-use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use openvault_core::membership::{AdminKey as _, DeviceName, Scope};
-use openvault_core::{CollectionId, DeviceId, Vault, transport_seed};
+use openvault_core::{CollectionId, Vault, transport_seed};
 use openvault_crypto::pake;
 use openvault_keystore::{AdminKey, Backend, Keys};
-use openvault_net::join::{self, AdminSession, JoinError, JoinerSession};
+use openvault_net::join::{self, AdminSession, JoinError};
 use openvault_net::{EndpointKey, Node, Options};
 use tokio::runtime::Runtime;
 use tokio::time::Instant;
 
 use openvault_service::handler;
+use openvault_service::setup::{self, ATTEMPTS, JoinProgress};
 
-use crate::{Home, create_private_dir, load_keys, read_new_passphrase, read_recovery_phrase};
+use crate::{Home, load_keys, read_new_passphrase, read_recovery_phrase};
 
-/// The file that holds a joining device's id until the join completes, so running `join` again
-/// resumes with the same identity (join.md, commands).
-const JOINING: &str = "joining";
-/// How long a code is shown for (join.md, the code).
-const JOIN_TIME: Duration = Duration::from_secs(10 * 60);
-/// Failed PAKE sessions before the joiner, or `approve`, gives up.
-const ATTEMPTS: usize = 3;
 /// How long `approve` looks for joining devices.
 const LOOK_TIME: Duration = Duration::from_secs(15);
 
 pub fn join(home: &Home, backend: Backend, name: String) -> Result<()> {
-    if home.vault().exists() {
-        bail!("this device is already in a vault ({})", home.0.display());
-    }
     let name = DeviceName {
         platform: std::env::consts::OS.into(),
         name,
     };
     name.check()?;
-    let (keys, device) = joining_keys(home, backend)?;
+    let (keys, device) = setup::joining_keys(&home.0, backend, read_new_passphrase, load_keys)?;
     let code = pake::new_code();
 
     println!("Joining as {} ({}).", name.name, name.platform);
@@ -54,129 +44,26 @@ pub fn join(home: &Home, backend: Backend, name: String) -> Result<()> {
     println!();
     println!("Waiting up to 10 minutes. Ctrl-C cancels.");
 
-    let runtime = runtime()?;
-    let vault = runtime.block_on(async {
-        let options = Options {
-            alpns: vec![join::ALPN.to_vec()],
-            announcement: Some(join::announcement(&name)),
-            ..Options::default()
-        };
-        let (node, _events) = Node::start(&transport_seed(&keys), options).await?;
-        let result = accept_join(home, &node, keys, device, &name, &code).await;
-        node.close().await;
-        result
-    })?;
-    let _ = fs::remove_file(home.0.join(JOINING));
+    let progress = |progress| match progress {
+        JoinProgress::WrongCode { .. } => eprintln!("A device tried a wrong code."),
+        JoinProgress::Failed(error) => eprintln!("A join attempt failed: {error}"),
+        JoinProgress::CodeAccepted => {
+            println!("Code accepted. Waiting for the admin to approve this device...");
+        }
+    };
+    let joined = runtime()?.block_on(setup::join(
+        &home.0,
+        keys,
+        device,
+        &name,
+        &code,
+        progress,
+        std::future::pending(),
+    ));
+    let vault = joined.context("run `openvault join` again for a new code")?;
     println!();
     println!("Joined the vault {} as {}.", vault.vault_id(), name.name);
     Ok(())
-}
-
-/// The keys and id of a join in progress, or new ones.
-fn joining_keys(home: &Home, backend: Backend) -> Result<(Keys, DeviceId)> {
-    let joining = home.0.join(JOINING);
-    if home.keys().exists() {
-        let id = fs::read_to_string(&joining).with_context(|| {
-            format!(
-                "{} has a key file but no vault and no join in progress",
-                home.0.display()
-            )
-        })?;
-        let device = id.trim().parse().context("the joining file is damaged")?;
-        return Ok((load_keys(&home.keys())?, device));
-    }
-    let passphrase = match backend {
-        Backend::Passphrase => Some(read_new_passphrase()?),
-        _ => None,
-    };
-    create_private_dir(&home.0)?;
-    let keys = match &passphrase {
-        Some(passphrase) => Keys::create_with_passphrase(&home.keys(), passphrase)?,
-        None => Keys::create(&home.keys(), backend)?,
-    };
-    let device = DeviceId::random();
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let written = options
-        .open(&joining)
-        .and_then(|mut file| writeln!(file, "{device}"));
-    if let Err(e) = written {
-        let _ = fs::remove_file(home.keys());
-        return Err(e).context("can't save the joining device's id");
-    }
-    Ok((keys, device))
-}
-
-/// Answers admins until one completes the join, three sessions fail, or the time is up.
-async fn accept_join(
-    home: &Home,
-    node: &Node,
-    keys: Keys,
-    device: DeviceId,
-    name: &DeviceName,
-    code: &str,
-) -> Result<Vault<Keys>> {
-    let deadline = Instant::now() + JOIN_TIME;
-    let mut failures = 0;
-    loop {
-        let incoming = tokio::select! {
-            incoming = node.endpoint().accept() => incoming.context("the endpoint closed")?,
-            _ = tokio::time::sleep_until(deadline) => {
-                bail!("no admin approved this device within 10 minutes; run `openvault join` again");
-            }
-        };
-        let Ok(connection) = incoming.await else {
-            continue;
-        };
-        let mut session = match JoinerSession::accept(connection, node.id(), code).await {
-            Ok(session) => session,
-            Err(error) => {
-                failures += 1;
-                match error {
-                    JoinError::WrongCode => eprintln!("A device tried a wrong code."),
-                    other => eprintln!("A join attempt failed: {other}"),
-                }
-                if failures == ATTEMPTS {
-                    bail!("three join attempts failed; run `openvault join` again for a new code");
-                }
-                continue;
-            }
-        };
-        println!("Code accepted. Waiting for the admin to approve this device...");
-        let request = openvault_core::join::JoinRequest::sign(
-            session.session_id(),
-            device,
-            &keys,
-            name.clone(),
-        )?;
-        let accepted = session.request(&request, deadline).await?;
-        let (log, grants) = session.receive(accepted.head).await?;
-        return match Vault::join(
-            &home.vault(),
-            keys,
-            device,
-            name,
-            accepted.head,
-            &log,
-            &grants,
-        ) {
-            Ok(vault) if vault.vault_id() == accepted.vault => {
-                session.joined().await?;
-                Ok(vault)
-            }
-            Ok(_) => {
-                let _ = fs::remove_file(home.vault());
-                session.fail("the log is another vault's").await;
-                bail!("the admin sent another vault's log")
-            }
-            Err(error) => {
-                session.fail(&error.to_string()).await;
-                Err(anyhow!(error).context("the admin's vault didn't check out"))
-            }
-        };
-    }
 }
 
 pub fn approve(home: &Home, write: &[String], read: &[String], hold: &[String]) -> Result<()> {

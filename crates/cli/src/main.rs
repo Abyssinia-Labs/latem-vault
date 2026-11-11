@@ -22,16 +22,14 @@ use std::process::{self, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use openvault_core::membership::AdminKey as _;
 use openvault_core::membership::Scope;
 use openvault_core::names::is_env_name;
 use openvault_core::record::MAX_VALUE_LEN;
 use openvault_core::{Kind, Vault, env_file, names};
-use openvault_crypto::RecoveryKey;
-use openvault_keystore::{AdminKey, Backend, Keys};
+use openvault_keystore::{Backend, Keys};
 use openvault_service::api::{DeviceSummary, ErrorCode, Item, Listed, Request, Response, Value};
 use openvault_service::handler::{self, unexpected};
-use openvault_service::{ADMIN_KEY, KEYS, SOCKET, VAULT, default_device_name};
+use openvault_service::{ADMIN_KEY, KEYS, SOCKET, VAULT, default_device_name, setup};
 use zeroize::Zeroizing;
 
 /// This build: its version, and the commit it was built from (README, versions).
@@ -612,28 +610,14 @@ fn init(home: &Home, backend: Backend, name: &str) -> Result<()> {
         Backend::Passphrase => Some(read_new_passphrase()?),
         _ => None,
     };
-    create_private_dir(&home.0)?;
-    let keys = match &passphrase {
-        Some(passphrase) => Keys::create_with_passphrase(&home.keys(), passphrase)?,
-        None => Keys::create(&home.keys(), backend)?,
-    };
-    let remove_files = || {
-        let _ = fs::remove_file(home.keys());
-        let _ = fs::remove_file(home.admin());
-    };
-    // The device that creates the vault administers it (design §14). A Mac with a Secure
-    // Enclave gets an admin key that asks for Touch ID; anywhere else, the recovery phrase is
-    // the only admin key.
-    let admin = match backend {
-        Backend::SecureEnclave => {
-            Some(AdminKey::create(&home.admin()).inspect_err(|_| remove_files())?)
-        }
-        Backend::Software | Backend::Passphrase => None,
-    };
-    let recovery = RecoveryKey::generate();
-    let admin_key = admin.as_ref().map(|admin| admin.verifying_key());
-    let vault = Vault::create(&home.vault(), keys, &recovery, name, admin_key)
-        .inspect_err(|_| remove_files())?;
+    let setup::Created {
+        vault, recovery, ..
+    } = setup::create(
+        &home.0,
+        backend,
+        passphrase.as_deref().map(String::as_str),
+        name,
+    )?;
 
     let (keys, admin) = match backend {
         Backend::SecureEnclave => (
@@ -1381,14 +1365,4 @@ fn read_value(kind: Kind) -> Result<Zeroizing<Vec<u8>>> {
         }
     }
     Ok(value)
-}
-
-fn create_private_dir(path: &Path) -> Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder
-        .create(path)
-        .with_context(|| format!("can't create {}", path.display()))
 }

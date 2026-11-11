@@ -1,6 +1,6 @@
 # Service spec, v1
 
-Status: draft, 2026-11-07. Changed 2026-11-09: starting at login, and the status request. Changed 2026-11-11: `--log`, the Mac app's LaunchAgent, and `parseEnv`. Implemented by `crates/net` (the endpoint and discovery), `crates/service` (the service and its local API) and `crates/cli` (starting at login). Builds on [records.md](records.md), [membership.md](membership.md) and [keystore.md](keystore.md). Sync ([sync.md](sync.md)) and joining ([join.md](join.md)) run inside it once they are built. The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking) and [§14](../design.md#14-interfaces).
+Status: draft, 2026-11-07. Changed 2026-11-09: starting at login, and the status request. Changed 2026-11-11: `--log`, the Mac app's LaunchAgent, `parseEnv`, and making or joining a vault from the bindings. Implemented by `crates/net` (the endpoint and discovery), `crates/service` (the service and its local API) and `crates/cli` (starting at login). Builds on [records.md](records.md), [membership.md](membership.md) and [keystore.md](keystore.md). Sync ([sync.md](sync.md)) and joining ([join.md](join.md)) run inside it once they are built. The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking) and [§14](../design.md#14-interfaces).
 
 `openvault service` is the one process on a device that holds the vault open. It:
 - unlocks the device's keys once, so a passphrase is typed once per run rather than once per command;
@@ -209,9 +209,13 @@ Since 0.3.3, for the Mac app (design §12), which reaches the service through th
 - A session ends after approve or refuse, when the joiner goes away, or after 10 minutes, the code's lifetime. At most 4 are open at once.
 - `openvault approve` uses these when the service runs, and its own endpoint otherwise.
 
-**Without the service.** The bindings also read two things themselves:
-- `deviceHome` (0.3.4) says whether an openvault directory holds a vault, and how its keys are kept.
+**Without the service.** The bindings also do some things themselves:
+- `deviceHome` (0.3.4) says whether an openvault directory holds a vault, how its keys are kept, and (0.3.6) whether a join was begun there and not finished.
 - `parseEnv` (0.3.5) reads a `.env` file with `import-env`'s parser, which is in `openvault-core` for that reason. An app's import then reads each file the same way the CLI and latem do. The parser refuses a NUL byte in a value, which no environment variable can hold.
+- `createVault` (0.3.6) makes a vault as `openvault init` does, and returns the recovery phrase to show once. With the Secure Enclave the device gets an admin key too.
+- `joinVault` (0.3.6) joins one as `openvault join` does (join.md, commands). It returns the code at once and runs the join on a thread of its own, on an endpoint of its own, telling a listener when an admin types a wrong code, when the code matched, and how it ended. `stop` ends it, and so does dropping it. `forgetJoin` removes the keys of a join that didn't finish.
+- `defaultDeviceName` and `secureEnclaveAvailable` (0.3.6) give the defaults `init` and `join` use: the host name, and the Secure Enclave when there is one.
+- These are what `init` and `join` do without the terminal, in `openvault_service::setup`, so the CLI and the apps share them. There's no service until the vault exists; the app starts one after.
 
 ## The CLI
 

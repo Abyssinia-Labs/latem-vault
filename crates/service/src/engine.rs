@@ -7,16 +7,18 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openvault_core::sets::SetId;
 use openvault_core::{DeviceId, Vault};
 use openvault_keystore::Keys;
 use openvault_net::sync::{self, Notice, Outcome, Role, SyncError};
 use openvault_net::{EndpointAddr, EndpointId, EndpointKey, Node, RelayUrl};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
+
+use crate::api::{Event, Peer, PeerState};
 
 /// The first retry after a failed session, doubling to [`LAST_RETRY`] (sync.md, retries).
 const FIRST_RETRY: Duration = Duration::from_secs(30);
@@ -27,6 +29,8 @@ pub(crate) struct Engine {
     vault: Arc<Mutex<Vault<Keys>>>,
     /// The grandfather's relay, if a coordinator is configured.
     relay: Option<RelayUrl>,
+    /// What watching apps hear of (service.md, for apps).
+    events: broadcast::Sender<Event>,
     state: Mutex<State>,
     next_id: AtomicU64,
 }
@@ -36,6 +40,10 @@ struct State {
     sessions: HashMap<EndpointKey, Running>,
     /// The delay before the next retry, for peers whose last session failed.
     retries: HashMap<EndpointKey, Duration>,
+    /// Why each peer's last session failed, and when the next try is due.
+    failures: HashMap<EndpointKey, (String, Instant)>,
+    /// When mDNS stopped showing each peer that has gone, since the service started.
+    gone_at: HashMap<EndpointKey, Instant>,
     /// The connection to the coordinator, which says hello again when the log grows.
     coordinator: Option<mpsc::Sender<Notice>>,
 }
@@ -52,10 +60,12 @@ impl Engine {
         node: Arc<Node>,
         vault: Arc<Mutex<Vault<Keys>>>,
         relay: Option<RelayUrl>,
+        events: broadcast::Sender<Event>,
     ) -> Arc<Self> {
         Arc::new(Self {
             node,
             vault,
+            events,
             relay,
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(0),
@@ -107,6 +117,7 @@ impl Engine {
                 task: task.abort_handle(),
             },
         );
+        self.emit(Event::DEVICES);
     }
 
     /// Takes a connection a peer opened. If both opened one at the same time, the one opened by
@@ -145,6 +156,7 @@ impl Engine {
                 task: task.abort_handle(),
             },
         );
+        self.emit(Event::DEVICES);
     }
 
     /// A local write changed `set`: running sessions send it on, and visible members that share
@@ -182,7 +194,56 @@ impl Engine {
 
     /// A peer stopped being visible: retries stop until it reappears (sync.md, retries).
     pub(crate) fn gone(&self, peer: &EndpointKey) {
-        self.state.lock().expect("poisoned").retries.remove(peer);
+        let mut state = self.state.lock().expect("poisoned");
+        state.retries.remove(peer);
+        state.failures.remove(peer);
+        state.gone_at.insert(*peer, Instant::now());
+    }
+
+    /// Each of `members`' sync state (service.md, for apps).
+    pub(crate) fn peers(&self, members: &[(DeviceId, EndpointKey)]) -> Vec<Peer> {
+        let visible = self.node.visible();
+        let state = self.state.lock().expect("poisoned");
+        let now = Instant::now();
+        members
+            .iter()
+            .map(|(device, key)| {
+                let on_network = visible.contains(key);
+                let failure = state.failures.get(key);
+                Peer {
+                    device: *device,
+                    state: if state.sessions.contains_key(key) {
+                        PeerState::Syncing
+                    } else if failure.is_some() {
+                        PeerState::Failing
+                    } else if on_network {
+                        PeerState::OnNetwork
+                    } else {
+                        PeerState::NotSeen
+                    },
+                    seen: if on_network {
+                        Some(0)
+                    } else {
+                        state.gone_at.get(key).map(|at| {
+                            u32::try_from(now.duration_since(*at).as_secs()).unwrap_or(u32::MAX - 1)
+                        })
+                    },
+                    retry_in: failure.map_or(0, |(_, at)| {
+                        u32::try_from(at.saturating_duration_since(now).as_secs())
+                            .unwrap_or(u32::MAX)
+                    }),
+                    error: failure.map(|(error, _)| error.clone()).unwrap_or_default(),
+                }
+            })
+            .collect()
+    }
+
+    /// Tells watching apps that `what` may have changed. Nobody watching isn't an error.
+    fn emit(&self, what: u8) {
+        let _ = self.events.send(Event {
+            what,
+            collections: Vec::new(),
+        });
     }
 
     /// Where the coordinator's task hears of log changes.
@@ -219,6 +280,15 @@ impl Engine {
         match result {
             Ok(outcome) => {
                 state.retries.remove(&peer);
+                state.failures.remove(&peer);
+                let mut what = Event::DEVICES;
+                if outcome.received > 0 {
+                    what |= Event::ENTRIES;
+                }
+                if outcome.log_received > 0 {
+                    what |= Event::LOG;
+                }
+                self.emit(what);
                 match describe(&outcome) {
                     Some(moved) => info!("synced with {name}: {moved}"),
                     None => debug!("synced with {name}: nothing new"),
@@ -236,6 +306,10 @@ impl Engine {
             Err(error) => {
                 let delay = *state.retries.get(&peer).unwrap_or(&FIRST_RETRY);
                 state.retries.insert(peer, (delay * 2).min(LAST_RETRY));
+                state
+                    .failures
+                    .insert(peer, (error.to_string(), Instant::now() + delay));
+                self.emit(Event::DEVICES);
                 warn!(
                     "sync with {name} failed: {error}; retrying in {}s if it stays visible",
                     delay.as_secs()

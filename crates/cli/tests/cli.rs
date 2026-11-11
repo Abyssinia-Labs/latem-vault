@@ -1095,3 +1095,278 @@ fn services_sync_a_joined_device() {
     );
     assert!(admin_service.stop());
 }
+
+/// The requests the Mac app makes (service.md, for apps), straight on the socket.
+#[cfg(unix)]
+#[test]
+fn apps_read_and_watch_through_the_service() {
+    use std::time::{Duration, Instant};
+
+    use openvault_core::Kind;
+    use openvault_core::membership::Scope;
+    use openvault_service::api::{self, Event, Request, Response, Signer};
+
+    let device = Device::new();
+    device.set("latem/prod/SENTRY_DSN", "--secret", b"https://sentry");
+    device.set("latem/prod/REGION", "--var", b"eu west");
+    let service = Service::start(&device);
+    let socket = device.home.path().join("service.sock");
+    let call = |request: Request| {
+        openvault_service::client::call(&socket, &request)
+            .unwrap()
+            .unwrap()
+    };
+
+    let Response::Vault(info) = call(Request::Vault) else {
+        panic!("no vault info: {}", service.log());
+    };
+    assert!(!info.admin, "software keys have no admin key");
+    let recovery = RecoveryKey::from_phrase(&device.phrase).unwrap();
+    let fingerprint = openvault_crypto::hash::hash(recovery.unwrap_key().wrap_key().as_bytes());
+    assert_eq!(info.recovery, fingerprint[..4]);
+
+    let Response::CollectionSummaries(summaries) = call(Request::CollectionSummaries) else {
+        panic!("no summaries");
+    };
+    assert_eq!(summaries.len(), 1);
+    let latem = &summaries[0];
+    assert_eq!(
+        (
+            latem.name.as_str(),
+            latem.secrets,
+            latem.variables,
+            latem.key
+        ),
+        ("latem", 1, 1, 0)
+    );
+    assert_eq!(latem.devices, [(info.device, Scope::Write)]);
+
+    let Response::EntryDetails(details) = call(Request::EntryDetails {
+        collection: "latem".into(),
+    }) else {
+        panic!("no entry details");
+    };
+    let shown: Vec<_> = details
+        .iter()
+        .map(|d| (d.name.as_str(), d.kind, &d.value[..], d.set_by, d.key))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("prod/REGION", Kind::Var, &b"eu west"[..], info.device, 0),
+            // A list never holds a secret's value.
+            ("prod/SENTRY_DSN", Kind::Secret, &b""[..], info.device, 0),
+        ]
+    );
+
+    let Response::Log(lines) = call(Request::Log { from: 0, max: 256 }) else {
+        panic!("no log");
+    };
+    assert_eq!(lines[0].change, 0x01, "genesis comes first");
+    assert!(lines.iter().all(|line| line.signer == Signer::Recovery));
+    assert_eq!(lines.last().unwrap().seq, info.log_head);
+    let Response::Log(page) = call(Request::Log {
+        from: info.log_head,
+        max: 5,
+    }) else {
+        panic!("no log page");
+    };
+    assert_eq!(page.len(), 1);
+
+    // A change to the scope the device already has is refused before the phrase is needed.
+    let Response::Error { message, .. } = call(Request::SetScopes {
+        device: info.device,
+        changes: vec![("latem".into(), Scope::Write)],
+        recovery_phrase: None,
+    }) else {
+        panic!("an unchanged scope was set");
+    };
+    assert!(message.contains("already has those scopes"), "{message}");
+    let Response::Peers(peers) = call(Request::Peers) else {
+        panic!("no peers");
+    };
+    assert!(peers.is_empty(), "{peers:?}");
+
+    // A watch hears of a write by another command.
+    let mut watch = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    api::write_message(&mut watch, &Request::Watch.encode()).unwrap();
+    let (kind, body) = api::read_message(&mut watch).unwrap();
+    assert!(matches!(Response::decode(kind, &body), Ok(Response::Done)));
+    watch
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    device.set("latem/prod/TOKEN", "--secret", b"abc");
+    let started = Instant::now();
+    loop {
+        assert!(started.elapsed() < Duration::from_secs(10), "no event");
+        let (kind, body) = api::read_message(&mut watch).unwrap();
+        let Ok(Response::Event(event)) = Response::decode(kind, &body) else {
+            panic!("not an event");
+        };
+        if event.what & Event::ENTRIES != 0 {
+            assert_eq!(event.collections, ["latem"]);
+            break;
+        }
+    }
+    drop(watch);
+    assert!(service.stop(), "the service didn't exit cleanly");
+}
+
+/// A device joins through the service, as the Mac app approves one (service.md, for apps).
+#[cfg(unix)]
+#[test]
+fn devices_join_through_the_service() {
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    use openvault_core::membership::Scope;
+    use openvault_service::api::{ErrorCode, Request, Response};
+
+    let _turn = JOINING.lock().unwrap_or_else(|e| e.into_inner());
+    let admin = Device::new();
+    let service = Service::start(&admin);
+    let socket = admin.home.path().join("service.sock");
+    let call = |request: Request| {
+        openvault_service::client::call(&socket, &request)
+            .unwrap()
+            .unwrap()
+    };
+
+    let joiner = Device::empty();
+    let log = joiner.home.path().join("join.log");
+    let mut join = joiner
+        .command(&["join", "--keys", "software", "--name", "Joiner"])
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .map(Child)
+        .unwrap();
+    let mut lines = BufReader::new(join.0.stdout.take().unwrap()).lines();
+    let code = loop {
+        let line = lines.next().expect("join printed no code").unwrap();
+        let digits: String = line.chars().filter(char::is_ascii_digit).collect();
+        if digits.len() == 6 && line.trim().len() == 7 {
+            break digits;
+        }
+    };
+
+    let started = Instant::now();
+    let found = loop {
+        let Response::Joiners(joiners) = call(Request::Joiners) else {
+            panic!("no joiners");
+        };
+        if let Some(found) = joiners.into_iter().find(|j| j.name == "Joiner") {
+            break found;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the joiner never showed up: {}",
+            service.log()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(found.platform, std::env::consts::OS);
+
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    let Response::Error {
+        code: ErrorCode::WrongCode,
+        message,
+    } = call(Request::CheckCode {
+        joiner: found.endpoint,
+        code: wrong.to_owned().into(),
+    })
+    else {
+        panic!("a wrong code got through");
+    };
+    assert_eq!(message, "wrong code; 2 tries left");
+    let Response::JoinRequest(request) = call(Request::CheckCode {
+        joiner: found.endpoint,
+        code: code.into(),
+    }) else {
+        panic!("the code didn't match: {}", service.log());
+    };
+    assert_eq!((request.name.as_str(), request.hardware), ("Joiner", false));
+
+    // No admin key here, so approving needs the recovery phrase.
+    let scopes = vec![("latem".to_owned(), Scope::Read)];
+    let Response::Error {
+        code: ErrorCode::RecoveryPhraseNeeded,
+        ..
+    } = call(Request::Approve {
+        session: request.session,
+        scopes: scopes.clone(),
+        recovery_phrase: None,
+    })
+    else {
+        panic!("approved without a signature");
+    };
+    let approved = call(Request::Approve {
+        session: request.session,
+        scopes,
+        recovery_phrase: Some(admin.phrase.clone().into()),
+    });
+    assert!(matches!(approved, Response::Done), "{approved:?}");
+
+    let status = join.0.wait().unwrap();
+    assert!(
+        status.success(),
+        "join failed: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    let rest: Vec<String> = lines.map_while(Result::ok).collect();
+    assert!(
+        rest.iter().any(|line| line.starts_with("Joined the vault")),
+        "{rest:?}"
+    );
+    let Response::Peers(peers) = call(Request::Peers) else {
+        panic!("no peers");
+    };
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].device, request.device);
+    assert!(service.stop(), "the service didn't exit cleanly");
+}
+
+/// `openvault approve` takes the service's way when one runs.
+#[cfg(unix)]
+#[test]
+fn approve_goes_through_the_service() {
+    use std::io::{BufRead, BufReader};
+
+    let _turn = JOINING.lock().unwrap_or_else(|e| e.into_inner());
+    let admin = Device::new();
+    let service = Service::start(&admin);
+    let joiner = Device::empty();
+    let log = joiner.home.path().join("join.log");
+    let mut join = joiner
+        .command(&["join", "--keys", "software", "--name", "Joiner"])
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .map(Child)
+        .unwrap();
+    let mut lines = BufReader::new(join.0.stdout.take().unwrap()).lines();
+    let code = loop {
+        let line = lines.next().expect("join printed no code").unwrap();
+        let digits: String = line.chars().filter(char::is_ascii_digit).collect();
+        if digits.len() == 6 && line.trim().len() == 7 {
+            break digits;
+        }
+    };
+
+    let answers = format!("{code}\ny\n{}\n", admin.phrase);
+    let output = admin.run_with_stdin(&["approve", "--read", "latem"], answers.as_bytes());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}\n{}", service.log());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Joiner joined the vault, with scopes read latem."),
+        "{stdout}"
+    );
+    assert!(
+        join.0.wait().unwrap().success(),
+        "join failed: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    let devices = admin.ok(&["devices"]);
+    assert!(devices.contains("Joiner"), "{devices}");
+}

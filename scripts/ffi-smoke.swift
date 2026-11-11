@@ -1,0 +1,72 @@
+// Uses the Swift bindings against a running service, as the Mac app will (scripts/swift-bindings.sh).
+// Arguments: the openvault directory, its recovery phrase, and the version the library should be.
+import Foundation
+
+let arguments = CommandLine.arguments
+let (home, phrase, expected) = (arguments[1], arguments[2], arguments[3])
+
+func check(_ condition: Bool, _ what: String) {
+    if !condition {
+        FileHandle.standardError.write(Data("ffi smoke test failed: \(what)\n".utf8))
+        exit(1)
+    }
+}
+
+final class Listener: WatchListener, @unchecked Sendable {
+    let changed = DispatchSemaphore(value: 0)
+    let ended = DispatchSemaphore(value: 0)
+
+    func onEvent(event: WatchEvent) {
+        if event.entries && event.collections == ["smoke"] {
+            changed.signal()
+        }
+    }
+
+    func onEnd(error: String?) {
+        check(error == nil, "the watch ended with \(error ?? "")")
+        ended.signal()
+    }
+}
+
+check(version() == expected, "version \(version()), not \(expected)")
+let client = try Client(home: home)
+check(client.isRunning(), "the service isn't running")
+let vault = try client.vault()
+check(vault.recovery.count == 9 && !vault.admin, "vault \(vault)")
+
+do {
+    try client.createCollection(name: "smoke", recoveryPhrase: nil)
+    check(false, "a collection was created without a signature")
+} catch OpenVaultError.RecoveryPhraseNeeded {
+    try client.createCollection(name: "smoke", recoveryPhrase: phrase)
+}
+
+let listener = Listener()
+let watch = try client.watch(listener: listener)
+try client.set(collection: "smoke", entries: [
+    NewEntry(name: "prod/TOKEN", kind: .secret, value: Data("abc".utf8)),
+    NewEntry(name: "prod/REGION", kind: .variable, value: Data("eu west".utf8)),
+])
+check(listener.changed.wait(timeout: .now() + 10) == .success, "no event for the write")
+
+let entries = try client.entries(collection: "smoke")
+check(entries.map(\.name) == ["prod/REGION", "prod/TOKEN"], "entries \(entries.map(\.name))")
+check(entries[0].value == Data("eu west".utf8), "a variable's value")
+check(entries[1].value == nil, "a list held a secret's value")
+check(entries.allSatisfy { $0.setBy == vault.device }, "who set them")
+let token = try client.get(collection: "smoke", name: "prod/TOKEN")
+check(token?.value == Data("abc".utf8) && token?.kind == .secret, "the secret's value")
+
+let collections = try client.collections()
+check(collections.count == 1 && collections[0].secrets == 1 && collections[0].variables == 1,
+      "collections \(collections)")
+check(collections[0].devices.map(\.scope) == [.write], "scopes \(collections[0].devices)")
+let log = try client.log(from: 0, max: 16)
+check(log.first?.change == .genesis && log.allSatisfy { $0.signer == .recoveryKey },
+      "log \(log)")
+check(try client.peers().isEmpty, "peers")
+check(try client.devices().count == 1, "devices")
+
+watch.stop()
+check(listener.ended.wait(timeout: .now() + 10) == .success, "the watch didn't end")
+print("openvault-ffi \(version()) works from Swift: \(entries.count) entries, \(log.count) log entries")

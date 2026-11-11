@@ -1,8 +1,8 @@
 //! `openvault join` and `openvault approve` (join.md, commands).
 //!
-//! Both run their own endpoint, the joiner because it has no vault for a service to hold yet,
-//! and `approve` because it needs the user at every step. `approve` opens the vault itself even
-//! while the service runs; the service picks up the new log entries on its next request.
+//! The joiner runs its own endpoint, because it has no vault for a service to hold yet. `approve`
+//! goes through the service when one runs (service.md, for apps), and otherwise runs its own
+//! endpoint and opens the vault itself.
 
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -11,13 +11,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use openvault_core::membership::{AdminKey as _, DeviceName, Scope};
 use openvault_core::{CollectionId, DeviceId, Vault, transport_seed};
-use openvault_crypto::RecoveryKey;
 use openvault_crypto::pake;
 use openvault_keystore::{AdminKey, Backend, Keys};
 use openvault_net::join::{self, AdminSession, JoinError, JoinerSession};
 use openvault_net::{EndpointKey, Node, Options};
 use tokio::runtime::Runtime;
 use tokio::time::Instant;
+
+use openvault_service::handler;
 
 use crate::{Home, create_private_dir, load_keys, read_new_passphrase, read_recovery_phrase};
 
@@ -180,6 +181,13 @@ async fn accept_join(
 
 pub fn approve(home: &Home, write: &[String], read: &[String], hold: &[String]) -> Result<()> {
     home.require_vault()?;
+    #[cfg(unix)]
+    {
+        let socket = home.0.join(openvault_service::SOCKET);
+        if openvault_service::client::is_running(&socket) {
+            return approve_through_service(&socket, write, read, hold);
+        }
+    }
     let keys = load_keys(&home.keys())?;
     let seed = transport_seed(&keys);
     let mut vault = Vault::open(&home.vault(), keys)?;
@@ -254,32 +262,29 @@ fn approve_with(
         bail!("not approved");
     }
 
-    let collections: Vec<(CollectionId, Scope)> =
-        scopes.iter().map(|(id, scope, _)| (*id, *scope)).collect();
-    let approval = match listed_admin_key(home, vault)? {
-        Some(admin) => {
-            let reason = format!("add {} to your vault", request.name.name);
-            eprintln!("Confirm with Touch ID or your password to {reason}.");
-            vault.approve_join(&request, &collections, &admin.with_reason(reason))
+    let named: Vec<(String, Scope)> = scopes
+        .iter()
+        .map(|(_, scope, name)| (name.clone(), *scope))
+        .collect();
+    if listed_admin_key(home, vault)?.is_some() {
+        eprintln!(
+            "Confirm with Touch ID or your password to add {} to your vault.",
+            request.name.name
+        );
+    }
+    let approval = match handler::approve_join(vault, &home.admin(), &request, &named, None) {
+        Err(error) if handler::needs_recovery_phrase(&error) => {
+            recovery_phrase_note();
+            let phrase = read_recovery_phrase()?;
+            handler::approve_join(vault, &home.admin(), &request, &named, Some(&phrase))
         }
-        None => {
-            if io::stdin().is_terminal() {
-                eprintln!("Approving needs an admin signature. This device has no admin key, so");
-                eprintln!("it comes from your recovery phrase.");
-            }
-            let recovery = RecoveryKey::from_phrase(&read_recovery_phrase()?)?;
-            if !vault.is_recovery_key(&recovery) {
-                runtime.block_on(session.refuse("not approved"));
-                bail!("that recovery phrase belongs to another vault");
-            }
-            vault.approve_join(&request, &collections, &recovery.admin_signing_key())
-        }
+        approval => approval,
     };
     let approval = match approval {
         Ok(approval) => approval,
         Err(error) => {
             runtime.block_on(session.refuse(&error.to_string()));
-            return Err(error.into());
+            return Err(error);
         }
     };
     runtime.block_on(session.finish(vault.vault_id(), &approval.log, &approval.grants))?;
@@ -294,6 +299,154 @@ fn approve_with(
         &openvault_service::api::Request::Changed,
     );
     Ok(())
+}
+
+/// `approve` with the service's endpoint (service.md, for apps): the same steps, each a request.
+#[cfg(unix)]
+fn approve_through_service(
+    socket: &std::path::Path,
+    write: &[String],
+    read: &[String],
+    hold: &[String],
+) -> Result<()> {
+    use openvault_service::api::{ErrorCode, Request, Response};
+
+    let call = |request: &Request| -> Result<Response> {
+        openvault_service::client::call(socket, request)?
+            .ok_or_else(|| anyhow!("the service stopped; run `openvault approve` again"))
+    };
+    let mut scopes: Vec<(String, Scope)> = Vec::new();
+    for (names, scope) in [
+        (write, Scope::Write),
+        (read, Scope::Read),
+        (hold, Scope::Hold),
+    ] {
+        for name in names {
+            if scopes.iter().any(|(other, _)| other == name) {
+                bail!("{name} is given more than one scope");
+            }
+            scopes.push((name.clone(), scope));
+        }
+    }
+
+    eprintln!("Looking for devices waiting to join on this network...");
+    let start = Instant::now();
+    let mut first_found: Option<Instant> = None;
+    let joiners = loop {
+        let joiners = match call(&Request::Joiners)? {
+            Response::Joiners(joiners) => joiners,
+            other => return Err(handler::unexpected(&other)),
+        };
+        if !joiners.is_empty() && first_found.is_none() {
+            first_found = Some(Instant::now());
+        }
+        // Once one is found, a little longer, in case others are about to appear.
+        let settled = first_found.is_some_and(|at| at.elapsed() > Duration::from_secs(2));
+        if settled || start.elapsed() > LOOK_TIME {
+            break joiners;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let joiner = match joiners.as_slice() {
+        [] => {
+            bail!("no device on this network is waiting to join; run `openvault join` on it first")
+        }
+        [joiner] => {
+            eprintln!("Found {} ({}).", joiner.name, joiner.platform);
+            joiner
+        }
+        several => {
+            for (i, joiner) in several.iter().enumerate() {
+                eprintln!("{:>3}. {} ({})", i + 1, joiner.name, joiner.platform);
+            }
+            let choice = prompt(&format!("Which device? [1-{}] ", several.len()))?;
+            let index: usize = choice.trim().parse().context("not a number")?;
+            several
+                .get(index.wrapping_sub(1))
+                .ok_or_else(|| anyhow!("there is no device {index}"))?
+        }
+    };
+
+    let request = loop {
+        let code = zeroize::Zeroizing::new(read_code(&joiner.name)?);
+        match call(&Request::CheckCode {
+            joiner: joiner.endpoint,
+            code,
+        })? {
+            Response::JoinRequest(request) => break request,
+            Response::Error {
+                code: ErrorCode::WrongCode,
+                message,
+            } => eprintln!("{}.", capitalized(&message)),
+            other => return Err(handler::unexpected(&other)),
+        }
+    };
+
+    let scope_list = if scopes.is_empty() {
+        "none".to_owned()
+    } else {
+        scopes
+            .iter()
+            .map(|(name, scope)| format!("{} {name}", scope_label(*scope)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let id = request.device.to_string();
+    println!();
+    println!("Device    {}", request.name);
+    println!("Platform  {}", request.platform);
+    println!(
+        "Keys      {}",
+        if request.hardware { "hardware" } else { "file" }
+    );
+    println!("Id        {}…", &id[..8]);
+    println!("Scopes    {scope_list}");
+    println!();
+    if !confirm("Approve this device? [y/N] ")? {
+        call(&Request::Refuse {
+            session: request.session,
+        })?;
+        bail!("not approved");
+    }
+
+    eprintln!("Confirm with Touch ID or your password if asked.");
+    let mut recovery_phrase = None;
+    loop {
+        match call(&Request::Approve {
+            session: request.session,
+            scopes: scopes.clone(),
+            recovery_phrase: recovery_phrase.take(),
+        })? {
+            Response::Done => break,
+            Response::Error {
+                code: ErrorCode::RecoveryPhraseNeeded,
+                ..
+            } => {
+                recovery_phrase_note();
+                recovery_phrase = Some(read_recovery_phrase()?);
+            }
+            other => return Err(handler::unexpected(&other)),
+        }
+    }
+    println!(
+        "{} joined the vault, with scopes {scope_list}.",
+        request.name
+    );
+    Ok(())
+}
+
+fn recovery_phrase_note() {
+    if io::stdin().is_terminal() {
+        eprintln!("Approving needs an admin signature. This device has no admin key, so");
+        eprintln!("it comes from your recovery phrase.");
+    }
+}
+
+fn capitalized(message: &str) -> String {
+    let mut chars = message.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 /// Finds the devices waiting to join on this network, and picks one.

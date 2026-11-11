@@ -146,8 +146,60 @@ Each device runs one iroh endpoint (design §10):
 | 3 | hardware keys (P-256) |
 
 - A name that doesn't open, or breaks the name rules, comes back with an empty platform and name. The CLI then shows the device id instead (membership.md, names key).
-- Error codes: `0x01` is any error, whose message the CLI prints. `0x02` is "recovery phrase needed".
+- Error codes: `0x01` is any error, whose message the CLI prints. `0x02` is "recovery phrase needed". `0x03` is "wrong code" (for apps, below).
 - Buffers that hold values are wiped after use, on both sides.
+
+### For apps
+
+Since 0.3.3, for the Mac app (design §12), which reaches the service through the Swift bindings in `crates/ffi` (`scripts/swift-bindings.sh` builds them). The CLI and the service come from the same release, so the local API has no version of its own: an older service answers these with error "unknown request" until `openvault service install` restarts it on the new build.
+
+| Type | Request | Body |
+| --- | --- | --- |
+| `0x0e` | vault | — |
+| `0x0f` | collection summaries | — |
+| `0x10` | entry details | collection (str) |
+| `0x11` | log | from seq (u64) ‖ max (u16) |
+| `0x12` | set scopes | device id (16) ‖ count (u32) ‖ changes: collection (str) ‖ scope (u8) ‖ has phrase (u8) ‖ recovery phrase (str, only if has phrase is 1) |
+| `0x13` | watch | — |
+| `0x14` | peers | — |
+| `0x15` | joiners | — |
+| `0x16` | check code | endpoint id (32) ‖ code (str) |
+| `0x17` | approve | session (u32) ‖ count (u32) ‖ scopes: collection (str) ‖ scope (u8) ‖ has phrase (u8) ‖ recovery phrase (str, only if has phrase is 1) |
+| `0x18` | refuse | session (u32) |
+
+| Type | Response | Body |
+| --- | --- | --- |
+| `0x8b` | vault | vault id (16) ‖ device id (16) ‖ recovery fingerprint (4) ‖ log head (u64) ‖ admin (u8) |
+| `0x8c` | collection summaries | count (u32) ‖ collections: name (str) ‖ secrets (u32) ‖ variables (u32) ‖ key (u32) ‖ count (u32) ‖ devices: device id (16) ‖ scope (u8) |
+| `0x8d` | entry details | count (u32) ‖ entries: name (str) ‖ kind ‖ set by (16) ‖ key (u32) ‖ value (bytes) |
+| `0x8e` | log | count (u32) ‖ entries: seq (u64) ‖ hash (32) ‖ change (u8) ‖ device id (16) ‖ collection (str) ‖ scope (u8) ‖ key (u32) ‖ signer (u8) |
+| `0x8f` | event | what (u8) ‖ count (u32) ‖ collections (str) |
+| `0x90` | peers | count (u32) ‖ peers: device id (16) ‖ state (u8) ‖ seen (u32) ‖ retry in (u32) ‖ error (str) |
+| `0x91` | joiners | count (u32) ‖ joiners: endpoint id (32) ‖ platform (str) ‖ name (str) |
+| `0x92` | join request | session (u32) ‖ device id (16) ‖ platform (str) ‖ name (str) ‖ hardware (u8) |
+| `0x93` | scopes set | count (u32) ‖ collections that got a new key (str) ‖ keys granted (u32) ‖ entries written again (u32) |
+
+**Reads.**
+- **vault**: the recovery fingerprint is the first 4 bytes of the hash of the recovery key, shown as `d06a 5f28`. The log head is the last entry's seq, 0 before the log starts. Admin is 1 when this device has an admin key the log lists.
+- **collection summaries**: every collection on this device, with its counts of secrets and variables, its current key (epoch), and each device that isn't revoked and has a scope on it other than none. Counting reads only the index, as list does.
+- **entry details**: every current entry of a collection, with the device that set it and the key it was sealed with. Variables come with their values; a secret's value is always empty, so a list never holds one. It opens every record, so a collection of n entries costs n decryptions.
+- **log**: up to `max` entries from seq `from`, at most 256 at a time. Change is the entry's type (membership.md): device id, collection, scope and key are filled in where the type has them, and zeros or empty otherwise. A collection is given by name, or by its id in hex if this device doesn't have it. Signer: `0x00` the recovery key, `0x01` this device's admin key, `0x02` another admin key. The log keeps no times, so neither does this.
+- **peers**: only the service answers it. For each member other than this device: state `0x00` not seen since the service started, `0x01` on the network, `0x02` syncing, `0x03` its last session failed; seen is seconds since mDNS last showed it (0 while it's on the network, `0xffffffff` never); retry in is seconds until the next attempt after a failure (0 if none is waiting); error is why the last session failed, or empty.
+
+**Scopes.** set scopes makes several scope changes for one device with one admin signature, so Touch ID asks once. It fails before asking if every change is to the scope the device already has, and skips the ones that are. The changes are made in order, each with its own log entry; if one fails, the ones before it stay. scopes set lists the collections that got a new key, and adds up the keys granted and the entries written again.
+
+**Watch.** The service answers with done and keeps the connection open. It then sends an event whenever something an app shows may have changed, and the client sends nothing more; closing the connection ends the watch.
+- What is a set of bits: `0x01` entries changed, in the collections listed, or in any of them if none are listed; `0x02` the membership log changed; `0x04` a device came or went, or its sync state changed; `0x08` a device started or stopped waiting to join.
+- Events come from this device's own writes, from sync sessions that took something in, from mDNS, and from join sessions. There's no polling, so an idle watch costs nothing.
+- At most 16 connections watch at once; another gets an error.
+
+**Joins.** Only the service answers these, since they use its endpoint (join.md).
+- **joiners** lists the endpoints whose mDNS announcement says they're waiting to join, with the platform and name they announce. The announcement is unchecked, as join.md says.
+- **check code** runs the PAKE with a joiner (join.md, the admin's side). With the right code it answers with a join request: the session that holds it, and the device id, platform, name and key type the joiner signed. With a wrong code it answers with error `0x03`, whose message says how many tries are left; after three the joiner stops, and the service refuses more codes for it until it announces again.
+- **approve** approves the session's request with the scopes given, signed like revoke: with this device's admin key, which asks for Touch ID, or with the recovery phrase. It then sends the joiner the log and grants, and starts sessions as after a log entry.
+- **refuse** tells the joiner it wasn't approved, and ends the session.
+- A session ends after approve or refuse, when the joiner goes away, or after 10 minutes, the code's lifetime. At most 4 are open at once.
+- `openvault approve` uses these when the service runs, and its own endpoint otherwise.
 
 ## The CLI
 

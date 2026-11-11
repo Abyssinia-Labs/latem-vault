@@ -1,29 +1,44 @@
 //! `openvault service`: holds the vault open, runs the endpoint, and answers on the socket
 //! (service.md).
 
+use std::collections::HashMap;
 use std::fs::{self, File, TryLockError};
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
+use openvault_core::membership::Scope;
 use openvault_core::sets::SetId;
 use openvault_core::{DeviceId, Vault, transport_seed};
 use openvault_keystore::Keys;
+use openvault_net::join::{self, AdminSession, JoinError};
 use openvault_net::{EndpointKey, Event, Node, Options, Relay};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
-use crate::api::{self, Request, Response};
+use crate::api::{self, ErrorCode, JoinRequestSummary, Joiner, Request, Response};
 #[cfg(feature = "coordinator")]
 use crate::coordinator;
 use crate::engine::Engine;
 use crate::handler::{self, Context, transport_endpoint};
 use crate::{ADMIN_KEY, LOCK, SOCKET, VAULT};
+
+/// The most connections that watch at once (service.md, for apps).
+const WATCHERS: usize = 16;
+/// The most join sessions open at once, and how long one lasts: the code's lifetime (join.md).
+const JOIN_SESSIONS: usize = 4;
+const JOIN_LIFETIME: Duration = Duration::from_secs(10 * 60);
+/// Wrong codes a joiner allows before it stops (join.md).
+const CODE_TRIES: u8 = 3;
 
 struct Shared {
     vault: Arc<Mutex<Vault<Keys>>>,
@@ -31,6 +46,19 @@ struct Shared {
     node: Arc<Node>,
     engine: Arc<Engine>,
     version: String,
+    /// What watching apps hear of.
+    events: broadcast::Sender<api::Event>,
+    watchers: AtomicUsize,
+    joins: Mutex<Joins>,
+}
+
+/// Joins an app or the CLI is in the middle of (service.md, for apps).
+#[derive(Default)]
+struct Joins {
+    sessions: HashMap<u32, (AdminSession, Instant)>,
+    next: u32,
+    /// Wrong codes so far for each joiner, until it announces again.
+    tries: HashMap<EndpointKey, u8>,
 }
 
 /// What a request changed, which sync passes on.
@@ -104,12 +132,16 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
     );
 
     let vault = Arc::new(Mutex::new(vault));
+    let app_events = broadcast::channel(64).0;
     let shared = Arc::new(Shared {
-        engine: Engine::new(node.clone(), vault.clone(), relay),
+        engine: Engine::new(node.clone(), vault.clone(), relay, app_events.clone()),
         vault,
         admin_key: dir.join(ADMIN_KEY),
         node,
         version: version.to_owned(),
+        events: app_events,
+        watchers: AtomicUsize::new(0),
+        joins: Mutex::new(Joins::default()),
     });
     #[cfg(feature = "coordinator")]
     let keeping = coordinator.map(|address| {
@@ -153,8 +185,13 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
                     log_event(&shared, event);
                     match event {
                         Event::Visible(peer) => shared.engine.dial(peer),
-                        Event::Gone(peer) => shared.engine.gone(&peer),
+                        Event::Gone(peer) => {
+                            shared.engine.gone(&peer);
+                            // A joiner that announces again gets new tries.
+                            shared.joins.lock().expect("poisoned").tries.remove(&peer);
+                        }
                     }
+                    emit(&shared, api::Event::DEVICES | api::Event::JOINERS, Vec::new());
                 });
             }
             _ = tokio::signal::ctrl_c() => break Ok(()),
@@ -201,6 +238,16 @@ async fn serve(shared: &Arc<Shared>, mut stream: UnixStream) -> Result<()> {
             stream.read_exact(&mut message).await?;
             let (kind, body) = api::split(message)?;
             match Request::decode(kind, &body) {
+                // It keeps the connection (service.md, for apps).
+                Ok(Request::Watch) => return watch(shared, stream).await,
+                Ok(Request::Joiners) => joiners(shared),
+                Ok(Request::CheckCode { joiner, code }) => check_code(shared, joiner, code).await,
+                Ok(Request::Approve {
+                    session,
+                    scopes,
+                    recovery_phrase,
+                }) => approve(shared, session, scopes, recovery_phrase).await,
+                Ok(Request::Refuse { session }) => refuse(shared, session).await,
                 Ok(request) => {
                     let shared = shared.clone();
                     tokio::task::spawn_blocking(move || answer(&shared, request)).await?
@@ -216,13 +263,17 @@ async fn serve(shared: &Arc<Shared>, mut stream: UnixStream) -> Result<()> {
 }
 
 fn answer(shared: &Shared, request: Request) -> Response {
-    if let Request::Status = request {
-        return Response::Status {
-            version: shared.version.clone(),
-            pid: std::process::id(),
-            // One node per service process, so the process's count is the service's.
-            mdns_stops: u32::try_from(openvault_net::discovery_stops()).unwrap_or(u32::MAX),
-        };
+    match request {
+        Request::Status => {
+            return Response::Status {
+                version: shared.version.clone(),
+                pid: std::process::id(),
+                // One node per service process, so the process's count is the service's.
+                mdns_stops: u32::try_from(openvault_net::discovery_stops()).unwrap_or(u32::MAX),
+            };
+        }
+        Request::Peers => return peers(shared),
+        _ => {}
     }
     let change = match &request {
         Request::Set { collection, .. } | Request::Delete { collection, .. } => {
@@ -231,7 +282,8 @@ fn answer(shared: &Shared, request: Request) -> Response {
         Request::CreateCollection { .. }
         | Request::Changed
         | Request::Revoke { .. }
-        | Request::SetScope { .. } => Some(Change::Log),
+        | Request::SetScope { .. }
+        | Request::SetScopes { .. } => Some(Change::Log),
         _ => None,
     };
     let visible = shared.node.visible();
@@ -258,12 +310,259 @@ fn answer(shared: &Shared, request: Request) -> Response {
     };
     if !matches!(response, Response::Error { .. }) {
         match (change, set) {
-            (Some(Change::Records(_)), Some(set)) => shared.engine.changed(set),
-            (Some(Change::Log), _) => shared.engine.log_changed(),
+            (Some(Change::Records(name)), Some(set)) => {
+                shared.engine.changed(set);
+                emit(shared, api::Event::ENTRIES, vec![name]);
+            }
+            (Some(Change::Log), _) => {
+                shared.engine.log_changed();
+                // A new key can carry entries over (sync.md, revoking and reducing scopes).
+                emit(
+                    shared,
+                    api::Event::LOG | api::Event::DEVICES | api::Event::ENTRIES,
+                    Vec::new(),
+                );
+            }
             _ => {}
         }
     }
     response
+}
+
+/// Tells watching apps that `what` may have changed. Nobody watching isn't an error.
+fn emit(shared: &Shared, what: u8, collections: Vec<String>) {
+    let _ = shared.events.send(api::Event { what, collections });
+}
+
+/// Sends events on `stream` until the client closes it or the service stops.
+async fn watch(shared: &Arc<Shared>, mut stream: UnixStream) -> Result<()> {
+    if shared.watchers.fetch_add(1, Ordering::Relaxed) >= WATCHERS {
+        shared.watchers.fetch_sub(1, Ordering::Relaxed);
+        let refused = Response::error(format!("{WATCHERS} connections are watching already"));
+        stream.write_all(&refused.encode()).await?;
+        return Ok(());
+    }
+    let result = send_events(shared, &mut stream).await;
+    shared.watchers.fetch_sub(1, Ordering::Relaxed);
+    match result {
+        // The app went away.
+        Err(e) if matches!(e.kind(), ErrorKind::BrokenPipe | ErrorKind::ConnectionReset) => Ok(()),
+        result => Ok(result?),
+    }
+}
+
+async fn send_events(shared: &Shared, stream: &mut UnixStream) -> std::io::Result<()> {
+    let mut events = shared.events.subscribe();
+    stream.write_all(&Response::Done.encode()).await?;
+    let mut byte = [0; 1];
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                let event = match event {
+                    Ok(event) => event,
+                    // Some were missed, so anything may have changed.
+                    Err(RecvError::Lagged(_)) => api::Event {
+                        what: api::Event::ENTRIES
+                            | api::Event::LOG
+                            | api::Event::DEVICES
+                            | api::Event::JOINERS,
+                        collections: Vec::new(),
+                    },
+                    Err(RecvError::Closed) => return Ok(()),
+                };
+                stream.write_all(&Response::Event(event).encode()).await?;
+            }
+            // The client sends nothing more, so a byte or the end both stop the watch.
+            _ = stream.read(&mut byte) => return Ok(()),
+        }
+    }
+}
+
+/// Each member's sync state, this device and revoked ones aside.
+fn peers(shared: &Shared) -> Response {
+    let members: Vec<(DeviceId, EndpointKey)> = {
+        let mut vault = shared.vault.lock().expect("poisoned");
+        if let Err(e) = vault.refresh() {
+            return Response::error(format!("{e:#}"));
+        }
+        let this = vault.device_id();
+        vault
+            .membership()
+            .map(|m| {
+                m.devices()
+                    .filter(|d| !d.revoked && d.info.id != this)
+                    .filter_map(|d| Some((d.info.id, transport_endpoint(&d.info.transport_key)?)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Response::Peers(shared.engine.peers(&members))
+}
+
+/// The endpoints whose mDNS announcement says they're waiting to join (join.md).
+fn joiners(shared: &Shared) -> Response {
+    Response::Joiners(
+        shared
+            .node
+            .announcements()
+            .into_iter()
+            .filter_map(|(endpoint, announcement)| {
+                let (platform, name) = join::parse_announcement(&announcement)?;
+                Some(Joiner {
+                    endpoint,
+                    platform,
+                    name,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Runs the PAKE with `joiner`, and keeps the session for approve or refuse.
+async fn check_code(shared: &Shared, joiner: EndpointKey, code: Zeroizing<String>) -> Response {
+    {
+        let mut joins = shared.joins.lock().expect("poisoned");
+        // Dropping a session closes its connection, which the joiner takes as a refusal.
+        joins
+            .sessions
+            .retain(|_, (_, started)| started.elapsed() < JOIN_LIFETIME);
+        if joins.sessions.len() >= JOIN_SESSIONS {
+            return Response::error(format!("{JOIN_SESSIONS} joins are waiting already"));
+        }
+        if joins.tries.get(&joiner).copied().unwrap_or(0) >= CODE_TRIES {
+            return Response::error(
+                "three wrong codes; run `openvault join` on the device again".to_owned(),
+            );
+        }
+    }
+    match AdminSession::start(shared.node.endpoint(), joiner, &code).await {
+        Ok(session) => {
+            let request = session.request().clone();
+            let mut joins = shared.joins.lock().expect("poisoned");
+            joins.tries.remove(&joiner);
+            let id = joins.next;
+            joins.next = joins.next.wrapping_add(1);
+            joins.sessions.insert(id, (session, Instant::now()));
+            Response::JoinRequest(JoinRequestSummary {
+                session: id,
+                device: request.device,
+                hardware: request.is_hardware(),
+                platform: request.name.platform,
+                name: request.name.name,
+            })
+        }
+        Err(JoinError::WrongCode) => {
+            let mut joins = shared.joins.lock().expect("poisoned");
+            let tries = joins.tries.entry(joiner).or_insert(0);
+            *tries += 1;
+            match CODE_TRIES - *tries {
+                0 => Response::error(
+                    "three wrong codes; run `openvault join` on the device again".to_owned(),
+                ),
+                left => Response::Error {
+                    code: ErrorCode::WrongCode,
+                    message: format!(
+                        "wrong code; {left} {} left",
+                        if left == 1 { "try" } else { "tries" }
+                    ),
+                },
+            }
+        }
+        Err(e) => Response::error(e.to_string()),
+    }
+}
+
+/// Approves a session's join, then sends the joiner the log and grants (join.md, approval).
+async fn approve(
+    shared: &Arc<Shared>,
+    session: u32,
+    scopes: Vec<(String, Scope)>,
+    recovery_phrase: Option<Zeroizing<String>>,
+) -> Response {
+    let Some((admin_session, started)) = shared
+        .joins
+        .lock()
+        .expect("poisoned")
+        .sessions
+        .remove(&session)
+    else {
+        return Response::error(format!(
+            "there's no join session {session}; check the code again"
+        ));
+    };
+    let request = admin_session.request().clone();
+    let signed = {
+        let shared = shared.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut vault = shared.vault.lock().expect("poisoned");
+            vault.refresh()?;
+            let approval = handler::approve_join(
+                &mut vault,
+                &shared.admin_key,
+                &request,
+                &scopes,
+                recovery_phrase.as_deref().map(String::as_str),
+            )?;
+            Ok::<_, anyhow::Error>((vault.vault_id(), approval))
+        })
+        .await
+    };
+    let (vault_id, approval) = match signed {
+        Ok(Ok(signed)) => signed,
+        Ok(Err(error)) => {
+            let response = handler::error_response(error);
+            if let Response::Error {
+                code: ErrorCode::RecoveryPhraseNeeded,
+                ..
+            } = response
+            {
+                // The CLI or the app asks for the phrase and sends approve again.
+                shared
+                    .joins
+                    .lock()
+                    .expect("poisoned")
+                    .sessions
+                    .insert(session, (admin_session, started));
+            } else if let Response::Error { message, .. } = &response {
+                admin_session.refuse(message).await;
+            }
+            return response;
+        }
+        Err(e) => return Response::error(e.to_string()),
+    };
+    // The approval is in the log either way, and syncs; the joiner can start over if this fails.
+    let finished = admin_session
+        .finish(vault_id, &approval.log, &approval.grants)
+        .await;
+    shared.engine.log_changed();
+    emit(
+        shared,
+        api::Event::LOG | api::Event::DEVICES | api::Event::JOINERS,
+        Vec::new(),
+    );
+    match finished {
+        Ok(()) => Response::Done,
+        Err(e) => Response::error(format!(
+            "approved, but the device didn't get the log: {e}; run `openvault join` on it again"
+        )),
+    }
+}
+
+/// Tells a session's joiner it wasn't approved.
+async fn refuse(shared: &Shared, session: u32) -> Response {
+    let removed = shared
+        .joins
+        .lock()
+        .expect("poisoned")
+        .sessions
+        .remove(&session);
+    match removed {
+        Some((admin_session, _)) => {
+            admin_session.refuse("not approved").await;
+            Response::Done
+        }
+        None => Response::error(format!("there's no join session {session}")),
+    }
 }
 
 /// Logs a member that has become visible or gone, and other OpenVault endpoints at debug level.

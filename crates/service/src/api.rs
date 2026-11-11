@@ -6,7 +6,7 @@
 use std::io::{self, Read, Write};
 
 use openvault_core::membership::Scope;
-use openvault_core::{DeviceId, Kind, Review, Written};
+use openvault_core::{DeviceId, Kind, Review, VaultId, Written};
 use zeroize::Zeroizing;
 
 /// The longest message, type and body: a folder of large values still fits.
@@ -64,6 +64,45 @@ pub enum Request {
     },
     /// Which build the service is and how it's doing. Only the service answers it.
     Status,
+    /// This vault and device, for apps (service.md, for apps).
+    Vault,
+    CollectionSummaries,
+    /// Every current entry of a collection, with variables' values but never secrets'.
+    EntryDetails {
+        collection: String,
+    },
+    /// Up to `max` log entries from seq `from`.
+    Log {
+        from: u64,
+        max: u16,
+    },
+    /// Several scope changes for one device, under one admin signature.
+    SetScopes {
+        device: DeviceId,
+        changes: Vec<(String, Scope)>,
+        /// Needed only when this device has no admin key.
+        recovery_phrase: Option<Zeroizing<String>>,
+    },
+    /// Keeps the connection open for events. Only the service answers it.
+    Watch,
+    /// Each member's sync state. Only the service answers it.
+    Peers,
+    /// The devices waiting to join on this network. Only the service answers it.
+    Joiners,
+    /// Runs the PAKE with a joiner (join.md). Only the service answers it.
+    CheckCode {
+        joiner: [u8; 32],
+        code: Zeroizing<String>,
+    },
+    Approve {
+        session: u32,
+        scopes: Vec<(String, Scope)>,
+        /// Needed only when this device has no admin key.
+        recovery_phrase: Option<Zeroizing<String>>,
+    },
+    Refuse {
+        session: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -101,6 +140,134 @@ pub enum Response {
         code: ErrorCode,
         message: String,
     },
+    Vault(VaultInfo),
+    CollectionSummaries(Vec<CollectionSummary>),
+    EntryDetails(Vec<EntryDetail>),
+    Log(Vec<LogLine>),
+    Event(Event),
+    Peers(Vec<Peer>),
+    Joiners(Vec<Joiner>),
+    JoinRequest(JoinRequestSummary),
+    ScopesSet {
+        /// The collections that got a new key.
+        rotated: Vec<String>,
+        /// Keys of the collections given to the device.
+        granted: u32,
+        /// Entries the device wrote last, written again under the new keys.
+        carried: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultInfo {
+    pub vault: VaultId,
+    pub device: DeviceId,
+    /// The first 4 bytes of the recovery key's hash.
+    pub recovery: [u8; 4],
+    /// The last log entry's seq, 0 before the log starts.
+    pub log_head: u64,
+    /// Whether this device has an admin key the log lists.
+    pub admin: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectionSummary {
+    pub name: String,
+    pub secrets: u32,
+    pub variables: u32,
+    /// The collection's current key (epoch).
+    pub key: u32,
+    /// Devices that aren't revoked, with a scope other than none.
+    pub devices: Vec<(DeviceId, Scope)>,
+}
+
+/// An entry with who set it and which key sealed it. `value` is a variable's, and always empty
+/// for a secret.
+pub struct EntryDetail {
+    pub name: String,
+    pub kind: Kind,
+    pub set_by: DeviceId,
+    pub key: u32,
+    pub value: Zeroizing<Vec<u8>>,
+}
+
+/// A membership log entry, as an app shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogLine {
+    pub seq: u64,
+    pub hash: [u8; 32],
+    /// The entry's type (membership.md).
+    pub change: u8,
+    /// Zeros if the type has no device.
+    pub device: DeviceId,
+    /// Empty if the type has no collection; the id in hex if this device doesn't have it.
+    pub collection: String,
+    pub scope: Scope,
+    pub key: u32,
+    pub signer: Signer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signer {
+    Recovery,
+    ThisDevice,
+    OtherAdmin,
+}
+
+/// What may have changed, for a watching app.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Event {
+    /// A set of the `Event::*` bits.
+    pub what: u8,
+    /// For [`Event::ENTRIES`]: the collections, or empty for any.
+    pub collections: Vec<String>,
+}
+
+impl Event {
+    pub const ENTRIES: u8 = 0x01;
+    pub const LOG: u8 = 0x02;
+    pub const DEVICES: u8 = 0x04;
+    pub const JOINERS: u8 = 0x08;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerState {
+    /// Not seen since the service started.
+    NotSeen,
+    OnNetwork,
+    Syncing,
+    /// Its last session failed.
+    Failing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Peer {
+    pub device: DeviceId,
+    pub state: PeerState,
+    /// Seconds since mDNS last showed it: 0 while it's on the network, `None` if never.
+    pub seen: Option<u32>,
+    /// Seconds until the next attempt after a failure, 0 if none is waiting.
+    pub retry_in: u32,
+    /// Why the last session failed, or empty.
+    pub error: String,
+}
+
+/// A device waiting to join, as its mDNS announcement says; unchecked (join.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Joiner {
+    pub endpoint: [u8; 32],
+    pub platform: String,
+    pub name: String,
+}
+
+/// What a joiner signed, once its code matched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinRequestSummary {
+    pub session: u32,
+    pub device: DeviceId,
+    pub platform: String,
+    pub name: String,
+    pub hardware: bool,
 }
 
 /// A secret or variable with its name.
@@ -137,6 +304,7 @@ pub struct DeviceSummary {
 pub enum ErrorCode {
     Other,
     RecoveryPhraseNeeded,
+    WrongCode,
 }
 
 impl std::fmt::Debug for Item {
@@ -144,6 +312,17 @@ impl std::fmt::Debug for Item {
         f.debug_struct("Item")
             .field("name", &self.name)
             .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for EntryDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntryDetail")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("set_by", &self.set_by)
+            .field("key", &self.key)
             .finish_non_exhaustive()
     }
 }
@@ -224,6 +403,39 @@ impl Request {
                 w.phrase(recovery_phrase.as_deref().map(String::as_str));
             }),
             Self::Status => frame(0x0d, |_| {}),
+            Self::Vault => frame(0x0e, |_| {}),
+            Self::CollectionSummaries => frame(0x0f, |_| {}),
+            Self::EntryDetails { collection } => frame(0x10, |w| w.str(collection)),
+            Self::Log { from, max } => frame(0x11, |w| {
+                w.put(&from.to_be_bytes());
+                w.put(&max.to_be_bytes());
+            }),
+            Self::SetScopes {
+                device,
+                changes,
+                recovery_phrase,
+            } => frame(0x12, |w| {
+                w.put(device.as_bytes());
+                w.scopes(changes);
+                w.phrase(recovery_phrase.as_deref().map(String::as_str));
+            }),
+            Self::Watch => frame(0x13, |_| {}),
+            Self::Peers => frame(0x14, |_| {}),
+            Self::Joiners => frame(0x15, |_| {}),
+            Self::CheckCode { joiner, code } => frame(0x16, |w| {
+                w.put(joiner);
+                w.str(code);
+            }),
+            Self::Approve {
+                session,
+                scopes,
+                recovery_phrase,
+            } => frame(0x17, |w| {
+                w.put(&session.to_be_bytes());
+                w.scopes(scopes);
+                w.phrase(recovery_phrase.as_deref().map(String::as_str));
+            }),
+            Self::Refuse { session } => frame(0x18, |w| w.put(&session.to_be_bytes())),
         }
     }
 
@@ -274,6 +486,33 @@ impl Request {
                 recovery_phrase: r.phrase()?,
             },
             0x0d => Self::Status,
+            0x0e => Self::Vault,
+            0x0f => Self::CollectionSummaries,
+            0x10 => Self::EntryDetails {
+                collection: r.string()?,
+            },
+            0x11 => Self::Log {
+                from: r.u64()?,
+                max: r.u16()?,
+            },
+            0x12 => Self::SetScopes {
+                device: r.device()?,
+                changes: r.scopes()?,
+                recovery_phrase: r.phrase()?,
+            },
+            0x13 => Self::Watch,
+            0x14 => Self::Peers,
+            0x15 => Self::Joiners,
+            0x16 => Self::CheckCode {
+                joiner: r.endpoint()?,
+                code: Zeroizing::new(r.string()?),
+            },
+            0x17 => Self::Approve {
+                session: r.u32()?,
+                scopes: r.scopes()?,
+                recovery_phrase: r.phrase()?,
+            },
+            0x18 => Self::Refuse { session: r.u32()? },
             _ => return Err(DecodeError::Bad("unknown request")),
         };
         r.finish()?;
@@ -381,8 +620,106 @@ impl Response {
                 w.u8(match code {
                     ErrorCode::Other => 0x01,
                     ErrorCode::RecoveryPhraseNeeded => 0x02,
+                    ErrorCode::WrongCode => 0x03,
                 });
                 w.str(truncate(message, 4096));
+            }),
+            Self::Vault(info) => frame(0x8b, |w| {
+                w.put(info.vault.as_bytes());
+                w.put(info.device.as_bytes());
+                w.put(&info.recovery);
+                w.put(&info.log_head.to_be_bytes());
+                w.u8(info.admin.into());
+            }),
+            Self::CollectionSummaries(collections) => frame(0x8c, |w| {
+                w.count(collections.len());
+                for collection in collections {
+                    w.str(&collection.name);
+                    w.put(&collection.secrets.to_be_bytes());
+                    w.put(&collection.variables.to_be_bytes());
+                    w.put(&collection.key.to_be_bytes());
+                    w.count(collection.devices.len());
+                    for (device, scope) in &collection.devices {
+                        w.put(device.as_bytes());
+                        w.u8(scope.code());
+                    }
+                }
+            }),
+            Self::EntryDetails(entries) => frame(0x8d, |w| {
+                w.count(entries.len());
+                for entry in entries {
+                    w.str(&entry.name);
+                    w.kind(entry.kind);
+                    w.put(entry.set_by.as_bytes());
+                    w.put(&entry.key.to_be_bytes());
+                    w.bytes(&entry.value);
+                }
+            }),
+            Self::Log(lines) => frame(0x8e, |w| {
+                w.count(lines.len());
+                for line in lines {
+                    w.put(&line.seq.to_be_bytes());
+                    w.put(&line.hash);
+                    w.u8(line.change);
+                    w.put(line.device.as_bytes());
+                    w.str(&line.collection);
+                    w.u8(line.scope.code());
+                    w.put(&line.key.to_be_bytes());
+                    w.u8(match line.signer {
+                        Signer::Recovery => 0x00,
+                        Signer::ThisDevice => 0x01,
+                        Signer::OtherAdmin => 0x02,
+                    });
+                }
+            }),
+            Self::Event(event) => frame(0x8f, |w| {
+                w.u8(event.what);
+                w.count(event.collections.len());
+                for name in &event.collections {
+                    w.str(name);
+                }
+            }),
+            Self::Peers(peers) => frame(0x90, |w| {
+                w.count(peers.len());
+                for peer in peers {
+                    w.put(peer.device.as_bytes());
+                    w.u8(match peer.state {
+                        PeerState::NotSeen => 0x00,
+                        PeerState::OnNetwork => 0x01,
+                        PeerState::Syncing => 0x02,
+                        PeerState::Failing => 0x03,
+                    });
+                    w.put(&peer.seen.unwrap_or(u32::MAX).to_be_bytes());
+                    w.put(&peer.retry_in.to_be_bytes());
+                    w.str(truncate(&peer.error, 1024));
+                }
+            }),
+            Self::Joiners(joiners) => frame(0x91, |w| {
+                w.count(joiners.len());
+                for joiner in joiners {
+                    w.put(&joiner.endpoint);
+                    w.str(&joiner.platform);
+                    w.str(&joiner.name);
+                }
+            }),
+            Self::JoinRequest(request) => frame(0x92, |w| {
+                w.put(&request.session.to_be_bytes());
+                w.put(request.device.as_bytes());
+                w.str(&request.platform);
+                w.str(&request.name);
+                w.u8(request.hardware.into());
+            }),
+            Self::ScopesSet {
+                rotated,
+                granted,
+                carried,
+            } => frame(0x93, |w| {
+                w.count(rotated.len());
+                for name in rotated {
+                    w.str(name);
+                }
+                w.put(&granted.to_be_bytes());
+                w.put(&carried.to_be_bytes());
             }),
         }
     }
@@ -504,9 +841,124 @@ impl Response {
             0x7f => Self::Error {
                 code: match r.u8()? {
                     0x02 => ErrorCode::RecoveryPhraseNeeded,
+                    0x03 => ErrorCode::WrongCode,
                     _ => ErrorCode::Other,
                 },
                 message: r.string()?,
+            },
+            0x8b => Self::Vault(VaultInfo {
+                vault: VaultId::from_bytes(r.array()?),
+                device: r.device()?,
+                recovery: r.array()?,
+                log_head: r.u64()?,
+                admin: r.flag("admin")?,
+            }),
+            0x8c => {
+                let count = r.count()?;
+                let mut collections = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let name = r.string()?;
+                    let (secrets, variables, key) = (r.u32()?, r.u32()?, r.u32()?);
+                    let devices = (0..r.count()?)
+                        .map(|_| Ok((r.device()?, r.scope()?)))
+                        .collect::<Result<_, DecodeError>>()?;
+                    collections.push(CollectionSummary {
+                        name,
+                        secrets,
+                        variables,
+                        key,
+                        devices,
+                    });
+                }
+                Self::CollectionSummaries(collections)
+            }
+            0x8d => {
+                let count = r.count()?;
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    entries.push(EntryDetail {
+                        name: r.string()?,
+                        kind: r.kind()?,
+                        set_by: r.device()?,
+                        key: r.u32()?,
+                        value: r.value()?,
+                    });
+                }
+                Self::EntryDetails(entries)
+            }
+            0x8e => {
+                let count = r.count()?;
+                let mut lines = Vec::with_capacity(count);
+                for _ in 0..count {
+                    lines.push(LogLine {
+                        seq: r.u64()?,
+                        hash: r.array()?,
+                        change: r.u8()?,
+                        device: r.device()?,
+                        collection: r.string()?,
+                        scope: r.scope()?,
+                        key: r.u32()?,
+                        signer: match r.u8()? {
+                            0x00 => Signer::Recovery,
+                            0x01 => Signer::ThisDevice,
+                            0x02 => Signer::OtherAdmin,
+                            _ => return Err(DecodeError::Bad("signer")),
+                        },
+                    });
+                }
+                Self::Log(lines)
+            }
+            0x8f => Self::Event(Event {
+                what: r.u8()?,
+                collections: (0..r.count()?)
+                    .map(|_| r.string())
+                    .collect::<Result<_, _>>()?,
+            }),
+            0x90 => {
+                let count = r.count()?;
+                let mut peers = Vec::with_capacity(count);
+                for _ in 0..count {
+                    peers.push(Peer {
+                        device: r.device()?,
+                        state: match r.u8()? {
+                            0x00 => PeerState::NotSeen,
+                            0x01 => PeerState::OnNetwork,
+                            0x02 => PeerState::Syncing,
+                            0x03 => PeerState::Failing,
+                            _ => return Err(DecodeError::Bad("peer state")),
+                        },
+                        seen: Some(r.u32()?).filter(|&seen| seen != u32::MAX),
+                        retry_in: r.u32()?,
+                        error: r.string()?,
+                    });
+                }
+                Self::Peers(peers)
+            }
+            0x91 => {
+                let count = r.count()?;
+                let mut joiners = Vec::with_capacity(count);
+                for _ in 0..count {
+                    joiners.push(Joiner {
+                        endpoint: r.endpoint()?,
+                        platform: r.string()?,
+                        name: r.string()?,
+                    });
+                }
+                Self::Joiners(joiners)
+            }
+            0x92 => Self::JoinRequest(JoinRequestSummary {
+                session: r.u32()?,
+                device: r.device()?,
+                platform: r.string()?,
+                name: r.string()?,
+                hardware: r.flag("hardware")?,
+            }),
+            0x93 => Self::ScopesSet {
+                rotated: (0..r.count()?)
+                    .map(|_| r.string())
+                    .collect::<Result<_, _>>()?,
+                granted: r.u32()?,
+                carried: r.u32()?,
             },
             _ => return Err(DecodeError::Bad("unknown response")),
         };
@@ -626,6 +1078,15 @@ impl Writer {
             self.bytes(&item.value);
         }
     }
+
+    /// `count (u32) ‖ collection (str) ‖ scope (u8)` for each.
+    fn scopes(&mut self, scopes: &[(String, Scope)]) {
+        self.count(scopes.len());
+        for (collection, scope) in scopes {
+            self.str(collection);
+            self.u8(scope.code());
+        }
+    }
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -654,6 +1115,47 @@ impl<'a> Reader<'a> {
 
     fn device(&mut self) -> Result<DeviceId, DecodeError> {
         DeviceId::try_from(self.take(16)?).map_err(|_| DecodeError::Bad("device id"))
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        Ok(self.take(N)?.try_into().expect("took N bytes"))
+    }
+
+    fn endpoint(&mut self) -> Result<[u8; 32], DecodeError> {
+        self.array()
+    }
+
+    fn u16(&mut self) -> Result<u16, DecodeError> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    fn u32(&mut self) -> Result<u32, DecodeError> {
+        Ok(u32::from_be_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, DecodeError> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
+    fn flag(&mut self, what: &'static str) -> Result<bool, DecodeError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(DecodeError::Bad(what)),
+        }
+    }
+
+    fn scope(&mut self) -> Result<Scope, DecodeError> {
+        Scope::from_code(self.u8()?).ok_or(DecodeError::Bad("scope"))
+    }
+
+    fn scopes(&mut self) -> Result<Vec<(String, Scope)>, DecodeError> {
+        let count = self.count()?;
+        let mut scopes = Vec::with_capacity(count);
+        for _ in 0..count {
+            scopes.push((self.string()?, self.scope()?));
+        }
+        Ok(scopes)
     }
 
     fn count(&mut self) -> Result<usize, DecodeError> {
@@ -933,6 +1435,198 @@ mod tests {
         };
         assert_eq!(code, ErrorCode::RecoveryPhraseNeeded);
         assert_eq!(message, "needs the phrase");
+    }
+
+    #[test]
+    fn app_messages_round_trip() {
+        let device = DeviceId::random();
+        let Request::SetScopes {
+            device: decoded,
+            changes,
+            recovery_phrase: None,
+        } = round_trip_request(&Request::SetScopes {
+            device,
+            changes: vec![("latem".into(), Scope::Read), ("ssh".into(), Scope::None)],
+            recovery_phrase: None,
+        })
+        else {
+            panic!("not set scopes");
+        };
+        assert_eq!(decoded, device);
+        assert_eq!(
+            changes,
+            [
+                ("latem".to_owned(), Scope::Read),
+                ("ssh".to_owned(), Scope::None)
+            ]
+        );
+        let Request::Log { from: 7, max: 64 } =
+            round_trip_request(&Request::Log { from: 7, max: 64 })
+        else {
+            panic!("not a log request");
+        };
+        let Request::CheckCode { joiner, code } = round_trip_request(&Request::CheckCode {
+            joiner: [7; 32],
+            code: Zeroizing::new("482917".into()),
+        }) else {
+            panic!("not a code");
+        };
+        assert_eq!((joiner, code.as_str()), ([7; 32], "482917"));
+        let Request::Approve {
+            session: 3,
+            scopes,
+            recovery_phrase: Some(_),
+        } = round_trip_request(&Request::Approve {
+            session: 3,
+            scopes: vec![("latem".into(), Scope::Write)],
+            recovery_phrase: Some(Zeroizing::new("abandon ability".into())),
+        })
+        else {
+            panic!("not an approval");
+        };
+        assert_eq!(scopes, [("latem".to_owned(), Scope::Write)]);
+        for request in [
+            Request::Vault,
+            Request::CollectionSummaries,
+            Request::Watch,
+            Request::Peers,
+            Request::Joiners,
+            Request::Refuse { session: 9 },
+            Request::EntryDetails {
+                collection: "latem".into(),
+            },
+        ] {
+            let again = round_trip_request(&request);
+            assert_eq!(format!("{again:?}"), format!("{request:?}"));
+        }
+
+        let info = VaultInfo {
+            vault: VaultId::random(),
+            device,
+            recovery: [0xd0, 0x6a, 0x5f, 0x28],
+            log_head: 24,
+            admin: true,
+        };
+        let Response::Vault(decoded) = round_trip_response(&Response::Vault(info.clone())) else {
+            panic!("not a vault");
+        };
+        assert_eq!(decoded, info);
+        let summaries = vec![CollectionSummary {
+            name: "latem".into(),
+            secrets: 22,
+            variables: 6,
+            key: 2,
+            devices: vec![(device, Scope::Write), (DeviceId::random(), Scope::Read)],
+        }];
+        let Response::CollectionSummaries(decoded) =
+            round_trip_response(&Response::CollectionSummaries(summaries.clone()))
+        else {
+            panic!("not summaries");
+        };
+        assert_eq!(decoded, summaries);
+        let Response::EntryDetails(details) =
+            round_trip_response(&Response::EntryDetails(vec![EntryDetail {
+                name: "prod/REGION".into(),
+                kind: Kind::Var,
+                set_by: device,
+                key: 2,
+                value: Zeroizing::new(b"eu-west".to_vec()),
+            }]))
+        else {
+            panic!("not details");
+        };
+        assert_eq!(
+            (details[0].set_by, details[0].key, &details[0].value[..]),
+            (device, 2, &b"eu-west"[..])
+        );
+        let lines = vec![LogLine {
+            seq: 10,
+            hash: [3; 32],
+            change: 0x03,
+            device,
+            collection: "latem".into(),
+            scope: Scope::Read,
+            key: 0,
+            signer: Signer::ThisDevice,
+        }];
+        let Response::Log(decoded) = round_trip_response(&Response::Log(lines.clone())) else {
+            panic!("not a log");
+        };
+        assert_eq!(decoded, lines);
+        let event = Event {
+            what: Event::ENTRIES | Event::DEVICES,
+            collections: vec!["latem".into()],
+        };
+        let Response::Event(decoded) = round_trip_response(&Response::Event(event.clone())) else {
+            panic!("not an event");
+        };
+        assert_eq!(decoded, event);
+        let peers = vec![
+            Peer {
+                device,
+                state: PeerState::Failing,
+                seen: Some(3600),
+                retry_in: 232,
+                error: "can't connect".into(),
+            },
+            Peer {
+                device: DeviceId::random(),
+                state: PeerState::NotSeen,
+                seen: None,
+                retry_in: 0,
+                error: String::new(),
+            },
+        ];
+        let Response::Peers(decoded) = round_trip_response(&Response::Peers(peers.clone())) else {
+            panic!("not peers");
+        };
+        assert_eq!(decoded, peers);
+        let joiners = vec![Joiner {
+            endpoint: [5; 32],
+            platform: "macos".into(),
+            name: "Mac mini".into(),
+        }];
+        let Response::Joiners(decoded) = round_trip_response(&Response::Joiners(joiners.clone()))
+        else {
+            panic!("not joiners");
+        };
+        assert_eq!(decoded, joiners);
+        let request = JoinRequestSummary {
+            session: 1,
+            device,
+            platform: "macos".into(),
+            name: "Mac mini".into(),
+            hardware: true,
+        };
+        let Response::JoinRequest(decoded) =
+            round_trip_response(&Response::JoinRequest(request.clone()))
+        else {
+            panic!("not a join request");
+        };
+        assert_eq!(decoded, request);
+        let Response::ScopesSet {
+            rotated,
+            granted: 2,
+            carried: 1,
+        } = round_trip_response(&Response::ScopesSet {
+            rotated: vec!["latem".into()],
+            granted: 2,
+            carried: 1,
+        })
+        else {
+            panic!("not scopes set");
+        };
+        assert_eq!(rotated, ["latem"]);
+        let Response::Error {
+            code: ErrorCode::WrongCode,
+            ..
+        } = round_trip_response(&Response::Error {
+            code: ErrorCode::WrongCode,
+            message: "wrong code; 2 tries left".into(),
+        })
+        else {
+            panic!("not a wrong code");
+        };
     }
 
     #[test]

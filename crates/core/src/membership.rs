@@ -230,6 +230,19 @@ pub enum Change {
 }
 
 impl Change {
+    /// The entry's type code (membership.md, log entries).
+    pub fn code(&self) -> u8 {
+        match self {
+            Self::Genesis { .. } => GENESIS,
+            Self::AddDevice(_) => ADD_DEVICE,
+            Self::SetScope { .. } => SET_SCOPE,
+            Self::RevokeDevice(_) => REVOKE_DEVICE,
+            Self::RotateEpoch { .. } => ROTATE_EPOCH,
+            Self::AddAdmin(_) => ADD_ADMIN,
+            Self::RemoveAdmin(_) => REMOVE_ADMIN,
+        }
+    }
+
     /// The type code and payload. Call [`check_fields`](Self::check_fields) first.
     fn encode(&self) -> (u8, Vec<u8>) {
         let mut out = Vec::new();

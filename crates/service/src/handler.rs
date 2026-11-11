@@ -5,13 +5,21 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use openvault_core::membership::AdminKey as AdminKeyTrait;
-use openvault_core::{DeviceId, Revocation, Vault, names};
+use openvault_core::join::JoinRequest;
+use openvault_core::membership::{AdminKey as AdminKeyTrait, Change, LogEntry, Scope};
+use openvault_core::{Approval, CollectionId, DeviceId, Kind, Revocation, Vault, names};
 use openvault_crypto::RecoveryKey;
 use openvault_keystore::{AdminKey, Keys};
 use openvault_net::EndpointKey;
+use zeroize::Zeroizing;
 
-use crate::api::{DeviceSummary, ErrorCode, Item, Listed, Request, Response, Value};
+use crate::api::{
+    CollectionSummary, DeviceSummary, EntryDetail, ErrorCode, Item, Listed, LogLine, Request,
+    Response, Signer, Value, VaultInfo,
+};
+
+/// The most log entries one log request returns (service.md, for apps).
+const MAX_LOG_LINES: u16 = 256;
 
 /// What a request runs against.
 pub struct Context<'a> {
@@ -28,14 +36,56 @@ pub struct Context<'a> {
 struct RecoveryPhraseNeeded(&'static str);
 
 pub fn handle(cx: &mut Context, request: Request) -> Response {
-    match run(cx, request) {
-        Ok(response) => response,
-        Err(error) if error.is::<RecoveryPhraseNeeded>() => Response::Error {
+    run(cx, request).unwrap_or_else(error_response)
+}
+
+/// The error response for `error`: "recovery phrase needed" when it is that, so the CLI and apps
+/// ask for the phrase and try again.
+pub fn error_response(error: anyhow::Error) -> Response {
+    if needs_recovery_phrase(&error) {
+        Response::Error {
             code: ErrorCode::RecoveryPhraseNeeded,
             message: error.to_string(),
-        },
-        Err(error) => Response::error(format!("{error:#}")),
+        }
+    } else {
+        Response::error(format!("{error:#}"))
     }
+}
+
+/// Whether `error` means the recovery phrase is needed, for a caller that asks for it and tries
+/// again.
+pub fn needs_recovery_phrase(error: &anyhow::Error) -> bool {
+    error.is::<RecoveryPhraseNeeded>()
+}
+
+/// Approves a join with `scopes`, signed like revoke: with this device's admin key, which asks
+/// for Touch ID, or with the recovery phrase (join.md, approval).
+pub fn approve_join(
+    vault: &mut Vault<Keys>,
+    admin_key: &Path,
+    request: &JoinRequest,
+    scopes: &[(String, Scope)],
+    recovery_phrase: Option<&str>,
+) -> Result<Approval> {
+    if vault.membership().is_none() {
+        bail!("this vault has no membership log yet; creating a collection starts it");
+    }
+    let mut collections: Vec<(CollectionId, Scope)> = Vec::with_capacity(scopes.len());
+    for (name, scope) in scopes {
+        let id = vault.collection(name)?;
+        if collections.iter().any(|(other, _)| *other == id) {
+            bail!("{name} is given more than one scope");
+        }
+        collections.push((id, *scope));
+    }
+    as_admin(
+        vault,
+        admin_key,
+        recovery_phrase,
+        "approving a device",
+        format!("add {} to your vault", request.name.name),
+        |vault, admin| vault.approve_join(request, &collections, &admin),
+    )
 }
 
 fn run(cx: &mut Context, request: Request) -> Result<Response> {
@@ -159,9 +209,205 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
                 carried: u32::try_from(change.carried).unwrap_or(u32::MAX),
             }
         }
-        // The service answers it before a request gets here.
-        Request::Status => bail!("only a running service answers status"),
+        Request::Vault => Response::Vault(VaultInfo {
+            vault: vault.vault_id(),
+            device: vault.device_id(),
+            recovery: openvault_crypto::hash::hash(vault.recovery_key().as_bytes())[..4]
+                .try_into()
+                .expect("took 4 bytes"),
+            log_head: vault.membership().map_or(0, |m| m.head().0),
+            admin: listed_admin_key(vault, cx.admin_key)?.is_some(),
+        }),
+        Request::CollectionSummaries => Response::CollectionSummaries(summaries(vault)?),
+        Request::EntryDetails { collection } => {
+            let id = vault.collection(&collection)?;
+            let names: Vec<String> = vault.list(id)?.into_iter().map(|e| e.name).collect();
+            let mut details = Vec::with_capacity(names.len());
+            for name in names {
+                let Some(entry) = vault.get(id, &name)? else {
+                    continue;
+                };
+                details.push(EntryDetail {
+                    name: entry.name,
+                    kind: entry.kind,
+                    set_by: entry.version.device,
+                    key: entry.epoch,
+                    // Lists never hold a secret's value (service.md, for apps).
+                    value: if entry.kind == Kind::Var {
+                        entry.value
+                    } else {
+                        Zeroizing::new(Vec::new())
+                    },
+                });
+            }
+            Response::EntryDetails(details)
+        }
+        Request::Log { from, max } => Response::Log(log_lines(
+            vault,
+            cx.admin_key,
+            from,
+            max.min(MAX_LOG_LINES),
+        )?),
+        Request::SetScopes {
+            device,
+            changes,
+            recovery_phrase,
+        } => {
+            let name = device_name(vault, device);
+            let mut ids: Vec<(CollectionId, Scope, &str)> = Vec::with_capacity(changes.len());
+            for (collection, scope) in &changes {
+                let id = vault.collection(collection)?;
+                if ids.iter().any(|(other, ..)| *other == id) {
+                    bail!("{collection} is given more than one scope");
+                }
+                // Changes to the scope the device already has are skipped.
+                if vault
+                    .membership()
+                    .is_none_or(|m| m.scope(device, id) != *scope)
+                {
+                    ids.push((id, *scope, collection.as_str()));
+                }
+            }
+            // Checked before asking for Touch ID or 24 words.
+            if ids.is_empty() {
+                bail!("{name} already has those scopes");
+            }
+            let collections = ids
+                .iter()
+                .map(|(.., collection)| *collection)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let changed = as_admin(
+                vault,
+                cx.admin_key,
+                recovery_phrase.as_deref().map(String::as_str),
+                "changing a scope",
+                format!("change what {name} may do with {collections}"),
+                |vault, admin| {
+                    ids.iter()
+                        .map(|(id, scope, _)| vault.set_scope(device, *id, *scope, &admin))
+                        .collect::<openvault_core::Result<Vec<_>>>()
+                },
+            )?;
+            let mut rotated = Vec::new();
+            let (mut granted, mut carried) = (0usize, 0usize);
+            for ((.., collection), change) in ids.iter().zip(&changed) {
+                if change.rotated {
+                    rotated.push((*collection).to_owned());
+                }
+                granted += change.granted;
+                carried += change.carried;
+            }
+            Response::ScopesSet {
+                rotated,
+                granted: u32::try_from(granted).unwrap_or(u32::MAX),
+                carried: u32::try_from(carried).unwrap_or(u32::MAX),
+            }
+        }
+        // The service answers these before a request gets here.
+        Request::Status
+        | Request::Watch
+        | Request::Peers
+        | Request::Joiners
+        | Request::CheckCode { .. }
+        | Request::Approve { .. }
+        | Request::Refuse { .. } => bail!("only a running service answers that"),
     })
+}
+
+/// Every collection on this device, with its counts, key and the devices with a scope on it.
+fn summaries(vault: &Vault<Keys>) -> Result<Vec<CollectionSummary>> {
+    let mut summaries = Vec::new();
+    for collection in vault.collections()? {
+        let entries = vault.list(collection.id)?;
+        let count = |kind| {
+            let n = entries.iter().filter(|entry| entry.kind == kind).count();
+            u32::try_from(n).unwrap_or(u32::MAX)
+        };
+        let membership = vault.membership();
+        let devices = membership
+            .map(|m| {
+                m.devices()
+                    .filter(|device| !device.revoked)
+                    .map(|device| (device.info.id, m.scope(device.info.id, collection.id)))
+                    .filter(|(_, scope)| *scope != Scope::None)
+                    .collect()
+            })
+            .unwrap_or_default();
+        summaries.push(CollectionSummary {
+            secrets: count(Kind::Secret),
+            variables: count(Kind::Var),
+            key: membership.and_then(|m| m.epoch(collection.id)).unwrap_or(0),
+            devices,
+            name: collection.name,
+        });
+    }
+    Ok(summaries)
+}
+
+/// Up to `max` log entries from seq `from`, as an app shows them.
+fn log_lines(vault: &Vault<Keys>, admin_key: &Path, from: u64, max: u16) -> Result<Vec<LogLine>> {
+    let entries = vault.log_range(from, usize::from(max))?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The recovery key's admin key is the first one genesis lists (membership.md).
+    let recovery_admin = match vault.log_range(0, 1)?.first().map(LogEntry::change) {
+        Some(Change::Genesis { admins, .. }) => admins.first().cloned(),
+        _ => None,
+    };
+    let this_admin = match AdminKey::load(admin_key) {
+        Ok(key) => Some(key.verifying_key()),
+        Err(openvault_keystore::Error::NotFound(_)) => None,
+        Err(e) => return Err(e).context("can't load this device's admin key"),
+    };
+    let names = vault.collections()?;
+    let collection_name = |id: &CollectionId| {
+        names
+            .iter()
+            .find(|collection| collection.id == *id)
+            .map_or_else(|| id.to_string(), |collection| collection.name.clone())
+    };
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            let mut line = LogLine {
+                seq: entry.seq(),
+                hash: entry.hash(),
+                change: entry.change().code(),
+                device: DeviceId::from_bytes([0; 16]),
+                collection: String::new(),
+                scope: Scope::None,
+                key: 0,
+                signer: if Some(entry.signer()) == recovery_admin.as_ref() {
+                    Signer::Recovery
+                } else if Some(entry.signer()) == this_admin.as_ref() {
+                    Signer::ThisDevice
+                } else {
+                    Signer::OtherAdmin
+                },
+            };
+            match entry.change() {
+                Change::AddDevice(info) => line.device = info.id,
+                Change::SetScope {
+                    device,
+                    collection,
+                    scope,
+                } => {
+                    line.device = *device;
+                    line.collection = collection_name(collection);
+                    line.scope = *scope;
+                }
+                Change::RevokeDevice(device) => line.device = *device,
+                Change::RotateEpoch { collection, epoch } => {
+                    line.collection = collection_name(collection);
+                    line.key = *epoch;
+                }
+                Change::Genesis { .. } | Change::AddAdmin(_) | Change::RemoveAdmin(_) => {}
+            }
+            line
+        })
+        .collect())
 }
 
 /// Runs `f` with an admin signature: this device's admin key when it has one, which asks for

@@ -159,6 +159,8 @@ pub struct Entry {
     pub kind: Kind,
     pub value: Zeroizing<Vec<u8>>,
     pub version: Version,
+    /// The collection key it was sealed with.
+    pub epoch: u32,
 }
 
 impl std::fmt::Debug for Entry {
@@ -167,6 +169,7 @@ impl std::fmt::Debug for Entry {
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("version", &self.version)
+            .field("epoch", &self.epoch)
             .finish_non_exhaustive()
     }
 }
@@ -327,6 +330,11 @@ impl<K: DeviceKeys> Vault<K> {
         self.membership.as_ref()
     }
 
+    /// The recovery key's public half, which wraps keys to it.
+    pub fn recovery_key(&self) -> &WrapKey {
+        &self.recovery
+    }
+
     /// Whether `recovery` is this vault's recovery key.
     pub fn is_recovery_key(&self, recovery: &RecoveryKey) -> bool {
         recovery.unwrap_key().wrap_key() == self.recovery
@@ -360,6 +368,18 @@ impl<K: DeviceKeys> Vault<K> {
     /// Every log entry, in order.
     pub fn log(&self) -> Result<Vec<LogEntry>> {
         read_log(&self.conn)
+    }
+
+    /// At most `max` log entries from seq `from`, in order.
+    pub fn log_range(&self, from: u64, max: usize) -> Result<Vec<LogEntry>> {
+        let from = i64::try_from(from).unwrap_or(i64::MAX);
+        let max = i64::try_from(max).unwrap_or(i64::MAX);
+        let mut statement = self
+            .conn
+            .prepare("SELECT entry FROM log WHERE seq >= ?1 ORDER BY seq LIMIT ?2")?;
+        let rows = statement.query_map(params![from, max], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|entry| LogEntry::from_bytes(&entry?))
+            .collect::<Result<_>>()
     }
 
     /// Approves a join (join.md, approval). `admin` signs add_device for `request` and a
@@ -761,6 +781,7 @@ impl<K: DeviceKeys> Vault<K> {
             kind: body.kind,
             value: body.value,
             version: record.header().version,
+            epoch: record.header().epoch,
         }))
     }
 

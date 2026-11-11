@@ -19,7 +19,8 @@ pub use ids::{CollectionId, DeviceId, VaultId};
 pub use keys::{DeviceKeys, SoftwareKeys, transport_seed};
 pub use record::{Kind, Version};
 pub use store::{
-    CollectionInfo, Entry, EntryInfo, Received, Review, Revocation, ScopeChange, Vault, Written,
+    Approval, CollectionInfo, Entry, EntryInfo, Received, Review, Revocation, ScopeChange, Vault,
+    Written,
 };
 
 #[derive(Debug, thiserror::Error)]

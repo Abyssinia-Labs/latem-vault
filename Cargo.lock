@@ -2663,7 +2663,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "openvault-cli"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -2684,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "openvault-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "hex",
  "openvault-crypto",
@@ -2696,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "openvault-crypto"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "argon2",
  "bip39",
@@ -2717,18 +2717,19 @@ dependencies = [
 
 [[package]]
 name = "openvault-ffi"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "openvault-core",
  "openvault-keystore",
  "openvault-service",
  "thiserror 2.0.21",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]
 name = "openvault-grandfather"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "iroh",
@@ -2748,7 +2749,7 @@ dependencies = [
 
 [[package]]
 name = "openvault-keystore"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "core-foundation",
  "objc2",
@@ -2765,7 +2766,7 @@ dependencies = [
 
 [[package]]
 name = "openvault-net"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "iroh",
  "iroh-mdns-address-lookup",
@@ -2781,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "openvault-service"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "libc",

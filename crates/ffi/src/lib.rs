@@ -12,10 +12,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use openvault_core::membership::Scope as CoreScope;
-use openvault_core::{DeviceId, Kind as CoreKind};
+use openvault_core::{DeviceId, Kind as CoreKind, env_file};
 use openvault_keystore::Backend;
 use openvault_service::api::{self, ErrorCode, Request, Response};
 use openvault_service::client;
+use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
@@ -244,6 +245,37 @@ pub trait WatchListener: Send + Sync {
     fn on_event(&self, event: WatchEvent);
     /// The watch ended: `stop` was called, or the service stopped. `error` says what failed.
     fn on_end(&self, error: Option<String>);
+}
+
+/// One `NAME=value` line of a `.env` file.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct EnvLine {
+    pub name: String,
+    pub value: Vec<u8>,
+    /// Where it is in the file, from 1.
+    pub line: u32,
+}
+
+/// Reads a `.env` file as `openvault import-env` does, and so as latem does. If any line can't
+/// be read, nothing is returned, and the error names the line but never shows it.
+#[uniffi::export]
+pub fn parse_env(file: Vec<u8>) -> Result<Vec<EnvLine>, OpenVaultError> {
+    let file = Zeroizing::new(file);
+    if file.len() > env_file::MAX_LEN {
+        return Err(failed(format!(
+            "the file is larger than {} bytes",
+            env_file::MAX_LEN
+        )));
+    }
+    let lines = env_file::parse(&file).map_err(|error| failed(error.to_string()))?;
+    Ok(lines
+        .into_iter()
+        .map(|line| EnvLine {
+            name: line.name,
+            value: line.value.to_vec(),
+            line: u32::try_from(line.number).unwrap_or(u32::MAX),
+        })
+        .collect())
 }
 
 /// How a device's keys are kept (keystore.md).
@@ -834,6 +866,23 @@ mod tests {
         })
         .unwrap();
         assert_eq!((genesis.device, genesis.collection), (None, None));
+    }
+
+    #[test]
+    fn env_files_read_as_import_env_reads_them() {
+        let lines = parse_env(b"# latem\nREGION=eu-west\nTOKEN='a b'\n".to_vec()).unwrap();
+        let read: Vec<_> = lines
+            .iter()
+            .map(|l| (l.name.as_str(), l.value.as_slice(), l.line))
+            .collect();
+        assert_eq!(
+            read,
+            [("REGION", &b"eu-west"[..], 2), ("TOKEN", &b"a b"[..], 3)]
+        );
+        let error = parse_env(b"A=1\nhunter2\n".to_vec())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "line 2: expected NAME=value");
     }
 
     #[test]

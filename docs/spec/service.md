@@ -1,6 +1,6 @@
 # Service spec, v1
 
-Status: draft, 2026-11-07. Changed 2026-11-09: starting at login, and the status request. Changed 2026-11-11: `--log`, and the Mac app's LaunchAgent. Implemented by `crates/net` (the endpoint and discovery), `crates/service` (the service and its local API) and `crates/cli` (starting at login). Builds on [records.md](records.md), [membership.md](membership.md) and [keystore.md](keystore.md). Sync ([sync.md](sync.md)) and joining ([join.md](join.md)) run inside it once they are built. The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking) and [§14](../design.md#14-interfaces).
+Status: draft, 2026-11-07. Changed 2026-11-09: starting at login, and the status request. Changed 2026-11-11: `--log`, the Mac app's LaunchAgent, and `parseEnv`. Implemented by `crates/net` (the endpoint and discovery), `crates/service` (the service and its local API) and `crates/cli` (starting at login). Builds on [records.md](records.md), [membership.md](membership.md) and [keystore.md](keystore.md). Sync ([sync.md](sync.md)) and joining ([join.md](join.md)) run inside it once they are built. The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking) and [§14](../design.md#14-interfaces).
 
 `openvault service` is the one process on a device that holds the vault open. It:
 - unlocks the device's keys once, so a passphrase is typed once per run rather than once per command;
@@ -208,6 +208,10 @@ Since 0.3.3, for the Mac app (design §12), which reaches the service through th
 - **refuse** tells the joiner it wasn't approved, and ends the session.
 - A session ends after approve or refuse, when the joiner goes away, or after 10 minutes, the code's lifetime. At most 4 are open at once.
 - `openvault approve` uses these when the service runs, and its own endpoint otherwise.
+
+**Without the service.** The bindings also read two things themselves:
+- `deviceHome` (0.3.4) says whether an openvault directory holds a vault, and how its keys are kept.
+- `parseEnv` (0.3.5) reads a `.env` file with `import-env`'s parser, which is in `openvault-core` for that reason. An app's import then reads each file the same way the CLI and latem do. The parser refuses a NUL byte in a value, which no environment variable can hold.
 
 ## The CLI
 

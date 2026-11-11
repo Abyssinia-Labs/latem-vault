@@ -40,6 +40,16 @@ pub fn check_entry(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `name` can be an environment variable's name: letters, digits and `_`, not starting
+/// with a digit. `run` passes entries on under such names, and `.env` files use them.
+pub fn is_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

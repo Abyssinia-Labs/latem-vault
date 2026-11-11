@@ -1,4 +1,4 @@
-//! The `NAME=value` files `openvault import-env` reads.
+//! The `NAME=value` files `openvault import-env` and the Mac app's import read.
 //!
 //! The format is latem's `secrets.env` (latem `internal/secrets/file.go`), so each value comes
 //! across byte for byte as latem reads it today:
@@ -11,6 +11,7 @@
 //! - `"…"` understands `\n`, `\r`, `\t`, `\\` and `\"`. Any other escape is an error, because
 //!   other readers disagree about what it means.
 //! - There is no `export`, no `${…}` expansion and no value spanning lines.
+//! - A value can't hold a NUL byte, which no environment variable can.
 //!
 //! A name set twice is an error rather than last-wins: which value was meant is for the person
 //! who wrote the file to say. Errors give line numbers, never line content, since a line that
@@ -18,8 +19,22 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Result, bail};
 use zeroize::Zeroizing;
+
+use crate::names::is_env_name;
+
+/// Why a file didn't parse: a line number and what's wrong with it, never the line itself.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ParseError(String);
+
+type Result<T> = std::result::Result<T, ParseError>;
+
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err(ParseError(format!($($arg)*)))
+    };
+}
 
 /// The largest file read, the same limit latem puts on `secrets.env`.
 pub const MAX_LEN: usize = 1 << 20;
@@ -52,7 +67,7 @@ pub fn parse(file: &[u8]) -> Result<Vec<Line>> {
             bail!("line {number}: remove `export`; the file is read, not run by a shell");
         }
         let name = match std::str::from_utf8(name) {
-            Ok(name) if crate::is_env_name(name) => name,
+            Ok(name) if is_env_name(name) => name,
             _ => bail!(
                 "line {number}: the name must be letters, digits and '_', not starting with a digit"
             ),
@@ -65,9 +80,16 @@ pub fn parse(file: &[u8]) -> Result<Vec<Line>> {
             .iter()
             .take_while(|&&b| b == b' ' || b == b'\t')
             .count()..];
+        let value = parse_value(value, number)?;
+        // `run` couldn't pass it on, so refuse it now rather than then.
+        if value.contains(&0) {
+            bail!(
+                "line {number}: the value has a NUL byte, which an environment variable can't hold"
+            );
+        }
         lines.push(Line {
             name: name.to_owned(),
-            value: parse_value(value, number)?,
+            value,
             number,
         });
     }
@@ -214,6 +236,7 @@ _lower9=1";
                 "line 1: unterminated",
             ),
             ("A=1\n\nA=hunter2", "A is set on lines 1 and 3; keep one"),
+            ("A=hunter\u{0}2", "line 1: the value has a NUL byte"),
         ];
         for (file, expected) in cases {
             let error = error(file);

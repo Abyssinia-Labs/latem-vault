@@ -23,3 +23,4 @@ openvault-keystore = { path = "../keystore" }
 openvault-service = { path = "../service" }
 thiserror = "2"
 uniffi = { version = "0.32.2", features = ["cli"] }
+zeroize = "1.9"

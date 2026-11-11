@@ -3,6 +3,7 @@
 //! Formats are specified in `docs/spec/records.md` and `docs/spec/membership.md`. Cryptography comes from
 //! `openvault-crypto`; device keys come from whatever implements [`DeviceKeys`].
 
+pub mod env_file;
 pub mod grant;
 mod ids;
 pub mod join;

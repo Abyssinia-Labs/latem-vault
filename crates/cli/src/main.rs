@@ -5,7 +5,6 @@
 //! `openvault service` runs, its socket (`service.sock`). Commands go through the service when
 //! it runs, and open the vault themselves otherwise.
 
-mod env_file;
 #[cfg(feature = "coordinator")]
 mod grandfather;
 mod join;
@@ -25,8 +24,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use openvault_core::membership::AdminKey as _;
 use openvault_core::membership::Scope;
+use openvault_core::names::is_env_name;
 use openvault_core::record::MAX_VALUE_LEN;
-use openvault_core::{Kind, Vault, names};
+use openvault_core::{Kind, Vault, env_file, names};
 use openvault_crypto::RecoveryKey;
 use openvault_keystore::{AdminKey, Backend, Keys};
 use openvault_service::api::{DeviceSummary, ErrorCode, Item, Listed, Request, Response, Value};
@@ -1194,14 +1194,6 @@ fn import_env(
     }
     let mut entries = Vec::with_capacity(lines.len());
     for line in &lines {
-        // `run` couldn't pass it on, so refuse it now rather than then.
-        if line.value.contains(&0) {
-            bail!(
-                "{source}: line {}: the value has a NUL byte, which an environment variable \
-                 can't hold",
-                line.number
-            );
-        }
         let name = format!("{folder}/{}", line.name);
         names::check_entry(&name)?;
         let kind = if vars.contains(&line.name) {
@@ -1346,14 +1338,6 @@ fn env_value(value: &[u8]) -> Result<&OsStr> {
     }
     let value = std::str::from_utf8(value).context("isn't UTF-8")?;
     Ok(OsStr::new(value))
-}
-
-fn is_env_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Splits `<collection>/<name>` and checks both parts.

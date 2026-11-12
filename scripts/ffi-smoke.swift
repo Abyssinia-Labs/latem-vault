@@ -69,6 +69,36 @@ check(log.first?.change == .genesis && log.allSatisfy { $0.signer == .recoveryKe
 check(try client.peers().isEmpty, "peers")
 check(try client.devices().count == 1, "devices")
 
+// Files: written from a path, listed with their size, written out again, and left alone when a
+// save holds what the current version does.
+let scratch = FileManager.default.temporaryDirectory.appending(path: "ffi-smoke-\(UUID().uuidString)")
+try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+defer { try? FileManager.default.removeItem(at: scratch) }
+let original = scratch.appending(path: "notes.bin")
+let bytes = Data((0..<(100 << 10)).map { UInt8($0 % 251) })
+try bytes.write(to: original)
+check(try client.writeFile(collection: "smoke", name: "docs/notes.bin", path: original.path), "a file wasn't written")
+check(!(try client.writeFile(collection: "smoke", name: "docs/notes.bin", path: original.path)),
+      "the same contents were written again")
+let file = try client.entries(collection: "smoke").first { $0.name == "docs/notes.bin" }
+check(file?.kind == .file && file?.size == UInt64(bytes.count) && file?.missing == 0 && file?.value == nil,
+      "the file as listed: \(String(describing: file?.size))")
+check(try client.fetch(collection: "smoke", name: "docs/notes.bin") == 0, "its chunks are here")
+let copy = scratch.appending(path: "copy.bin")
+try client.exportFile(collection: "smoke", name: "docs/notes.bin", path: copy.path)
+check(try Data(contentsOf: copy) == bytes, "the copy's bytes")
+let mode = try FileManager.default.attributesOfItem(atPath: copy.path)[.posixPermissions] as? Int
+check(mode == 0o600, "the copy's mode \(String(describing: mode))")
+check(try client.get(collection: "smoke", name: "docs/notes.bin") == nil, "get gave a file's manifest")
+do {
+    _ = try client.writeFile(collection: "smoke", name: "prod/TOKEN", path: original.path)
+    check(false, "a file took a secret's name")
+} catch OpenVaultError.Failed {}
+check(try client.collections()[0].files == 1, "the collection's file count")
+check(try client.placement(collection: "smoke", set: .onDemand) == .onDemand, "on demand")
+check(try client.placement(collection: "smoke", set: .keep) == .keep, "keep")
+_ = diskNotEncrypted()
+
 watch.stop()
 check(listener.ended.wait(timeout: .now() + 10) == .success, "the watch didn't end")
-print("openvault-ffi \(version()) works from Swift: \(entries.count) entries, \(log.count) log entries")
+print("openvault-ffi \(version()) works from Swift: \(entries.count) entries, a file, \(log.count) log entries")

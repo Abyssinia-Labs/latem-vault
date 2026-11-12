@@ -13,6 +13,7 @@ mod coordinator;
 mod engine;
 #[cfg(unix)]
 mod fetch;
+pub mod files;
 pub mod handler;
 #[cfg(unix)]
 mod server;

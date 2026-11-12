@@ -181,7 +181,7 @@ Since 0.4.0 ([files.md](files.md#the-service)). get, set, delete, list and folde
 - **fetch** (0.5.0) gets the chunks of a file that aren't on this device from the devices that read its collection, and answers once they're all here, or with how many none of them had (files.md, asking). It answers only when it's done, which for a large file takes as long as the transfer. Without the service, it only counts them, since only the service has the endpoint. `get` and `run` send it before they read a file with chunks.
 - When a fetch stores chunks, watching apps get an entries event for the collection, so they can show its files as here.
 - A set or delete that leaves chunks no current version names sweeps one batch of those due (files.md, dropping chunks). The service also sweeps when it starts.
-- The Swift bindings leave files out of entries until the Mac app shows them (files.md, M4 stage 4).
+- The Swift bindings list files among a collection's entries, with their sizes and missing chunks from list, and fetch, write out and write them with the code the CLI uses (files.md, the Mac app).
 
 ### For apps
 
@@ -204,7 +204,7 @@ Since 0.3.3, for the Mac app (design §12), which reaches the service through th
 | Type | Response | Body |
 | --- | --- | --- |
 | `0x8b` | vault | vault id (16) ‖ device id (16) ‖ recovery fingerprint (4) ‖ log head (u64) ‖ admin (u8) |
-| `0x8c` | collection summaries | count (u32) ‖ collections: name (str) ‖ secrets (u32) ‖ variables (u32) ‖ key (u32) ‖ count (u32) ‖ devices: device id (16) ‖ scope (u8) |
+| `0x8c` | collection summaries | count (u32) ‖ collections: name (str) ‖ secrets (u32) ‖ variables (u32) ‖ files (u32) ‖ key (u32) ‖ count (u32) ‖ devices: device id (16) ‖ scope (u8) |
 | `0x8d` | entry details | count (u32) ‖ entries: name (str) ‖ kind ‖ set by (16) ‖ key (u32) ‖ value (bytes) |
 | `0x8e` | log | count (u32) ‖ entries: seq (u64) ‖ hash (32) ‖ change (u8) ‖ device id (16) ‖ collection (str) ‖ scope (u8) ‖ key (u32) ‖ signer (u8) |
 | `0x8f` | event | what (u8) ‖ count (u32) ‖ collections (str) |
@@ -215,7 +215,7 @@ Since 0.3.3, for the Mac app (design §12), which reaches the service through th
 
 **Reads.**
 - **vault**: the recovery fingerprint is the first 4 bytes of the hash of the recovery key, shown as `d06a 5f28`. The log head is the last entry's seq, 0 before the log starts. Admin is 1 when this device has an admin key the log lists.
-- **collection summaries**: every collection on this device, with its counts of secrets and variables, its current key (epoch), and each device that isn't revoked and has a scope on it other than none. Counting reads only the index, as list does.
+- **collection summaries**: every collection on this device, with its counts of secrets, variables and files (files since 0.5.2), its current key (epoch), and each device that isn't revoked and has a scope on it other than none. Counting reads only the index, as list does.
 - **entry details**: every current entry of a collection, with the device that set it and the key it was sealed with. Variables come with their values; a secret's value is always empty, so a list never holds one. It opens every record, so a collection of n entries costs n decryptions.
 - **log**: up to `max` entries from seq `from`, at most 256 at a time. Change is the entry's type (membership.md): device id, collection, scope and key are filled in where the type has them, and zeros or empty otherwise. A collection is given by name, or by its id in hex if this device doesn't have it. Signer: `0x00` the recovery key, `0x01` this device's admin key, `0x02` another admin key. The log keeps no times, so neither does this.
 - **peers**: only the service answers it. For each member other than this device: state `0x00` not seen since the service started, `0x01` on the network, or in a session that has caught up, `0x02` syncing: in a session that hasn't gone 2 seconds without a message (sync.md, lifetime), `0x03` its last session failed; seen is seconds since mDNS last showed it (0 while it's on the network or in a session, `0xffffffff` never); retry in is seconds until the next attempt after a failure (0 if none is waiting); error is why the last session failed, or empty.

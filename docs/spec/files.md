@@ -1,6 +1,6 @@
 # Files spec, v1
 
-Status: stage 1 built in 0.4.0, 2026-11-11: files on one device, with the manifest, chunks, the local store, `import`, `get`, `list`, `run` and `placement`. Stage 2 built in 0.5.0, 2026-11-12: chunk sync over `openvault/chunks/1`, fetching, and the on-demand cache's limit. Stage 3 built in 0.5.1, 2026-11-12: `open`. Builds on [records.md](records.md), [crypto.md](crypto.md) and [sync.md](sync.md). The design is in [design §13](../design.md#13-files), and it settles [§19, decision 3](../design.md#19-open-decisions).
+Status: stage 1 built in 0.4.0, 2026-11-11: files on one device, with the manifest, chunks, the local store, `import`, `get`, `list`, `run` and `placement`. Stage 2 built in 0.5.0, 2026-11-12: chunk sync over `openvault/chunks/1`, fetching, and the on-demand cache's limit. Stage 3 built in 0.5.1, 2026-11-12: `open`. Stage 4 built in 0.5.2 and the Mac app, 2026-11-12: files in the app (below). Builds on [records.md](records.md), [crypto.md](crypto.md) and [sync.md](sync.md). The design is in [design §13](../design.md#13-files), and it settles [§19, decision 3](../design.md#19-open-decisions).
 
 A file is an entry like a secret: a name in a collection, with versions, written by devices with `write` and read by devices with `read`. Its record holds a manifest. A small file's bytes are in the manifest; a larger file's are in sealed chunks, which live outside the database and travel between devices only when a device needs them.
 
@@ -144,6 +144,17 @@ openvault list <collection>[/<folder>]                         files show their 
 - Without a service, the CLI runs the same requests on the vault itself.
 - The service holds the endpoint, so it fetches chunks. The fetch request (service.md, files) asks for a file's chunks: the service fetches the missing ones and answers once they're all here, or with how many no peer had. `get` and `run` send it before they read a file; without a service they fail if chunks are missing, and say to start it.
 - When a fetch stores chunks, the watch sends an entries event for the collection, so an app can show its files as here.
+
+## The Mac app
+
+Since 0.5.2 the Swift bindings list files with their sizes and how many of their chunks aren't here, and fetch, write out and write files through the shared code the CLI uses (`openvault_service::files`). The app (`openvault-apple`):
+
+- **Lists** a collection's files among its entries, with their sizes, and "not here" while chunks are missing. Counts include files.
+- **Opens** a file as `open` does: it fetches what's missing, writes a copy to a private directory and opens it in its app. A save becomes a new version once nothing has changed in the copy's directory for 2 seconds, which the app learns from FSEvents rather than by looking. Done, on the file or in Needs you, writes a save that hasn't settled and deletes the copy; quitting the app does that for every open file first. A copy whose last save can't be written stays, and the app says where. On a Mac that can't write the collection, the copy is read-only and nothing is saved.
+- **Saves a copy** where you pick, as `get -o` does.
+- **Imports** files and folders, from the file picker or dropped on a collection, with `import`'s rules for names, what's left out and disk encryption; the sheet lists what it will write before it does. A file whose contents haven't changed isn't written again.
+- **Shows and sets placement** for a collection with files: keep all, or on demand.
+- ⌘K finds secrets and variables only, since it copies values.
 
 ## Cost
 

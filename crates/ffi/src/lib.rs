@@ -5,18 +5,20 @@
 //! connection open and calls a Swift listener on each event. Every call blocks, so Swift makes
 //! them off the main thread. Values cross into Swift as `Data`, where they can't be wiped.
 
+use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use openvault_core::file::Manifest;
 use openvault_core::membership::{DeviceName, Scope as CoreScope};
-use openvault_core::{DeviceId, Kind as CoreKind, env_file};
+use openvault_core::{DeviceId, Kind as CoreKind, Placement as CorePlacement, env_file};
 use openvault_crypto::pake;
 use openvault_keystore::{Backend, Keys};
 use openvault_service::api::{self, ErrorCode, Request, Response};
-use openvault_service::{client, setup};
+use openvault_service::{client, files, setup};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
@@ -63,6 +65,17 @@ pub enum Scope {
 pub enum Kind {
     Secret,
     Variable,
+    /// A file (files.md). Its bytes are read with `export_file`, and written with `write_file`.
+    File,
+}
+
+/// Which of a collection's file chunks this device keeps (files.md, placement).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum Placement {
+    /// Every current file's chunks.
+    Keep,
+    /// The chunks of files read lately, up to 2 GiB.
+    OnDemand,
 }
 
 #[derive(Debug, uniffi::Record)]
@@ -97,9 +110,11 @@ pub struct CollectionSummary {
     /// The collection's current key (epoch).
     pub key: u32,
     pub devices: Vec<DeviceScope>,
+    #[uniffi(default = 0)]
+    pub files: u32,
 }
 
-/// An entry as a list shows it: a variable's value, and never a secret's.
+/// An entry as a list shows it: a variable's value, and never a secret's or a file's.
 #[derive(uniffi::Record)]
 pub struct Entry {
     pub name: String,
@@ -107,6 +122,12 @@ pub struct Entry {
     pub set_by: String,
     pub key: u32,
     pub value: Option<Vec<u8>>,
+    /// A file's length in bytes; 0 for the others.
+    #[uniffi(default = 0)]
+    pub size: u64,
+    /// How many of a file's chunks aren't on this device: it can't be read until they're fetched.
+    #[uniffi(default = 0)]
+    pub missing: u32,
 }
 
 #[derive(uniffi::Record)]
@@ -610,6 +631,7 @@ impl Client {
                     name: summary.name,
                     secrets: summary.secrets,
                     variables: summary.variables,
+                    files: summary.files,
                     key: summary.key,
                     devices: summary
                         .devices
@@ -636,27 +658,48 @@ impl Client {
         })?)
     }
 
-    /// A collection's current secrets and variables, with variables' values but never secrets'.
-    /// Files aren't listed yet: the app shows them from M4's stage 4 (files.md).
+    /// A collection's current entries, with variables' values but never secrets'. Files come with
+    /// their sizes and how many of their chunks aren't here, from the listing, which only a
+    /// collection with files asks for.
     pub fn entries(&self, collection: String) -> Result<Vec<Entry>, OpenVaultError> {
-        match self.call(&Request::EntryDetails { collection })? {
-            Response::EntryDetails(details) => Ok(details
-                .into_iter()
-                .filter(|detail| detail.kind != CoreKind::File)
-                .map(|detail| Entry {
+        let details = match self.call(&Request::EntryDetails {
+            collection: collection.clone(),
+        })? {
+            Response::EntryDetails(details) => details,
+            other => return Err(unexpected(other)),
+        };
+        let files: HashMap<String, (u64, u32)> =
+            if details.iter().any(|detail| detail.kind == CoreKind::File) {
+                match self.call(&Request::List { collection })? {
+                    Response::Listing(listed) => listed
+                        .into_iter()
+                        .filter(|listed| listed.kind == CoreKind::File)
+                        .map(|listed| (listed.name, (listed.size, listed.missing)))
+                        .collect(),
+                    other => return Err(unexpected(other)),
+                }
+            } else {
+                HashMap::new()
+            };
+        Ok(details
+            .into_iter()
+            .map(|detail| {
+                let (size, missing) = files.get(&detail.name).copied().unwrap_or_default();
+                Entry {
                     kind: detail.kind.into(),
                     value: (detail.kind == CoreKind::Var).then(|| detail.value.to_vec()),
                     name: detail.name,
                     set_by: detail.set_by.to_string(),
                     key: detail.key,
-                })
-                .collect()),
-            other => Err(unexpected(other)),
-        }
+                    size,
+                    missing,
+                }
+            })
+            .collect())
     }
 
-    /// A secret's or variable's value, or `None` if it doesn't exist (or is a file, which the
-    /// app doesn't show yet).
+    /// A secret's or variable's value, or `None` if it doesn't exist or is a file, whose bytes
+    /// `export_file` writes out instead.
     pub fn get(&self, collection: String, name: String) -> Result<Option<Value>, OpenVaultError> {
         match self.call(&Request::Get { collection, name })? {
             Response::Entry(value) => {
@@ -671,8 +714,11 @@ impl Client {
         }
     }
 
-    /// Writes every entry in one transaction.
+    /// Writes every entry in one transaction. Files are written with `write_file`.
     pub fn set(&self, collection: String, entries: Vec<NewEntry>) -> Result<(), OpenVaultError> {
+        if entries.iter().any(|entry| entry.kind == Kind::File) {
+            return Err(failed("files are written with write_file"));
+        }
         let entries = entries
             .into_iter()
             .map(|entry| api::Item {
@@ -691,6 +737,67 @@ impl Client {
     pub fn delete(&self, collection: String, name: String) -> Result<bool, OpenVaultError> {
         match self.call(&Request::Delete { collection, name })? {
             Response::Deleted(existed) => Ok(existed),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Gets the chunks of a file that aren't on this device from the devices that read its
+    /// collection, and returns how many none of them had: 0 once it can be read (files.md,
+    /// asking). It answers when it's done, which for a large file takes the transfer's time.
+    pub fn fetch(&self, collection: String, name: String) -> Result<u64, OpenVaultError> {
+        match self.call(&Request::Fetch { collection, name })? {
+            Response::Fetched { missing } => Ok(missing),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Writes a file's bytes to `path`, readable only by this user (0700 if it's executable), with
+    /// the time it was written, through a private file renamed into place once it's whole. Its
+    /// chunks must be here: `fetch` first.
+    pub fn export_file(
+        &self,
+        collection: String,
+        name: String,
+        path: String,
+    ) -> Result<(), OpenVaultError> {
+        let manifest = self.manifest(&collection, &name)?;
+        let mut calls = Calls(self);
+        files::write_out(
+            Path::new(&path),
+            manifest.executable,
+            manifest.mtime,
+            |file| files::write_contents(&mut calls, &collection, &manifest, file),
+        )
+        .map_err(from_anyhow)
+    }
+
+    /// Writes the file at `path` as `collection`/`name`: an import, or a save of a copy that was
+    /// opened. Returns whether it wrote a version: a file whose contents and executable bit are
+    /// the current version's is left as it is. It fails if the name is a secret's or a
+    /// variable's.
+    pub fn write_file(
+        &self,
+        collection: String,
+        name: String,
+        path: String,
+    ) -> Result<bool, OpenVaultError> {
+        files::write_file(&mut Calls(self), &collection, &name, Path::new(&path))
+            .map(|written| written.is_some())
+            .map_err(from_anyhow)
+    }
+
+    /// This device's placement for a collection, after setting it if `set` is given. Set to keep,
+    /// the collection gets its missing chunks at once.
+    pub fn placement(
+        &self,
+        collection: String,
+        set: Option<Placement>,
+    ) -> Result<Placement, OpenVaultError> {
+        match self.call(&Request::Placement {
+            collection,
+            set: set.map(Into::into),
+        })? {
+            Response::Placement(placement) => Ok(placement.into()),
             other => Err(unexpected(other)),
         }
     }
@@ -907,6 +1014,20 @@ impl Drop for Watch {
 }
 
 impl Client {
+    /// A file's manifest: what it holds, or the chunks it's in.
+    fn manifest(&self, collection: &str, name: &str) -> Result<Manifest, OpenVaultError> {
+        match self.call(&Request::Get {
+            collection: collection.into(),
+            name: name.into(),
+        })? {
+            Response::Entry(Some(value)) if value.kind == CoreKind::File => {
+                Manifest::decode(&value.value).map_err(|e| failed(e.to_string()))
+            }
+            Response::Entry(_) => Err(failed(format!("no file {collection}/{name}"))),
+            other => Err(unexpected(other)),
+        }
+    }
+
     fn call(&self, request: &Request) -> Result<Response, OpenVaultError> {
         match client::call(&self.socket, request)? {
             Some(Response::Error { code, message }) => Err(match code {
@@ -992,6 +1113,31 @@ fn device_id(id: &str) -> Result<DeviceId, OpenVaultError> {
         .map_err(|_| failed(format!("{id} isn't a device id")))
 }
 
+/// The client as the shared file code calls it (`openvault_service::files`).
+struct Calls<'a>(&'a Client);
+
+impl files::Caller for Calls<'_> {
+    fn call(&mut self, request: Request) -> anyhow::Result<Response> {
+        Ok(self.0.call(&request)?)
+    }
+}
+
+/// Back from the shared file code: the service's own error if that's what it was.
+fn from_anyhow(error: anyhow::Error) -> OpenVaultError {
+    match error.downcast::<OpenVaultError>() {
+        Ok(error) => error,
+        Err(error) => failed(format!("{error:#}")),
+    }
+}
+
+/// Why this Mac's disk isn't encrypted, or `None` if it is (FileVault). A file imported from an
+/// unencrypted disk may stay on it in the clear after its original is deleted, so the app asks
+/// first (files.md, import).
+#[uniffi::export]
+pub fn disk_not_encrypted() -> Option<String> {
+    files::disk_encryption().err()
+}
+
 fn done(response: Response) -> Result<(), OpenVaultError> {
     match response {
         Response::Done => Ok(()),
@@ -1037,9 +1183,9 @@ impl From<CoreKind> for Kind {
     fn from(kind: CoreKind) -> Self {
         match kind {
             CoreKind::Var => Self::Variable,
-            // Collection entries never cross the local API, and files are left out above until
-            // the app shows them.
-            CoreKind::Secret | CoreKind::Collection | CoreKind::File => Self::Secret,
+            CoreKind::File => Self::File,
+            // Collection entries never cross the local API.
+            CoreKind::Secret | CoreKind::Collection => Self::Secret,
         }
     }
 }
@@ -1049,6 +1195,25 @@ impl From<Kind> for CoreKind {
         match kind {
             Kind::Secret => Self::Secret,
             Kind::Variable => Self::Var,
+            Kind::File => Self::File,
+        }
+    }
+}
+
+impl From<CorePlacement> for Placement {
+    fn from(placement: CorePlacement) -> Self {
+        match placement {
+            CorePlacement::Keep => Self::Keep,
+            CorePlacement::OnDemand => Self::OnDemand,
+        }
+    }
+}
+
+impl From<Placement> for CorePlacement {
+    fn from(placement: Placement) -> Self {
+        match placement {
+            Placement::Keep => Self::Keep,
+            Placement::OnDemand => Self::OnDemand,
         }
     }
 }

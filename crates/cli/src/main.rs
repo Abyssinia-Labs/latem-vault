@@ -30,6 +30,7 @@ use openvault_core::record::MAX_VALUE_LEN;
 use openvault_core::{Kind, Placement, Vault, env_file, names};
 use openvault_keystore::{Backend, Keys};
 use openvault_service::api::{DeviceSummary, ErrorCode, Item, Listed, Request, Response, Value};
+use openvault_service::files::size_label;
 use openvault_service::handler::{self, unexpected};
 use openvault_service::{ADMIN_KEY, KEYS, SOCKET, VAULT, default_device_name, setup};
 use zeroize::Zeroizing;
@@ -1161,7 +1162,7 @@ fn get(home: &Home, entry: &str, output: Option<&Path>) -> Result<()> {
         return files::get(&mut access, collection, name, &manifest, output);
     }
     if let Some(path) = output {
-        return files::write_out(path, false, now_secs(), |file| {
+        return openvault_service::files::write_out(path, false, now_secs(), |file| {
             Ok(file.write_all(&entry.value)?)
         });
     }
@@ -1400,21 +1401,6 @@ fn kind_label(kind: Kind) -> &'static str {
         Kind::File => "file",
         Kind::Var | Kind::Collection => "var",
     }
-}
-
-/// `512 B`, `2.1 KiB`, `12.0 MiB`.
-fn size_label(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut size = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    format!("{size:.1} {}", UNITS[unit])
 }
 
 /// Seconds since 1970, for a value written out with `get -o`.

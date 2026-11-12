@@ -3,23 +3,24 @@
 //! the service, one to a message.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use openvault_core::file::{CHUNK_SIZE, ChunkId, Content, MAX_INLINE, MAX_SIZE, Manifest};
+use openvault_core::file::{Content, Manifest};
 use openvault_core::membership::Scope;
 use openvault_core::names::{self, is_env_name};
 use openvault_core::{Kind, Placement};
-use openvault_service::api::{ChunkData, Item, Request, Response};
+use openvault_service::api::{Item, Request, Response};
+use openvault_service::files::{
+    Caller, disk_encryption, seal_file, size_label, write_contents, write_file, write_out,
+};
 use openvault_service::handler::unexpected;
-use zeroize::Zeroizing;
 
-use crate::{Access, Home, size_label};
+use crate::{Access, Home};
 
 /// Files' manifests go to the service in batches of at most this many bytes.
 const BATCH_BYTES: usize = 4 << 20;
@@ -29,28 +30,13 @@ const SETTLE: Duration = Duration::from_secs(2);
 /// How often `open` looks at its copy for a save: one `stat` each time, nothing more.
 const LOOK: Duration = Duration::from_millis(500);
 
+impl Caller for Access {
+    fn call(&mut self, request: Request) -> Result<Response> {
+        Access::call(self, request)
+    }
+}
+
 impl Access {
-    fn write_chunk(&mut self, collection: &str, data: &[u8]) -> Result<(ChunkId, u32)> {
-        match self.call(Request::WriteChunk {
-            collection: collection.into(),
-            data: ChunkData(Zeroizing::new(data.to_vec())),
-        })? {
-            Response::ChunkWritten { id, epoch } => Ok((id, epoch)),
-            other => Err(unexpected(&other)),
-        }
-    }
-
-    fn read_chunk(&mut self, collection: &str, epoch: u32, id: ChunkId) -> Result<ChunkData> {
-        match self.call(Request::ReadChunk {
-            collection: collection.into(),
-            epoch,
-            id,
-        })? {
-            Response::Chunk(data) => Ok(data),
-            other => Err(unexpected(&other)),
-        }
-    }
-
     /// Gets the chunks of the file `collection`/`name` that aren't on this device from the
     /// devices that share its collection (files.md, asking). Only the service can, since it
     /// holds the endpoint; without it this fails if any are missing.
@@ -310,97 +296,6 @@ fn sources(path: &Path, into: Option<&str>) -> Result<(Vec<Source>, Vec<Skipped>
 
 /// Reads a file in 1 MiB pieces, has the service seal each, and returns its manifest. A file of
 /// at most 64 KiB is kept in the manifest instead.
-fn seal_file(access: &mut Access, collection: &str, path: &Path) -> Result<Manifest> {
-    let mut file = fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if metadata.len() > MAX_SIZE {
-        bail!("files are at most {}", size_label(MAX_SIZE));
-    }
-    let mtime = match metadata.modified()?.duration_since(UNIX_EPOCH) {
-        Ok(after) => i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
-        Err(before) => -i64::try_from(before.duration().as_secs()).unwrap_or(i64::MAX),
-    };
-    #[cfg(unix)]
-    let executable = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o111 != 0;
-    #[cfg(not(unix))]
-    let executable = false;
-
-    let mut piece = Zeroizing::new(vec![0; CHUNK_SIZE]);
-    let first = fill(&mut file, &mut piece)?;
-    if first <= MAX_INLINE {
-        return Ok(Manifest {
-            size: first as u64,
-            executable,
-            mtime,
-            content: Content::Inline(Zeroizing::new(piece[..first].to_vec())),
-        });
-    }
-    let (mut ids, mut size, mut epoch) = (Vec::new(), 0u64, None);
-    let mut len = first;
-    while len > 0 {
-        if ids.len() * CHUNK_SIZE >= MAX_SIZE as usize {
-            bail!("files are at most {}", size_label(MAX_SIZE));
-        }
-        let (id, sealed_under) = access.write_chunk(collection, &piece[..len])?;
-        if *epoch.get_or_insert(sealed_under) != sealed_under {
-            bail!("{collection} got a new key while this file was read; import it again");
-        }
-        ids.push(id);
-        size += len as u64;
-        if len < CHUNK_SIZE {
-            break;
-        }
-        len = fill(&mut file, &mut piece)?;
-    }
-    Ok(Manifest {
-        size,
-        executable,
-        mtime,
-        content: Content::Chunks {
-            epoch: epoch.expect("a chunked file has a chunk"),
-            ids,
-        },
-    })
-}
-
-/// Reads until `buf` is full or the file ends.
-fn fill(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match reader.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(filled)
-}
-
-/// Writes a file's bytes to `out`, a chunk at a time.
-fn write_contents(
-    access: &mut Access,
-    collection: &str,
-    manifest: &Manifest,
-    out: &mut impl Write,
-) -> Result<()> {
-    match &manifest.content {
-        Content::Inline(bytes) => out.write_all(bytes)?,
-        Content::Chunks { epoch, ids } => {
-            let mut written = 0u64;
-            for id in ids {
-                let data = access.read_chunk(collection, *epoch, *id)?;
-                written += data.0.len() as u64;
-                out.write_all(&data.0)?;
-            }
-            if written != manifest.size {
-                bail!("its chunks don't add up to its size");
-            }
-        }
-    }
-    Ok(out.flush()?)
-}
-
 /// Writes a file entry to stdout, or to `output` with mode 0600 (0700 if it's executable) and
 /// its modification time.
 pub fn get(
@@ -420,53 +315,6 @@ pub fn get(
         Some(path) => write_out(path, manifest.executable, manifest.mtime, |file| {
             write_contents(access, collection, manifest, file).with_context(context)
         }),
-    }
-}
-
-/// Writes `path` through a private file beside it, renamed into place once it's whole.
-pub fn write_out(
-    path: &Path,
-    executable: bool,
-    mtime: i64,
-    contents: impl FnOnce(&mut fs::File) -> Result<()>,
-) -> Result<()> {
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("{} isn't a file name", path.display()))?;
-    let mut partial = OsString::from(".");
-    partial.push(file_name);
-    partial.push(".openvault-partial");
-    let partial = dir.join(partial);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, if executable { 0o700 } else { 0o600 });
-    let result = (|| -> Result<()> {
-        let mut file = options
-            .open(&partial)
-            .with_context(|| format!("can't write {}", partial.display()))?;
-        contents(&mut file)?;
-        if let Some(time) = system_time(mtime) {
-            file.set_modified(time)?;
-        }
-        file.sync_all()?;
-        fs::rename(&partial, path).with_context(|| format!("can't write {}", path.display()))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&partial);
-    }
-    result
-}
-
-fn system_time(secs: i64) -> Option<SystemTime> {
-    if secs >= 0 {
-        UNIX_EPOCH.checked_add(Duration::from_secs(secs.unsigned_abs()))
-    } else {
-        UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
     }
 }
 
@@ -593,26 +441,14 @@ pub fn open(access: &mut Access, collection: &str, name: &str, manifest: &Manife
             }
         }
     });
-    let mut last = manifest.clone();
+    // A save whose contents are the current version's writes nothing (files.md, open).
     let mut save = |path: &Path| -> Result<()> {
-        let saved = seal_file(access, collection, path)?;
-        if saved.content == last.content && saved.executable == last.executable {
-            return Ok(());
+        if let Some(saved) = write_file(access, collection, name, path)? {
+            println!(
+                "Saved a new version of {entry}, {}.",
+                size_label(saved.size)
+            );
         }
-        let value = saved.encode();
-        access.set(
-            collection,
-            vec![Item {
-                name: name.to_owned(),
-                kind: Kind::File,
-                value,
-            }],
-        )?;
-        println!(
-            "Saved a new version of {entry}, {}.",
-            size_label(saved.size)
-        );
-        last = saved;
         Ok(())
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -842,78 +678,6 @@ pub fn placement(home: &Home, collection: &str, set: Option<Placement>) -> Resul
     Ok(())
 }
 
-/// `Ok` if this device's disk is encrypted, otherwise why not, or why it can't tell (design §13).
-fn disk_encryption() -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = process::Command::new("/usr/bin/fdesetup")
-            .arg("isactive")
-            .output()
-            .map_err(|e| format!("can't ask fdesetup whether FileVault is on: {e}"))?;
-        match String::from_utf8_lossy(&output.stdout).trim() {
-            "true" => Ok(()),
-            "false" => Err("FileVault is off".into()),
-            other => Err(format!("fdesetup says {other:?} about FileVault")),
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        linux_root_encrypted()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        Err("openvault can't tell whether this disk is encrypted".into())
-    }
-}
-
-/// Whether the root file system is on dm-crypt, directly or under LVM.
-#[cfg(target_os = "linux")]
-fn linux_root_encrypted() -> Result<(), String> {
-    let mounts = fs::read_to_string("/proc/self/mounts")
-        .map_err(|e| format!("can't read /proc/self/mounts: {e}"))?;
-    // The last mount on / is the one in use.
-    let device = mounts
-        .lines()
-        .rev()
-        .find_map(|line| {
-            let mut fields = line.split(' ');
-            let (source, target) = (fields.next()?, fields.next()?);
-            (target == "/").then_some(source)
-        })
-        .ok_or("can't find the root file system")?;
-    let resolved = fs::canonicalize(device).unwrap_or_else(|_| PathBuf::from(device));
-    let Some(name) = resolved
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| name.starts_with("dm-"))
-    else {
-        return Err(format!("the root file system ({device}) isn't on dm-crypt"));
-    };
-    if dm_crypt(name, 4) {
-        Ok(())
-    } else {
-        Err(format!("the root file system ({device}) isn't on dm-crypt"))
-    }
-}
-
-/// Whether device-mapper device `name`, or one it's built on, is a dm-crypt device.
-#[cfg(target_os = "linux")]
-fn dm_crypt(name: &str, depth: u8) -> bool {
-    let block = Path::new("/sys/block").join(name);
-    if fs::read_to_string(block.join("dm/uuid")).is_ok_and(|uuid| uuid.starts_with("CRYPT-")) {
-        return true;
-    }
-    depth > 0
-        && fs::read_dir(block.join("slaves")).is_ok_and(|slaves| {
-            slaves.flatten().any(|slave| {
-                slave
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|slave| slave.starts_with("dm-") && dm_crypt(slave, depth - 1))
-            })
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,30 +714,5 @@ mod tests {
         assert_eq!(found[0].name, "upload.jks");
         let (found, _) = sources(&root.join("upload.jks"), Some("prod")).unwrap();
         assert_eq!(found[0].name, "prod/upload.jks");
-    }
-
-    #[test]
-    fn written_files_are_private_and_keep_their_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("out.bin");
-        write_out(&path, true, 1_000_000_000, |file| {
-            Ok(file.write_all(b"data")?)
-        })
-        .unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"data");
-        let metadata = fs::metadata(&path).unwrap();
-        assert_eq!(
-            metadata.modified().unwrap(),
-            UNIX_EPOCH + Duration::from_secs(1_000_000_000)
-        );
-        #[cfg(unix)]
-        assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o777,
-            0o700
-        );
-        // A failure leaves neither the file nor the partial one.
-        let failed = dir.path().join("failed.bin");
-        assert!(write_out(&failed, false, 0, |_| bail!("no")).is_err());
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

@@ -219,6 +219,7 @@ pub struct CollectionSummary {
     pub name: String,
     pub secrets: u32,
     pub variables: u32,
+    pub files: u32,
     /// The collection's current key (epoch).
     pub key: u32,
     /// Devices that aren't revoked, with a scope other than none.
@@ -733,6 +734,7 @@ impl Response {
                     w.str(&collection.name);
                     w.put(&collection.secrets.to_be_bytes());
                     w.put(&collection.variables.to_be_bytes());
+                    w.put(&collection.files.to_be_bytes());
                     w.put(&collection.key.to_be_bytes());
                     w.count(collection.devices.len());
                     for (device, scope) in &collection.devices {
@@ -969,7 +971,7 @@ impl Response {
                 let mut collections = Vec::with_capacity(count);
                 for _ in 0..count {
                     let name = r.string()?;
-                    let (secrets, variables, key) = (r.u32()?, r.u32()?, r.u32()?);
+                    let (secrets, variables, files, key) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
                     let devices = (0..r.count()?)
                         .map(|_| Ok((r.device()?, r.scope()?)))
                         .collect::<Result<_, DecodeError>>()?;
@@ -977,6 +979,7 @@ impl Response {
                         name,
                         secrets,
                         variables,
+                        files,
                         key,
                         devices,
                     });
@@ -1637,6 +1640,7 @@ mod tests {
             name: "latem".into(),
             secrets: 22,
             variables: 6,
+            files: 3,
             key: 2,
             devices: vec![(device, Scope::Write), (DeviceId::random(), Scope::Read)],
         }];

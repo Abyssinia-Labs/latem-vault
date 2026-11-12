@@ -410,6 +410,7 @@ fn summaries(vault: &Vault<Keys>) -> Result<Vec<CollectionSummary>> {
         summaries.push(CollectionSummary {
             secrets: count(Kind::Secret),
             variables: count(Kind::Var),
+            files: count(Kind::File),
             key: membership.and_then(|m| m.epoch(collection.id)).unwrap_or(0),
             devices,
             name: collection.name,

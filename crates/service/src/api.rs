@@ -267,7 +267,9 @@ impl Event {
 pub enum PeerState {
     /// Not seen since the service started.
     NotSeen,
+    /// On the network, or in a session that has caught up and only waits for more work.
     OnNetwork,
+    /// In a session that hasn't gone quiet yet (sync.md, quiet).
     Syncing,
     /// Its last session failed.
     Failing,
@@ -277,7 +279,8 @@ pub enum PeerState {
 pub struct Peer {
     pub device: DeviceId,
     pub state: PeerState,
-    /// Seconds since mDNS last showed it: 0 while it's on the network, `None` if never.
+    /// Seconds since mDNS last showed it: 0 while it's on the network or in a session, `None`
+    /// if never.
     pub seen: Option<u32>,
     /// Seconds until the next attempt after a failure, 0 if none is waiting.
     pub retry_in: u32,

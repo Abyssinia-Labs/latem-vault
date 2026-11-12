@@ -2,7 +2,8 @@
 //! members exchange hellos, bring their logs level, then reconcile every set they share.
 //!
 //! A session runs until 60 seconds pass without a message. While it runs, the device tells it of
-//! local writes and log changes through [`Notice`]s, so they reach the peer straight away.
+//! local writes and log changes through [`Notice`]s, so they reach the peer straight away. It
+//! counts as quiet once 2 seconds pass without a message: caught up, and only waiting.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,10 @@ pub const ALPN: &[u8] = b"openvault/sync/1";
 
 /// How long a session waits for a message before it closes (sync.md, lifetime).
 pub const IDLE: Duration = Duration::from_secs(60);
+/// How long a session goes without a message before it counts as quiet: caught up, though still
+/// open in case more work comes (sync.md, quiet). The protocol has no message that says a
+/// session is done, so this is how a device tells.
+pub const QUIET: Duration = Duration::from_secs(2);
 /// A range with at most this many items is sent as ids rather than a fingerprint.
 const IDS_LIMIT: usize = 32;
 /// How many ranges a fingerprint that differs splits into.
@@ -157,15 +162,18 @@ struct Session<S: SyncStore> {
 }
 
 /// Runs a session on `connection` until `idle` passes without a message ([`IDLE`] outside
-/// tests), the peer closes it, or it fails.
+/// tests), the peer closes it, or it fails. `quiet` hears `true` each time the session goes
+/// [`QUIET`] without a message, and `false` when a message comes after that. A session starts
+/// with work to do.
 pub async fn run<S: SyncStore>(
     connection: Connection,
     role: Role,
     store: Arc<S>,
     mut notices: mpsc::Receiver<Notice>,
     idle: Duration,
+    mut quiet: impl FnMut(bool) + Send,
 ) -> Result<Outcome, SyncError> {
-    let result = session(&connection, role, store, &mut notices, idle).await;
+    let result = session(&connection, role, store, &mut notices, idle, &mut quiet).await;
     let duplicate = matches!(
         connection.close_reason(),
         Some(ConnectionError::ApplicationClosed(close)) if u64::from(close.error_code) == u64::from(DUPLICATE)
@@ -189,6 +197,7 @@ async fn session<S: SyncStore>(
     store: Arc<S>,
     notices: &mut mpsc::Receiver<Notice>,
     idle: Duration,
+    quiet: &mut (impl FnMut(bool) + Send),
 ) -> Result<Outcome, SyncError> {
     let peer_endpoint = *connection.remote_id().as_bytes();
     let (send, recv) = match role {
@@ -212,7 +221,7 @@ async fn session<S: SyncStore>(
         log_requested: false,
         outcome: Outcome::default(),
     };
-    let result = session.drive(recv, notices, idle).await;
+    let result = session.drive(recv, notices, idle, quiet).await;
     if let Err(error) = &result {
         if let Some(reason) = error.reason() {
             frame::send_error(&mut session.send, reason, &error.to_string()).await;
@@ -229,12 +238,16 @@ impl<S: SyncStore> Session<S> {
         recv: RecvStream,
         notices: &mut mpsc::Receiver<Notice>,
         idle: Duration,
+        quiet: &mut (impl FnMut(bool) + Send),
     ) -> Result<(), SyncError> {
         self.send_hello().await?;
         // One read stays in flight across the loop. `select!` drops the branches it doesn't take,
         // and a read dropped part way through a message would lose the bytes it had read.
         let mut reading = Box::pin(next_message(recv));
         let mut deadline = Instant::now() + idle;
+        // When the session goes quiet if no message comes first; `None` once it has. A message
+        // either way puts it off, and tells `quiet` if the session had gone quiet.
+        let mut quiet_at = Some(Instant::now() + QUIET);
         loop {
             tokio::select! {
                 (recv, message) = &mut reading => {
@@ -247,9 +260,22 @@ impl<S: SyncStore> Session<S> {
                     };
                     reading.set(next_message(recv));
                     deadline = Instant::now() + idle;
+                    if quiet_at.replace(Instant::now() + QUIET).is_none() {
+                        quiet(false);
+                    }
                     self.handle(kind, &body).await?;
                 }
-                Some(notice) = notices.recv() => self.notice(notice).await?,
+                Some(notice) = notices.recv() => {
+                    if self.notice(notice).await?
+                        && quiet_at.replace(Instant::now() + QUIET).is_none()
+                    {
+                        quiet(false);
+                    }
+                }
+                () = sleep_until(quiet_at.unwrap_or(deadline)), if quiet_at.is_some() => {
+                    quiet_at = None;
+                    quiet(true);
+                }
                 () = sleep_until(deadline) => return Ok(()),
             }
         }
@@ -420,20 +446,23 @@ impl<S: SyncStore> Session<S> {
         Ok(())
     }
 
-    async fn notice(&mut self, notice: Notice) -> Result<(), SyncError> {
+    /// Passes a notice on to the peer. True if it sent the peer anything.
+    async fn notice(&mut self, notice: Notice) -> Result<bool, SyncError> {
         match notice {
             Notice::Log => {
                 self.reset_roots();
                 self.send_hello().await?;
-                self.progress().await
+                self.progress().await?;
+                Ok(true)
             }
             Notice::Changed(set) if self.roots_sent && self.shared.contains(&set) => {
                 // The peer learns the new root; the opener also starts the set over itself.
                 self.send_roots(&[set]).await?;
                 self.reconciled.remove(&set);
-                self.progress().await
+                self.progress().await?;
+                Ok(true)
             }
-            Notice::Changed(_) => Ok(()),
+            Notice::Changed(_) => Ok(false),
         }
     }
 
@@ -920,12 +949,27 @@ mod session_tests {
         let endpoint = accepter.0.endpoint().clone();
         let accepting = tokio::spawn(async move {
             let connection = endpoint.accept().await.unwrap().await.unwrap();
-            run(connection, Role::Accepter, accept_store, accept_rx, idle).await
+            run(
+                connection,
+                Role::Accepter,
+                accept_store,
+                accept_rx,
+                idle,
+                |_| {},
+            )
+            .await
         });
         let id = iroh::EndpointId::from_bytes(&accepter.0.id()).unwrap();
         let connection = opener.0.endpoint().connect(id, ALPN).await.unwrap();
         let (tx, rx) = mpsc::channel(8);
-        let opening = tokio::spawn(run(connection, Role::Opener, opener.1.clone(), rx, idle));
+        let opening = tokio::spawn(run(
+            connection,
+            Role::Opener,
+            opener.1.clone(),
+            rx,
+            idle,
+            |_| {},
+        ));
         during(&tx).await;
         drop(accept_tx);
         (
@@ -1016,6 +1060,71 @@ mod session_tests {
         assert_eq!(&entry.value[..], b"now");
     }
 
+    /// A session goes quiet once it has caught up, has work again when a notice brings some, and
+    /// goes quiet again once that's sent, all while it stays open (sync.md, quiet).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_says_when_it_has_caught_up() {
+        let p = pair(1).await;
+        let idle = Duration::from_secs(5);
+        let (accept_tx, accept_rx) = mpsc::channel(8);
+        let accept_store = p.joined.clone();
+        let endpoint = p.joined_node.endpoint().clone();
+        let accepting = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            run(
+                connection,
+                Role::Accepter,
+                accept_store,
+                accept_rx,
+                idle,
+                |_| {},
+            )
+            .await
+        });
+        let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
+        let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+        let (open_tx, open_rx) = mpsc::channel(8);
+        let (heard_tx, mut heard) = mpsc::unbounded_channel();
+        let opening = tokio::spawn(run(
+            connection,
+            Role::Opener,
+            p.admin.clone(),
+            open_rx,
+            idle,
+            move |quiet| {
+                let _ = heard_tx.send(quiet);
+            },
+        ));
+
+        // It starts with work, so the first thing it says is that it caught up.
+        assert_eq!(heard.recv().await, Some(true));
+        assert_eq!(p.joined.lock().unwrap().list(p.latem).unwrap().len(), 1);
+
+        p.admin
+            .lock()
+            .unwrap()
+            .set(p.latem, "prod/LATER", Kind::Var, b"later")
+            .unwrap();
+        open_tx
+            .send(Notice::Changed(SetId::records(p.latem)))
+            .await
+            .unwrap();
+        assert_eq!(heard.recv().await, Some(false));
+        assert_eq!(heard.recv().await, Some(true));
+        assert_eq!(p.joined.lock().unwrap().list(p.latem).unwrap().len(), 2);
+
+        // A notice for a set the two don't share sends nothing, so it stays quiet until it
+        // closes.
+        open_tx
+            .send(Notice::Changed(SetId::records(CollectionId::random())))
+            .await
+            .unwrap();
+        drop(accept_tx);
+        opening.await.unwrap().unwrap();
+        accepting.await.unwrap().unwrap();
+        assert_eq!(heard.recv().await, None, "nothing after the last quiet");
+    }
+
     /// A session ends once both sides know the peer was revoked, even when the revoked device has
     /// the newest log, as it would from a device that hadn't yet applied the revocation.
     #[tokio::test(flavor = "multi_thread")]
@@ -1027,7 +1136,15 @@ mod session_tests {
         let endpoint = p.joined_node.endpoint().clone();
         let accepting = tokio::spawn(async move {
             let connection = endpoint.accept().await.unwrap().await.unwrap();
-            run(connection, Role::Accepter, accept_store, accept_rx, idle).await
+            run(
+                connection,
+                Role::Accepter,
+                accept_store,
+                accept_rx,
+                idle,
+                |_| {},
+            )
+            .await
         });
         let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
         let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
@@ -1038,6 +1155,7 @@ mod session_tests {
             p.admin.clone(),
             open_rx,
             idle,
+            |_| {},
         ));
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -1085,6 +1203,7 @@ mod session_tests {
             p.admin.clone(),
             rx,
             Duration::from_secs(5),
+            |_| {},
         )
         .await;
         assert!(matches!(result, Err(SyncError::Duplicate)), "{result:?}");

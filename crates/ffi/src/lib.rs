@@ -136,9 +136,14 @@ pub struct Device {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum PeerState {
+    /// Not seen since the service started.
     NotSeen,
+    /// On the network, or in a session that has caught up and only waits for more work.
     OnNetwork,
+    /// In a session that is still moving something: one that hasn't gone 2 seconds without a
+    /// message (sync.md, quiet).
     Syncing,
+    /// Its last session failed.
     Failing,
 }
 
@@ -146,7 +151,8 @@ pub enum PeerState {
 pub struct Peer {
     pub device: String,
     pub state: PeerState,
-    /// Seconds since mDNS last showed it: 0 while it's on the network, `None` if never.
+    /// Seconds since mDNS last showed it: 0 while it's on the network or in a session, `None`
+    /// if never.
     pub seen: Option<u32>,
     pub retry_in: u32,
     pub error: Option<String>,

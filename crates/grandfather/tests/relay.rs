@@ -232,6 +232,7 @@ async fn members_sync_through_the_relay_and_strangers_are_refused() {
                 store,
                 rx,
                 Duration::from_secs(2),
+                |_| {},
             )
             .await
         })
@@ -248,6 +249,7 @@ async fn members_sync_through_the_relay_and_strangers_are_refused() {
         v.admin.clone(),
         rx,
         Duration::from_secs(2),
+        |_| {},
     )
     .await
     .unwrap();

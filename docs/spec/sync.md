@@ -27,6 +27,8 @@ All integers are big-endian.
 
 **Lifetime.** A device opens a connection when there is something to sync (below) and closes it after 60 seconds without a message. It keeps no idle connections.
 
+**Quiet.** No message says a session is done, since a settled reply isn't sent (answering). So a session counts as quiet once 2 seconds pass without a message either way: it has caught up and only waits for more work. A message after that, received or sent for a notice, ends the quiet. A device shows a peer as syncing only while its session isn't quiet (service.md, peers).
+
 ### Framing
 
 A session is one bidirectional QUIC stream. Each message is:

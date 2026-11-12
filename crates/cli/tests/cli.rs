@@ -1305,6 +1305,10 @@ fn scopes_change_with_an_admin_signature() {
 #[cfg(unix)]
 #[test]
 fn services_sync_a_joined_device() {
+    use std::time::{Duration, Instant};
+
+    use openvault_service::api::{PeerState, Request, Response};
+
     let admin = Device::new();
     admin.set("latem/prod/SENTRY_DSN", "--secret", b"https://sentry");
     let joiner = Device::empty();
@@ -1321,6 +1325,29 @@ fn services_sync_a_joined_device() {
     // A write on the admin reaches the joined device while both run.
     admin.set("latem/prod/REGION", "--var", b"eu west");
     eventually(&joiner, &["get", "latem/prod/REGION"], "eu west");
+    // Once its session has caught up, apps see the device as on the network rather than
+    // syncing, though the session stays open until a minute passes without a message
+    // (sync.md, lifetime). It logs what it moved only when it closes.
+    let socket = admin.home.path().join("service.sock");
+    let started = Instant::now();
+    loop {
+        let Ok(Some(Response::Peers(peers))) =
+            openvault_service::client::call(&socket, &Request::Peers)
+        else {
+            panic!("no peers: {}", admin_service.log());
+        };
+        if peers[0].state == PeerState::OnNetwork {
+            break;
+        }
+        assert_eq!(peers[0].state, PeerState::Syncing);
+        assert!(started.elapsed() < Duration::from_secs(15), "{peers:?}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        !joiner_service.log().contains("synced with"),
+        "the session closed: {}",
+        joiner_service.log()
+    );
     // It can read but not write.
     let output = joiner.run_with_stdin(&["set", "latem/prod/X", "--var"], b"1");
     assert!(String::from_utf8_lossy(&output.stderr).contains("can't write"));

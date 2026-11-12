@@ -5,7 +5,7 @@
 //! (coordinator.md, devices).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,8 @@ struct Running {
     notices: mpsc::Sender<Notice>,
     opened_here: bool,
     task: AbortHandle,
+    /// Whether the session has caught up and only waits for more work (sync.md, quiet).
+    quiet: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -83,6 +85,7 @@ impl Engine {
         }
         let (notices, receive) = mpsc::channel(32);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (quiet, on_quiet) = self.quiet_flag();
         let engine = self.clone();
         let task = tokio::spawn(async move {
             let result = match EndpointId::from_bytes(&peer) {
@@ -99,6 +102,7 @@ impl Engine {
                             engine.vault.clone(),
                             receive,
                             sync::IDLE,
+                            on_quiet,
                         )
                         .await
                     }
@@ -115,6 +119,7 @@ impl Engine {
                 notices,
                 opened_here: true,
                 task: task.abort_handle(),
+                quiet,
             },
         );
         self.emit(Event::DEVICES);
@@ -135,6 +140,7 @@ impl Engine {
         }
         let (notices, receive) = mpsc::channel(32);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (quiet, on_quiet) = self.quiet_flag();
         let engine = self.clone();
         let task = tokio::spawn(async move {
             let result = sync::run(
@@ -143,6 +149,7 @@ impl Engine {
                 engine.vault.clone(),
                 receive,
                 sync::IDLE,
+                on_quiet,
             )
             .await;
             engine.finished(peer, id, result);
@@ -154,6 +161,7 @@ impl Engine {
                 notices,
                 opened_here: false,
                 task: task.abort_handle(),
+                quiet,
             },
         );
         self.emit(Event::DEVICES);
@@ -208,13 +216,16 @@ impl Engine {
         members
             .iter()
             .map(|(device, key)| {
-                let on_network = visible.contains(key);
+                // A session that has caught up reaches the peer as well as mDNS does.
+                let session = state.sessions.get(key);
+                let on_network = visible.contains(key) || session.is_some();
                 let failure = state.failures.get(key);
                 Peer {
                     device: *device,
-                    state: if state.sessions.contains_key(key) {
+                    state: if session.is_some_and(|running| !running.quiet.load(Ordering::Relaxed))
+                    {
                         PeerState::Syncing
-                    } else if failure.is_some() {
+                    } else if failure.is_some() && session.is_none() {
                         PeerState::Failing
                     } else if on_network {
                         PeerState::OnNetwork
@@ -236,6 +247,20 @@ impl Engine {
                 }
             })
             .collect()
+    }
+
+    /// A new session's quiet flag, and what its session calls when it goes quiet or has work
+    /// again: watching apps hear of each change (service.md, peers).
+    fn quiet_flag(self: &Arc<Self>) -> (Arc<AtomicBool>, impl FnMut(bool) + Send + 'static) {
+        let quiet = Arc::new(AtomicBool::new(false));
+        let flag = quiet.clone();
+        let engine = Arc::downgrade(self);
+        (quiet, move |now| {
+            flag.store(now, Ordering::Relaxed);
+            if let Some(engine) = engine.upgrade() {
+                engine.emit(Event::DEVICES);
+            }
+        })
     }
 
     /// Tells watching apps that `what` may have changed. Nobody watching isn't an error.
@@ -270,11 +295,11 @@ impl Engine {
     fn finished(self: &Arc<Self>, peer: EndpointKey, id: u64, result: Result<Outcome, SyncError>) {
         let name = self.name(&peer);
         let mut state = self.state.lock().expect("poisoned");
-        if state
+        let removed = state
             .sessions
             .get(&peer)
-            .is_some_and(|running| running.id == id)
-        {
+            .is_some_and(|running| running.id == id);
+        if removed {
             state.sessions.remove(&peer);
         }
         match result {
@@ -302,7 +327,14 @@ impl Engine {
             }
             // Both devices connected at once and the other kept its own connection, which carries
             // the session (sync.md, who connects).
-            Err(SyncError::Duplicate) => debug!("{name} already has a session with this device"),
+            Err(SyncError::Duplicate) => {
+                debug!("{name} already has a session with this device");
+                // Apps heard this session start, so they hear it end. The connection the peer
+                // opened carries the session from here, under its own entry.
+                if removed {
+                    self.emit(Event::DEVICES);
+                }
+            }
             Err(error) => {
                 let delay = *state.retries.get(&peer).unwrap_or(&FIRST_RETRY);
                 state.retries.insert(peer, (delay * 2).min(LAST_RETRY));

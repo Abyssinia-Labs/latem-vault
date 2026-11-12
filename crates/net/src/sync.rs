@@ -263,13 +263,18 @@ impl<S: SyncStore> Session<S> {
                     if quiet_at.replace(Instant::now() + QUIET).is_none() {
                         quiet(false);
                     }
-                    self.handle(kind, &body).await?;
+                    if let Err(error) = self.handle(kind, &body).await {
+                        return Err(peer_reason(&mut reading, error).await);
+                    }
                 }
                 Some(notice) = notices.recv() => {
-                    if self.notice(notice).await?
-                        && quiet_at.replace(Instant::now() + QUIET).is_none()
-                    {
-                        quiet(false);
+                    match self.notice(notice).await {
+                        Ok(sent) => {
+                            if sent && quiet_at.replace(Instant::now() + QUIET).is_none() {
+                                quiet(false);
+                            }
+                        }
+                        Err(error) => return Err(peer_reason(&mut reading, error).await),
                     }
                 }
                 () = sleep_until(quiet_at.unwrap_or(deadline)), if quiet_at.is_some() => {
@@ -741,6 +746,25 @@ fn parse_reconcile(body: &[u8]) -> Result<(SetId, Vec<Range>), FrameError> {
 }
 
 /// Reads the next message and hands the stream back for the one after.
+/// How long a session whose write failed waits for the peer's reason, if it sent one.
+const REASON_WAIT: Duration = Duration::from_secs(2);
+
+/// A write that fails because the peer stopped reading may race the error message the peer sent
+/// just before: both devices can end a session at once, as when both learn of a revocation. The
+/// read already in flight gets that message if it's coming, and its reason is the session's.
+async fn peer_reason<F>(reading: &mut F, error: SyncError) -> SyncError
+where
+    F: Future<Output = (RecvStream, Result<(u8, Vec<u8>), FrameError>)> + Unpin,
+{
+    if matches!(error, SyncError::Frame(FrameError::Connection(_)))
+        && let Ok((_, Err(FrameError::Peer { reason, .. }))) =
+            tokio::time::timeout(REASON_WAIT, reading).await
+    {
+        return SyncError::Refused(reason);
+    }
+    error
+}
+
 pub(crate) async fn next_message(
     mut recv: RecvStream,
 ) -> (RecvStream, Result<(u8, Vec<u8>), FrameError>) {

@@ -860,6 +860,102 @@ fn files_are_imported_read_and_run_with() {
     assert!(device.ok(&["placement", "latem"]).contains("on demand"));
 }
 
+/// `open` writes a copy and opens it in its app, saves each change once it has settled, writes
+/// a change that hasn't when it ends, and deletes the copy (files.md, open). A stand-in for
+/// `open` (`xdg-open` on Linux) says which path it was given.
+#[cfg(unix)]
+#[test]
+fn open_saves_each_change_and_deletes_the_copy() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let device = Device::new();
+    device.set("latem/prod/REGION", "--var", b"eu west");
+    let dir = release_folder(&device);
+    device.ok(&[
+        "import",
+        dir.to_str().unwrap(),
+        "--collection",
+        "latem",
+        "--into",
+        "prod",
+        "--disk-not-encrypted",
+    ]);
+    assert!(
+        device
+            .fails(&["open", "latem/prod/REGION"])
+            .contains("open opens files")
+    );
+
+    let bin = device.home.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let opened = device.home.path().join("opened");
+    for name in ["open", "xdg-open"] {
+        let script = bin.join(name);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", opened.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut open = Child(
+        device
+            .command(&["open", "latem/prod/upload.jks"])
+            .env("PATH", path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let started = Instant::now();
+    let copy = loop {
+        if let Ok(path) = std::fs::read_to_string(&opened)
+            && !path.is_empty()
+        {
+            break std::path::PathBuf::from(path);
+        }
+        assert!(started.elapsed() < Duration::from_secs(20), "never opened");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(copy.file_name().unwrap(), "upload.jks");
+    assert_eq!(std::fs::read(&copy).unwrap(), vec![7u8; 3000]);
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&copy), 0o600);
+    assert_eq!(mode(copy.parent().unwrap()), 0o700);
+
+    // A save that changes nothing but the time writes no version.
+    std::fs::File::options()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    // A save becomes a new version once the copy has been unchanged for 2 seconds.
+    std::fs::write(&copy, b"edited once").unwrap();
+    eventually(&device, &["get", "latem/prod/upload.jks"], "edited once");
+    // One saved just before Enter is written too, and then the copy goes.
+    std::fs::write(&copy, b"edited twice").unwrap();
+    open.0.stdin.take().unwrap().write_all(b"\n").unwrap();
+    let mut stdout = String::new();
+    open.0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert!(open.0.wait().unwrap().success(), "{stdout}");
+    assert_eq!(stdout.matches("Saved a new version").count(), 2, "{stdout}");
+    assert!(stdout.ends_with("Deleted the copy.\n"), "{stdout}");
+    assert!(!copy.parent().unwrap().exists());
+    let output = device.run(&["get", "latem/prod/upload.jks"]);
+    assert_eq!(output.stdout, b"edited twice");
+}
+
 #[cfg(unix)]
 #[test]
 fn files_go_through_the_service() {

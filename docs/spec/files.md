@@ -1,6 +1,6 @@
 # Files spec, v1
 
-Status: stage 1 built in 0.4.0, 2026-11-11: files on one device, with the manifest, chunks, the local store, `import`, `get`, `list`, `run` and `placement`. Stage 2 built in 0.5.0, 2026-11-12: chunk sync over `openvault/chunks/1`, fetching, and the on-demand cache's limit. `open` is still proposed. Builds on [records.md](records.md), [crypto.md](crypto.md) and [sync.md](sync.md). The design is in [design §13](../design.md#13-files), and it settles [§19, decision 3](../design.md#19-open-decisions).
+Status: stage 1 built in 0.4.0, 2026-11-11: files on one device, with the manifest, chunks, the local store, `import`, `get`, `list`, `run` and `placement`. Stage 2 built in 0.5.0, 2026-11-12: chunk sync over `openvault/chunks/1`, fetching, and the on-demand cache's limit. Stage 3 built in 0.5.1, 2026-11-12: `open`. Builds on [records.md](records.md), [crypto.md](crypto.md) and [sync.md](sync.md). The design is in [design §13](../design.md#13-files), and it settles [§19, decision 3](../design.md#19-open-decisions).
 
 A file is an entry like a secret: a name in a collection, with versions, written by devices with `write` and read by devices with `read`. Its record holds a manifest. A small file's bytes are in the manifest; a larger file's are in sealed chunks, which live outside the database and travel between devices only when a device needs them.
 
@@ -110,7 +110,7 @@ Each request is one bidirectional stream, with sync.md's framing. The asker send
 ```
 openvault import <path> --collection <c> [--into <folder>] [--disk-not-encrypted]   a file, or a folder's files
 openvault get <collection>/<name> [-o <path>]                  a file to stdout, or to a path
-openvault open <collection>/<name>                             open a copy; each save writes a new version (stage 3)
+openvault open <collection>/<name>                             open a copy; each save writes a new version
 openvault run --collection <c> --env <folder> -- <command>     the folder's files as temporary paths too
 openvault placement <collection> [keep|on-demand]
 openvault list <collection>[/<folder>]                         files show their size, and whether they're here
@@ -127,9 +127,10 @@ openvault list <collection>[/<folder>]                         files show their 
 **get** writes a file's bytes to stdout, or to `-o <path>` with mode 0600 (0700 if it's executable) and its `mtime`. The path is written through a private file beside it, renamed into place once whole. `-o` also writes a secret's or variable's value; without it they print as before.
 
 **open**
-- It writes the file to a private directory (0700) in the user's temporary directory, under the file's own name, and opens it with its default app (`open` on macOS, `xdg-open` on Linux).
-- It stays in the foreground. Each time the copy is saved, it writes a new version, once the file has been unchanged for 2 seconds.
-- It ends on Enter or Ctrl-C, and then deletes the copy and its directory. There is no general way to see an app close a document, so it says so when it starts.
+- It fetches the file's chunks if any aren't here, as `get` does. It then writes the file to a private directory (0700) in the user's temporary directory, under the file's own name, and opens it with its default app (`open` on macOS, `xdg-open` on Linux). If that fails, it says where the copy is.
+- It stays in the foreground. Each time the copy is saved, it writes a new version, once the file has been unchanged for 2 seconds, so an app that saves in several steps makes one version. A save is noticed by the copy's length, modification and change times, and inode, looked at every half second. A save whose contents are the same as the last version's, as when only the time changed, writes nothing.
+- On a device that can read the collection but not write to it, the copy is read-only (0400), so its app shows it can't be changed, and nothing is saved.
+- It ends on Enter or Ctrl-C (or SIGTERM or SIGHUP). A save that hasn't become a version yet is written first, then the copy and its directory are deleted. If that write fails, the copy stays, and it says where. There is no general way to see an app close a document, so it says so when it starts.
 
 **run** also writes the folder's files to a private temporary directory (0700) for the command's lifetime, keeping their paths within the folder. Each file's path is set in a variable named after the last part of its name, upper-cased with every character but A–Z and 0–9 turned into `_`: `prod/upload.jks` becomes `UPLOAD_JKS` (with `--prefix`, `LATEM_SECRET_UPLOAD_JKS`). A name that would start with a digit is an error, and so are a file and a secret or variable, or two files, that would set the same variable.
 - Without files, `run` replaces itself with the command, as before. With files it starts the command and waits, so it can delete the directory when the command exits. It passes SIGTERM and SIGHUP on to the command, and waits out Ctrl-C, which the terminal sends the command too. It exits as the command did, or with 128 plus the signal's number.
@@ -156,6 +157,7 @@ openvault list <collection>[/<folder>]                         files show their 
 | A session that catches up | A flag and a map. If a received record named chunks that aren't here, one query per kept collection for the files missing chunks, and one record opened for each. |
 | Fetching on demand | After it, the sizes of the on-demand collections' chunks added up, from their rows: at most about 2 000 rows at the limit. |
 | Listing a collection | Its index rows, as before. With files, one more query counts the chunks that aren't here, over the collection's `file_chunks` rows. |
+| `open` | While it runs, one `stat` of the copy every half second. A save seals the file again: unchanged chunks have the same ids, so only the changed ones are stored and sent. |
 | Idle | Nothing. No sweep or fetch runs on a timer. |
 
 **What to watch once it runs:**

@@ -6,7 +6,7 @@ This repository holds the open-source core: the Rust service and CLI, the coordi
 
 ## Status
 
-Milestones M1, one device, and M2, devices on the same network, are done: devices join with a 6-digit code, sync directly over iroh, and can be revoked, and latem reads its builds' secrets from OpenVault. M3, reaching devices from outside the network, has its first stage built and paused: it is behind the cargo feature `coordinator`, off by default, so devices find each other on the local network only. M4, files, has its first two stages built: files are kept encrypted in chunks, imported, read and passed to commands, and their chunks reach the other devices that read the collection; `open` comes next. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
+Milestones M1, one device, and M2, devices on the same network, are done: devices join with a 6-digit code, sync directly over iroh, and can be revoked, and latem reads its builds' secrets from OpenVault. M3, reaching devices from outside the network, has its first stage built and paused: it is behind the cargo feature `coordinator`, off by default, so devices find each other on the local network only. M4, files, has its first three stages built: files are kept encrypted in chunks, imported, read, opened in their apps and passed to commands, and their chunks reach the other devices that read the collection; the Mac app's files come next. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
 
 ## Try it
 
@@ -74,6 +74,7 @@ Files, such as a signing keystore or a folder of documents, are imported as file
 openvault import ~/release --collection latem --into prod   # needs FileVault, or dm-crypt on Linux
 openvault list latem/prod                                    # files show their size
 openvault get latem/prod/upload.jks -o upload.jks           # readable only by you
+openvault open latem/prod/notes.md                          # in its app; each save is a new version
 openvault run --collection latem --env prod -- ./gradlew bundleRelease   # UPLOAD_JKS is the keystore's path
 ```
 

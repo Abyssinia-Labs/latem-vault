@@ -85,6 +85,12 @@ enum Command {
         #[arg(short, long, value_name = "PATH")]
         output: Option<PathBuf>,
     },
+    /// Open a copy of a file in its app. Each save becomes a new version; Enter here ends it and
+    /// deletes the copy.
+    Open {
+        /// `<collection>/<name>`
+        entry: String,
+    },
     /// List the names in a collection, or in one folder of it, with files' sizes. Values aren't
     /// shown.
     List {
@@ -398,6 +404,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             )?;
         }
         Command::Get { entry, output } => get(&home, &entry, output.as_deref())?,
+        Command::Open { entry } => open(&home, &entry)?,
         Command::List { path } => list(&home, &path)?,
         Command::Delete { entry } => delete(&home, &entry)?,
         Command::Run {
@@ -1122,6 +1129,25 @@ fn set(home: &Home, entry: &str, kind: Kind) -> Result<()> {
             value,
         }],
     )
+}
+
+fn open(home: &Home, entry: &str) -> Result<()> {
+    let (collection, name) = split_entry(entry)?;
+    let mut access = home.access()?;
+    let entry = access
+        .get(collection, name)?
+        .ok_or_else(|| anyhow!("{collection}/{name} doesn't exist"))?;
+    if entry.kind != Kind::File {
+        bail!(
+            "{collection}/{name} is a {}; open opens files. `openvault get` shows it",
+            kind_label(entry.kind)
+        );
+    }
+    let manifest = Manifest::decode(&entry.value)?;
+    #[cfg(unix)]
+    return files::open(&mut access, collection, name, &manifest);
+    #[cfg(not(unix))]
+    bail!("open needs macOS or Linux")
 }
 
 fn get(home: &Home, entry: &str, output: Option<&Path>) -> Result<()> {

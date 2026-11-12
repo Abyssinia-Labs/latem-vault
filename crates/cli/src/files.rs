@@ -1,6 +1,6 @@
-//! Files (files.md, commands): `import`, `get` for a file, `run` with a folder's files, and
-//! `placement`. This process reads and writes the user's files itself; only chunks cross to the
-//! service, one to a message.
+//! Files (files.md, commands): `import`, `get` for a file, `open`, `run` with a folder's files,
+//! and `placement`. This process reads and writes the user's files itself; only chunks cross to
+//! the service, one to a message.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use openvault_core::file::{CHUNK_SIZE, ChunkId, Content, MAX_INLINE, MAX_SIZE, Manifest};
+use openvault_core::membership::Scope;
 use openvault_core::names::{self, is_env_name};
 use openvault_core::{Kind, Placement};
 use openvault_service::api::{ChunkData, Item, Request, Response};
@@ -22,6 +23,11 @@ use crate::{Access, Home, size_label};
 
 /// Files' manifests go to the service in batches of at most this many bytes.
 const BATCH_BYTES: usize = 4 << 20;
+/// How long `open`'s copy stays unchanged after a save before it becomes a new version, so an
+/// app that writes a file in several steps saves one version (files.md, open).
+const SETTLE: Duration = Duration::from_secs(2);
+/// How often `open` looks at its copy for a save: one `stat` each time, nothing more.
+const LOOK: Duration = Duration::from_millis(500);
 
 impl Access {
     fn write_chunk(&mut self, collection: &str, data: &[u8]) -> Result<(ChunkId, u32)> {
@@ -70,6 +76,28 @@ impl Access {
             "{missing} {chunks} of {collection}/{name} aren't on this device; start the service \
              (`openvault service`) to fetch them from your other devices"
         )
+    }
+
+    /// Whether this device may write to `collection`. A vault from before the membership log
+    /// lists nobody's scopes, and its one device writes.
+    fn can_write(&mut self, collection: &str) -> Result<bool> {
+        let device = match self.call(Request::Vault)? {
+            Response::Vault(info) => info.device,
+            other => return Err(unexpected(&other)),
+        };
+        let summaries = match self.call(Request::CollectionSummaries)? {
+            Response::CollectionSummaries(summaries) => summaries,
+            other => return Err(unexpected(&other)),
+        };
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.name == collection)
+            .ok_or_else(|| anyhow!("no collection {collection}"))?;
+        Ok(summary.devices.is_empty()
+            || summary
+                .devices
+                .iter()
+                .any(|&(id, scope)| id == device && scope == Scope::Write))
     }
 
     fn placement(&mut self, collection: &str, set: Option<Placement>) -> Result<Placement> {
@@ -454,7 +482,7 @@ pub fn run_with_files(
     taken: &HashSet<String>,
     mut child: process::Command,
 ) -> Result<ExitCode> {
-    let dir = PrivateDir::create()?;
+    let dir = PrivateDir::create("run")?;
     let mut set: HashMap<String, &str> = HashMap::new();
     for item in files {
         let value = access
@@ -502,6 +530,188 @@ pub fn run_with_files(
     Ok(status)
 }
 
+/// `open` (files.md, open): a copy of the file in a private directory, under its own name, opened
+/// in its app. Each save becomes a new version once the copy has been unchanged for [`SETTLE`].
+/// Enter or Ctrl-C ends it; a save that hasn't become a version yet is written first, and then
+/// the copy is deleted. If that write fails, the copy stays, and this says where.
+#[cfg(unix)]
+pub fn open(access: &mut Access, collection: &str, name: &str, manifest: &Manifest) -> Result<()> {
+    use std::io::BufRead;
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let entry = format!("{collection}/{name}");
+    if matches!(manifest.content, Content::Chunks { .. }) {
+        access.fetch(collection, name)?;
+    }
+    let writable = access.can_write(collection)?;
+    let dir = PrivateDir::create("open")?;
+    let file_name = name.rsplit('/').next().expect("split gives one part");
+    let path = dir.0.join(file_name);
+    write_out(&path, manifest.executable, manifest.mtime, |file| {
+        write_contents(access, collection, manifest, file)
+            .with_context(|| format!("can't read {entry}"))
+    })?;
+    if !writable {
+        // So its app shows it can't be changed.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if manifest.executable { 0o500 } else { 0o400 };
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+    }
+    match launch(&path) {
+        Ok(()) => println!(
+            "Opened {entry} in its app, from a copy at {}",
+            path.display()
+        ),
+        Err(e) => println!(
+            "Can't open {entry} in its app ({e}). Open the copy yourself: {}",
+            path.display()
+        ),
+    }
+    if writable {
+        println!(
+            "Each save becomes a new version of {entry} once the copy has been unchanged for 2 \
+             seconds."
+        );
+    } else {
+        println!(
+            "This device can read {collection} but not write to it, so the copy is read-only and \
+             nothing is saved."
+        );
+    }
+    println!(
+        "Press Enter here when you're done, and the copy is deleted. Closing the app doesn't end \
+         this: there's no general way to tell when an app is done with a file."
+    );
+
+    // Enter, read on a thread of its own: a read left waiting on stdin would hold up a runtime's
+    // shutdown. At the end of stdin, only a signal ends it.
+    let (enter, mut entered) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if line.is_err() || enter.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    let mut last = manifest.clone();
+    let mut save = |path: &Path| -> Result<()> {
+        let saved = seal_file(access, collection, path)?;
+        if saved.content == last.content && saved.executable == last.executable {
+            return Ok(());
+        }
+        let value = saved.encode();
+        access.set(
+            collection,
+            vec![Item {
+                name: name.to_owned(),
+                kind: Kind::File,
+                value,
+            }],
+        )?;
+        println!(
+            "Saved a new version of {entry}, {}.",
+            size_label(saved.size)
+        );
+        last = saved;
+        Ok(())
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let unsaved: Option<anyhow::Error> = runtime.block_on(async {
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        let mut look = tokio::time::interval(LOOK);
+        look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // What the copy looks like now, since when, and when it last became a version.
+        let mut seen = signature(&path);
+        let mut since = tokio::time::Instant::now();
+        let mut saved = seen;
+        let mut failed: Option<anyhow::Error> = None;
+        loop {
+            tokio::select! {
+                Some(()) = entered.recv() => break,
+                _ = interrupt.recv() => break,
+                _ = terminate.recv() => break,
+                _ = hangup.recv() => break,
+                _ = look.tick() => {
+                    let now = signature(&path);
+                    if now != seen {
+                        seen = now;
+                        since = tokio::time::Instant::now();
+                    } else if writable && seen.is_some() && seen != saved && since.elapsed() >= SETTLE {
+                        saved = seen;
+                        failed = save(&path).err();
+                        if let Some(e) = &failed {
+                            eprintln!("openvault: can't save {entry}: {e:#}");
+                        }
+                    }
+                }
+            }
+        }
+        // A save that hasn't settled yet still counts.
+        let now = signature(&path);
+        if writable && now.is_some() && now != saved {
+            failed = save(&path).err();
+        }
+        anyhow::Ok(failed)
+    })?;
+    // The runtime's only tasks are done; the stdin thread goes with the process.
+    drop(runtime);
+    if let Some(error) = unsaved {
+        let kept = dir.keep();
+        bail!(
+            "can't save the last changes to {entry}: {error:#}. The copy is still at {}; delete \
+             it once they're somewhere safe",
+            kept.join(file_name).display()
+        );
+    }
+    drop(dir);
+    println!("Deleted the copy.");
+    Ok(())
+}
+
+/// What a save changes: the file's length, modification time, change time and inode, which a
+/// save that replaces the file changes too. `None` while it isn't there, as in the middle of
+/// some apps' saves.
+#[cfg(unix)]
+fn signature(path: &Path) -> Option<(u64, i64, i64, i64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).ok()?;
+    Some((
+        metadata.len(),
+        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+        metadata.ino(),
+    ))
+}
+
+/// Opens `path` in its default app: `open` on macOS, which returns once the app has it, or
+/// `xdg-open` elsewhere, which may stay with it, so it isn't waited for.
+#[cfg(unix)]
+fn launch(path: &Path) -> Result<()> {
+    let mut command = process::Command::new(if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    });
+    command
+        .arg(path)
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null());
+    if cfg!(target_os = "macos") {
+        let status = command.status().context("can't run open")?;
+        if !status.success() {
+            bail!("open found no app for it");
+        }
+    } else {
+        command.spawn().context("can't run xdg-open")?;
+    }
+    Ok(())
+}
+
 /// `UPLOAD_JKS` for `upload.jks`: upper case, with everything but A–Z and 0–9 turned into `_`.
 pub fn file_var(name: &str) -> String {
     name.chars()
@@ -520,9 +730,10 @@ pub fn file_var(name: &str) -> String {
 struct PrivateDir(PathBuf);
 
 impl PrivateDir {
-    fn create() -> Result<Self> {
+    /// `openvault-<purpose>-<random>` in the user's temporary directory.
+    fn create(purpose: &str) -> Result<Self> {
         let name = format!(
-            "openvault-run-{}",
+            "openvault-{purpose}-{}",
             hex(&openvault_crypto::random_bytes::<8>()[..])
         );
         let path = std::env::temp_dir().join(name);
@@ -533,6 +744,16 @@ impl PrivateDir {
             .create(&path)
             .with_context(|| format!("can't make {}", path.display()))?;
         Ok(Self(path))
+    }
+}
+
+impl PrivateDir {
+    /// Leaves it in place, for what couldn't be saved.
+    #[cfg(unix)]
+    fn keep(self) -> PathBuf {
+        let path = self.0.clone();
+        std::mem::forget(self);
+        path
     }
 }
 

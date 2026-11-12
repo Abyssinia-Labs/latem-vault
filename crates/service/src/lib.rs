@@ -11,6 +11,8 @@ pub mod client;
 mod coordinator;
 #[cfg(unix)]
 mod engine;
+#[cfg(unix)]
+mod fetch;
 pub mod handler;
 #[cfg(unix)]
 mod server;

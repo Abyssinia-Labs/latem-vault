@@ -425,12 +425,12 @@ impl<K: DeviceKeys> Vault<K> {
             ],
         )? > 0;
         if current {
-            self.set_file_chunks(
-                tx,
-                collection,
-                &tag,
-                &named_chunks(body.kind, header.deleted, &body.value),
-            )?;
+            let chunks = named_chunks(body.kind, header.deleted, &body.value);
+            self.set_file_chunks(tx, collection, &tag, &chunks)?;
+            if !chunks.is_empty() {
+                self.arrived
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         if body.kind != Kind::Collection {
             return Ok(());

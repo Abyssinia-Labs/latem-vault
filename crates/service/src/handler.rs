@@ -183,6 +183,21 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
             }
             Response::Placement(vault.placement(id)?)
         }
+        // Only the service has the endpoint to fetch with, so here they're only counted.
+        Request::Fetch { collection, name } => {
+            let id = vault.collection(&collection)?;
+            let entry = vault
+                .get(id, &name)?
+                .filter(|entry| entry.kind == Kind::File)
+                .ok_or_else(|| anyhow!("no file {collection}/{name}"))?;
+            let missing = match openvault_core::file::Manifest::decode(&entry.value)?.content {
+                openvault_core::file::Content::Inline(_) => 0,
+                openvault_core::file::Content::Chunks { ids, .. } => {
+                    vault.chunks_not_held(&ids)?.len() as u64
+                }
+            };
+            Response::Fetched { missing }
+        }
         Request::Folder { collection, folder } => {
             let id = vault.collection(&collection)?;
             Response::Entries(

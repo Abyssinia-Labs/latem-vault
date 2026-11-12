@@ -4,7 +4,7 @@ mod files;
 mod revoke;
 mod sync;
 
-pub use files::{CHUNK_RETENTION_SECS, Placement, SWEEP_BATCH, Swept, WrittenChunk};
+pub use files::{CACHE_LIMIT, CHUNK_RETENTION_SECS, Placement, SWEEP_BATCH, Swept, WrittenChunk};
 pub use revoke::{Review, Revocation, ScopeChange, Written};
 pub use sync::Received;
 
@@ -223,6 +223,9 @@ pub struct Vault<K: DeviceKeys> {
     chunks: PathBuf,
     /// Whether chunks became unreferenced since the last finished sweep.
     dropped: AtomicBool,
+    /// Whether a received record made a file that names chunks current, since
+    /// [`take_files_arrived`](Self::take_files_arrived).
+    arrived: AtomicBool,
 }
 
 impl<K: DeviceKeys> Vault<K> {
@@ -324,6 +327,7 @@ impl<K: DeviceKeys> Vault<K> {
             data_version,
             chunks: path.with_file_name("chunks"),
             dropped: AtomicBool::new(false),
+            arrived: AtomicBool::new(false),
         })
     }
 
@@ -1993,7 +1997,7 @@ mod tests {
     /// store (README, versions). Change both together.
     #[test]
     fn the_build_version_follows_the_store_version() {
-        assert_eq!((env!("CARGO_PKG_VERSION_MINOR"), SCHEMA_VERSION), ("4", 7));
+        assert_eq!((env!("CARGO_PKG_VERSION_MINOR"), SCHEMA_VERSION), ("5", 7));
     }
 
     #[test]
@@ -3447,6 +3451,122 @@ mod tests {
             joined.write_chunk(latem, b"x"),
             Err(Error::ReadOnly)
         ));
+    }
+
+    /// A device takes in the chunks a peer sends for its current files, and only those
+    /// (files.md, sync).
+    #[test]
+    fn chunks_from_a_peer_are_checked_and_kept() {
+        let s = setup();
+        let joiner_keys = SoftwareKeys::generate();
+        let (mut admin, mut joined, latem, _) = joined_pair(&s, &joiner_keys);
+        let pieces = pieces(&[1, 2], 10);
+        let pieces: Vec<&[u8]> = pieces.iter().map(Vec::as_slice).collect();
+        let manifest = write_file(&mut admin, latem, "release/app.aab", &pieces);
+        let crate::file::Content::Chunks { epoch, ids } = &manifest.content else {
+            panic!("a file of two pieces is in chunks");
+        };
+        let (epoch, first, second) = (*epoch, ids[0], ids[1]);
+        assert!(!joined.take_files_arrived());
+        send_missing(&admin, &mut joined);
+        assert!(
+            joined.take_files_arrived(),
+            "a file that names chunks arrived"
+        );
+        assert!(!joined.take_files_arrived(), "and that's said once");
+        assert_eq!(
+            joined.chunks_not_held(&[first, second, first]).unwrap(),
+            [first, second]
+        );
+
+        let sealed = admin.sealed_chunk(latem, &first).unwrap().unwrap();
+        assert!(
+            admin
+                .sealed_chunk(CollectionId::random(), &first)
+                .unwrap()
+                .is_none(),
+            "only for its own collection"
+        );
+        let mut bad = sealed.clone();
+        bad[30] ^= 1;
+        assert!(joined.receive_chunk(latem, epoch, &first, &bad).is_err());
+        let loose = admin.write_chunk(latem, b"loose").unwrap();
+        let loose_sealed = admin.sealed_chunk(latem, &loose.id).unwrap().unwrap();
+        assert!(matches!(
+            joined.receive_chunk(latem, epoch, &loose.id, &loose_sealed),
+            Err(Error::ChunkUnwanted)
+        ));
+        assert!(joined.receive_chunk(latem, epoch, &first, &sealed).unwrap());
+        assert!(
+            !joined.receive_chunk(latem, epoch, &first, &sealed).unwrap(),
+            "kept once"
+        );
+        assert_eq!(joined.chunks_not_held(ids).unwrap(), [second]);
+        assert_eq!(
+            joined.missing_chunks(latem).unwrap(),
+            HashMap::from([("release/app.aab".to_owned(), 1)])
+        );
+        let sealed = admin.sealed_chunk(latem, &second).unwrap().unwrap();
+        assert!(
+            joined
+                .receive_chunk(latem, epoch, &second, &sealed)
+                .unwrap()
+        );
+        assert!(joined.missing_chunks(latem).unwrap().is_empty());
+        assert_eq!(
+            &joined.read_chunk(latem, epoch, &second).unwrap()[..],
+            pieces[1]
+        );
+        assert!(
+            unreferenced(&joined).is_empty(),
+            "a current file names them"
+        );
+    }
+
+    /// Chunks of on-demand collections over the limit go least recently used first, sparing
+    /// the file being read; kept collections' chunks don't count (files.md, placement).
+    #[test]
+    fn the_on_demand_cache_drops_what_was_used_least_lately() {
+        let s = setup();
+        let mut vault = s.create();
+        let docs = vault.create_collection("docs", &s.admin()).unwrap();
+        let latem = vault.create_collection("latem", &s.admin()).unwrap();
+        let a = write_file(&mut vault, docs, "a.pdf", &[b"aaaa"]);
+        let b = write_file(&mut vault, docs, "b.pdf", &[b"bbbb"]);
+        let c = write_file(&mut vault, docs, "c.pdf", &[b"cccc"]);
+        let kept = write_file(&mut vault, latem, "kept.jks", &[b"kkkk"]);
+        assert_eq!(
+            vault.trim_cache_to(0, &[]).unwrap(),
+            0,
+            "nothing is on demand"
+        );
+
+        vault.set_placement(docs, Placement::OnDemand).unwrap();
+        for (manifest, used) in [(&a, 100), (&b, 200), (&c, 300)] {
+            vault
+                .conn
+                .execute(
+                    "UPDATE chunks SET used = ?2 WHERE chunk_id = ?1",
+                    params![&manifest.chunks()[0][..], used],
+                )
+                .unwrap();
+        }
+        // Each sealed chunk is 4 bytes, a nonce and a tag: room for two. `a` was used least
+        // lately, but it's being read.
+        let size = 4 + 24 + 16;
+        assert_eq!(vault.trim_cache_to(2 * size, a.chunks()).unwrap(), 1);
+        assert_eq!(vault.chunks_not_held(b.chunks()).unwrap(), b.chunks());
+        assert!(!vault.chunk_path(&b.chunks()[0]).exists());
+        for held in [&a, &c, &kept] {
+            assert!(vault.chunks_not_held(held.chunks()).unwrap().is_empty());
+        }
+        assert_eq!(
+            vault.missing_chunks(docs).unwrap(),
+            HashMap::from([("b.pdf".to_owned(), 1)])
+        );
+        assert_eq!(vault.trim_cache_to(2 * size, &[]).unwrap(), 0, "within it");
+        assert_eq!(vault.trim_cache_to(size, &[]).unwrap(), 1);
+        assert_eq!(vault.chunks_not_held(a.chunks()).unwrap(), a.chunks());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Files spec, v1
 
-Status: stage 1 built in 0.4.0, 2026-11-11: files on one device, with the manifest, chunks, the local store, `import`, `get`, `list`, `run` and `placement`. Chunk sync, fetching, the cache limit and `open` are still proposed. Builds on [records.md](records.md), [crypto.md](crypto.md) and [sync.md](sync.md). The design is in [design §13](../design.md#13-files), and it settles [§19, decision 3](../design.md#19-open-decisions).
+Status: stage 1 built in 0.4.0, 2026-11-11: files on one device, with the manifest, chunks, the local store, `import`, `get`, `list`, `run` and `placement`. Stage 2 built in 0.5.0, 2026-11-12: chunk sync over `openvault/chunks/1`, fetching, and the on-demand cache's limit. `open` is still proposed. Builds on [records.md](records.md), [crypto.md](crypto.md) and [sync.md](sync.md). The design is in [design §13](../design.md#13-files), and it settles [§19, decision 3](../design.md#19-open-decisions).
 
 A file is an entry like a secret: a name in a collection, with versions, written by devices with `write` and read by devices with `read`. Its record holds a manifest. A small file's bytes are in the manifest; a larger file's are in sealed chunks, which live outside the database and travel between devices only when a device needs them.
 
@@ -71,6 +71,8 @@ chunk id     BLAKE3.derive_key("openvault v1 chunk id", sealed)
 | keep | every chunk of every current version | Macs and Linux |
 | on demand | chunks of files read lately, up to 2 GiB per vault, least recently used dropped first | the iPhone (M5) |
 
+**The cache limit.** After a fetch stores chunks, the device adds up the chunks it holds for its on-demand collections. While they take more than 2 GiB, it deletes the least recently used, by the day they were last read, sparing the file just fetched. They go at once rather than after 30 days, since a current file names them and they can be fetched again. A device with no on-demand collection reads nothing for this.
+
 **Dropping chunks.**
 - A chunk that no current version references stops counting when that happens: on a write, a received record or a recount (records.md, versions). One named again before it's deleted counts again.
 - It's deleted 30 days later. Until then an older version can still be read from this device, and a file deleted by mistake can be put back.
@@ -84,7 +86,7 @@ Chunks aren't in any reconciled set. A device that can read a collection finds t
 
 **Protocol.** Chunks have their own ALPN, `openvault/chunks/1`, on the same iroh endpoint. `openvault/sync/1` doesn't change, so devices on 0.3 keep syncing records and grants with newer ones. A peer that doesn't accept the ALPN has no chunks to give.
 
-Each request is one bidirectional stream, with sync.md's framing:
+Each request is one bidirectional stream, with sync.md's framing. The asker sends hello and one want; the answer is the chunks, then one missing message, which ends it, empty if nothing is missing.
 
 | Type | Message | Body |
 | --- | --- | --- |
@@ -94,12 +96,12 @@ Each request is one bidirectional stream, with sync.md's framing:
 | `0x04` | missing | collection id (16) ‖ count (u16) ‖ ids |
 | `0x7f` | error | as sync.md |
 
-- **Answering.** The answering device first checks, as for sync, that the asker is a member that isn't revoked. It then answers a want with each chunk it holds, one message each, and one missing message for the rest. It answers only for collections where both devices have read or write. It never fetches a chunk for another device.
+- **Answering.** The answering device first checks, as for sync, that the asker is a member that isn't revoked; otherwise it ends the stream with "wrong vault" or "not a member". It then answers a want with each chunk it holds, one message each, and one missing message for the rest. It answers only for collections where both devices have read or write: for any other, every chunk is missing. It never fetches a chunk for another device.
 - **Asking.**
-  - With keep placement, a manifest that becomes current from sync has its missing chunks asked for at once.
+  - With keep placement, a manifest that becomes current from sync has its missing chunks asked for at once: when the session that brought it goes quiet (sync.md, quiet), or ends. A collection set to keep through the service gets its missing chunks then too.
   - `get`, `open` and `run` ask for the chunks of the file they read, whatever the placement.
-  - A device asks the visible peers that share the collection, one after another: those on the local network first, then those through a relay.
-- **Missing chunks.** A chunk no visible peer holds leaves its file waiting. The device asks again when a peer that shares the collection syncs records with it, and backs off as sync.md's retries do, from 30 seconds doubling to an hour. Nothing asks on a timer alone.
+  - A device asks the peers that read the collection, one after another, until none are missing: those on the local network first, then, with a coordinator configured, the others through its relay. Connecting to one may take 15 seconds before the next is asked.
+- **Missing chunks.** A chunk no peer that was asked holds leaves its file waiting. For a kept collection, the device asks again when a session with any peer goes quiet or ends, backing off as sync.md's retries do: at the earliest 30 seconds later, doubling to an hour. Nothing asks on a timer alone. A file read on demand is asked for again when it's next read.
 - **Bad chunks.** A chunk whose id doesn't match is dropped, and the stream ends with "bad message".
 - **Connections.** A connection lasts while chunks are being asked for, and closes after 60 seconds without a message, as sync's do.
 
@@ -133,14 +135,14 @@ openvault list <collection>[/<folder>]                         files show their 
 - Without files, `run` replaces itself with the command, as before. With files it starts the command and waits, so it can delete the directory when the command exits. It passes SIGTERM and SIGHUP on to the command, and waits out Ctrl-C, which the terminal sends the command too. It exits as the command did, or with 128 plus the signal's number.
 - A `run` killed with SIGKILL leaves the directory in the user's temporary directory.
 
-**placement** shows or sets this device's placement for a collection. Switching to on demand doesn't delete anything at once; the cache's limit does that over time (stage 2). Only a placement other than the device's default is stored.
+**placement** shows or sets this device's placement for a collection. Switching to on demand doesn't delete anything at once; the cache's limit does that over time. Switching to keep through the service fetches what's missing at once. Only a placement other than the device's default is stored.
 
 ## The service
 
 - Files cross the local socket one chunk to a message, in both directions, so neither process holds more than a chunk (service.md, files). The CLI reads and writes the user's files itself. On macOS that matters: a LaunchAgent reading `~/Documents` would need its own permission.
 - Without a service, the CLI runs the same requests on the vault itself.
-- Stage 2: the service holds the endpoint, so it fetches chunks. A new local API request asks for a file's chunks: the service fetches the missing ones and answers once they're all here, or with how many no peer had.
-- Stage 2: the watch's entries event also says when a file's chunks have all arrived, so an app can show a file as here.
+- The service holds the endpoint, so it fetches chunks. The fetch request (service.md, files) asks for a file's chunks: the service fetches the missing ones and answers once they're all here, or with how many no peer had. `get` and `run` send it before they read a file; without a service they fail if chunks are missing, and say to start it.
+- When a fetch stores chunks, the watch sends an entries event for the collection, so an app can show its files as here.
 
 ## Cost
 
@@ -150,7 +152,9 @@ openvault list <collection>[/<folder>]                         files show their 
 | Writing a 10 MiB file | 10 chunks sealed and stored, each a request over the local socket and one row; one record with a 347-byte manifest, and 10 `file_chunks` rows. |
 | Syncing it | The record to every peer that shares the collection, then 10 chunk messages (10 MiB) to each that keeps it. |
 | Editing it near the end | The record, and only the chunks from the edit on. |
-| A file nobody holds | One want to each visible peer, then retries with backoff. |
+| A file nobody holds | One want to each peer that reads the collection, then, if it's kept, retries with backoff. |
+| A session that catches up | A flag and a map. If a received record named chunks that aren't here, one query per kept collection for the files missing chunks, and one record opened for each. |
+| Fetching on demand | After it, the sizes of the on-demand collections' chunks added up, from their rows: at most about 2 000 rows at the limit. |
 | Listing a collection | Its index rows, as before. With files, one more query counts the chunks that aren't here, over the collection's `file_chunks` rows. |
 | Idle | Nothing. No sweep or fetch runs on a timer. |
 

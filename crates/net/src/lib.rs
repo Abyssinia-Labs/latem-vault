@@ -6,6 +6,7 @@
 //! which of them are members is for the membership log to say. When mDNS stops, the node starts
 //! it again ([`discovery_watch`]).
 
+pub mod chunks;
 pub mod coord;
 pub mod frame;
 pub mod join;

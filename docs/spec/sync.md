@@ -17,7 +17,7 @@ All integers are big-endian.
 - Each device runs one iroh endpoint. Its node id is the device's transport key (records.md, local store).
 - It finds other devices with iroh's mDNS discovery, and recognizes members by their transport keys in the log. It ignores every other endpoint.
 
-**Protocols.** Sync uses ALPN `openvault/sync/1`, and joining uses `openvault/join/1` (join.md). A new protocol version gets a new ALPN.
+**Protocols.** Sync uses ALPN `openvault/sync/1`, joining uses `openvault/join/1` (join.md), and files' chunks use `openvault/chunks/1` (files.md, sync). A new protocol version gets a new ALPN.
 
 **Who connects.**
 - Either device may connect.

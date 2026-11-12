@@ -120,6 +120,13 @@ pub enum Request {
         collection: String,
         set: Option<Placement>,
     },
+    /// Gets the chunks of a file that aren't here from the devices that share its collection,
+    /// and answers once they're all here, or with how many none of them had (files.md, the
+    /// service). Without a service, it only counts them.
+    Fetch {
+        collection: String,
+        name: String,
+    },
 }
 
 #[derive(Debug)]
@@ -180,6 +187,10 @@ pub enum Response {
     },
     Chunk(ChunkData),
     Placement(Placement),
+    /// How many of a file's chunks still aren't here.
+    Fetched {
+        missing: u64,
+    },
 }
 
 /// A piece of a file, in the clear: at most a chunk, which never shows in debug output.
@@ -493,6 +504,10 @@ impl Request {
                 w.str(collection);
                 w.u8(set.map_or(0, Placement::code));
             }),
+            Self::Fetch { collection, name } => frame(0x1c, |w| {
+                w.str(collection);
+                w.str(name);
+            }),
         }
     }
 
@@ -585,6 +600,10 @@ impl Request {
                     0 => None,
                     code => Some(Placement::from_code(code).ok_or(DecodeError::Bad("placement"))?),
                 },
+            },
+            0x1c => Self::Fetch {
+                collection: r.string()?,
+                name: r.string()?,
             },
             _ => return Err(DecodeError::Bad("unknown request")),
         };
@@ -804,6 +823,7 @@ impl Response {
             }),
             Self::Chunk(data) => frame(0x95, |w| w.bytes(&data.0)),
             Self::Placement(placement) => frame(0x96, |w| w.u8(placement.code())),
+            Self::Fetched { missing } => frame(0x97, |w| w.put(&missing.to_be_bytes())),
         }
     }
 
@@ -1059,6 +1079,7 @@ impl Response {
             0x96 => {
                 Self::Placement(Placement::from_code(r.u8()?).ok_or(DecodeError::Bad("placement"))?)
             }
+            0x97 => Self::Fetched { missing: r.u64()? },
             _ => return Err(DecodeError::Bad("unknown response")),
         };
         r.finish()?;
@@ -1782,6 +1803,21 @@ mod tests {
             panic!("placement");
         };
         assert_eq!(placement, Placement::OnDemand);
+        let Request::Fetch { collection, name } = round_trip_request(&Request::Fetch {
+            collection: "docs".into(),
+            name: "2026/passport.pdf".into(),
+        }) else {
+            panic!("fetch");
+        };
+        assert_eq!(
+            (collection.as_str(), name.as_str()),
+            ("docs", "2026/passport.pdf")
+        );
+        let Response::Fetched { missing } = round_trip_response(&Response::Fetched { missing: 3 })
+        else {
+            panic!("fetched");
+        };
+        assert_eq!(missing, 3);
 
         // A listing gives a file's size and how many of its chunks aren't here.
         let listed = vec![

@@ -19,6 +19,7 @@ use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 use crate::api::{Event, Peer, PeerState};
+use crate::fetch::Fetcher;
 
 /// The first retry after a failed session, doubling to [`LAST_RETRY`] (sync.md, retries).
 const FIRST_RETRY: Duration = Duration::from_secs(30);
@@ -31,6 +32,8 @@ pub(crate) struct Engine {
     relay: Option<RelayUrl>,
     /// What watching apps hear of (service.md, for apps).
     events: broadcast::Sender<Event>,
+    /// Told when a session catches up or ends, so files get their chunks (files.md, asking).
+    fetcher: Arc<Fetcher>,
     state: Mutex<State>,
     next_id: AtomicU64,
 }
@@ -63,11 +66,13 @@ impl Engine {
         vault: Arc<Mutex<Vault<Keys>>>,
         relay: Option<RelayUrl>,
         events: broadcast::Sender<Event>,
+        fetcher: Arc<Fetcher>,
     ) -> Arc<Self> {
         Arc::new(Self {
             node,
             vault,
             events,
+            fetcher,
             relay,
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(0),
@@ -259,6 +264,10 @@ impl Engine {
             flag.store(now, Ordering::Relaxed);
             if let Some(engine) = engine.upgrade() {
                 engine.emit(Event::DEVICES);
+                // Caught up: whatever records came are in the store.
+                if now {
+                    engine.fetcher.synced();
+                }
             }
         })
     }
@@ -302,6 +311,7 @@ impl Engine {
         if removed {
             state.sessions.remove(&peer);
         }
+        let caught_up = result.is_ok();
         match result {
             Ok(outcome) => {
                 state.retries.remove(&peer);
@@ -360,6 +370,11 @@ impl Engine {
                     }
                 });
             }
+        }
+        // The fetcher takes the vault's lock, so not while holding this one.
+        drop(state);
+        if caught_up {
+            self.fetcher.synced();
         }
     }
 

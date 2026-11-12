@@ -767,13 +767,15 @@ mod tests {
                 env!("CARGO_PKG_VERSION_MINOR"),
                 ALPN,
                 crate::join::ALPN,
-                crate::coord::ALPN
+                crate::coord::ALPN,
+                crate::chunks::ALPN
             ),
             (
-                "4",
+                "5",
                 &b"openvault/sync/1"[..],
                 &b"openvault/join/1"[..],
-                &b"openvault/coord/1"[..]
+                &b"openvault/coord/1"[..],
+                &b"openvault/chunks/1"[..]
             )
         );
     }
@@ -843,7 +845,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod session_tests {
+pub(crate) mod session_tests {
     use openvault_core::join::JoinRequest;
     use openvault_core::membership::{DeviceName, Scope};
     use openvault_core::{CollectionId, Kind, SoftwareKeys, transport_seed};
@@ -852,21 +854,21 @@ mod session_tests {
     use super::*;
     use crate::{Node, Options};
 
-    type Store = Mutex<Vault<SoftwareKeys>>;
+    pub(crate) type Store = Mutex<Vault<SoftwareKeys>>;
 
-    struct Pair {
+    pub(crate) struct Pair {
         _dir: tempfile::TempDir,
-        recovery: RecoveryKey,
-        admin: Arc<Store>,
-        joined: Arc<Store>,
-        admin_node: Node,
-        joined_node: Node,
-        latem: CollectionId,
+        pub(crate) recovery: RecoveryKey,
+        pub(crate) admin: Arc<Store>,
+        pub(crate) joined: Arc<Store>,
+        pub(crate) admin_node: Node,
+        pub(crate) joined_node: Node,
+        pub(crate) latem: CollectionId,
     }
 
     /// An admin vault with `latem` and `ssh`, and a device that joined it with read on `latem`,
-    /// each with an endpoint that accepts sync.
-    async fn pair(entries: usize) -> Pair {
+    /// each with an endpoint that accepts sync and chunk requests.
+    pub(crate) async fn pair(entries: usize) -> Pair {
         let dir = tempfile::tempdir().unwrap();
         let recovery = RecoveryKey::generate();
         let admin_keys = SoftwareKeys::generate();
@@ -922,7 +924,7 @@ mod session_tests {
         )
         .unwrap();
         let options = || Options {
-            alpns: vec![ALPN.to_vec()],
+            alpns: vec![ALPN.to_vec(), crate::chunks::ALPN.to_vec()],
             ..Options::default()
         };
         Pair {

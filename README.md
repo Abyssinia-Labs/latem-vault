@@ -6,7 +6,7 @@ This repository holds the open-source core: the Rust service and CLI, the coordi
 
 ## Status
 
-Milestones M1, one device, and M2, devices on the same network, are done: devices join with a 6-digit code, sync directly over iroh, and can be revoked, and latem reads its builds' secrets from OpenVault. M3, reaching devices from outside the network, has its first stage built and paused: it is behind the cargo feature `coordinator`, off by default, so devices find each other on the local network only. M4, files, has its first stage built: files are kept encrypted in chunks on one device, and imported, read and passed to commands; syncing their chunks comes next. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
+Milestones M1, one device, and M2, devices on the same network, are done: devices join with a 6-digit code, sync directly over iroh, and can be revoked, and latem reads its builds' secrets from OpenVault. M3, reaching devices from outside the network, has its first stage built and paused: it is behind the cargo feature `coordinator`, off by default, so devices find each other on the local network only. M4, files, has its first two stages built: files are kept encrypted in chunks, imported, read and passed to commands, and their chunks reach the other devices that read the collection; `open` comes next. The design is in [docs/design.md](docs/design.md), and the formats are in [docs/spec](docs/spec).
 
 ## Try it
 
@@ -79,6 +79,8 @@ openvault run --collection latem --env prod -- ./gradlew bundleRelease   # UPLOA
 
 A file of up to 64 KiB is kept in its record, like a secret. A larger one is cut into 1 MiB chunks, each encrypted, which are kept in `~/.openvault/chunks`. The originals stay where they were until you delete them. `run` writes the folder's files to a private temporary folder while the command runs, and deletes it after.
 
+The service passes a file's chunks to the other devices that read its collection. A device keeps every file's chunks unless `openvault placement <collection> on-demand` says to fetch them when a file is read; `get` and `run` fetch what's missing either way.
+
 `openvault service` holds the vault open until Ctrl-C. It finds this vault's other devices on the local network with mDNS, without relays or anything outside the network, and other commands go through it, so a passphrase is typed once rather than for every command. Without it, each command opens the vault itself.
 
 The vault and this device's key file are kept in `~/.openvault`; set `OPENVAULT_HOME` to use another directory. On a Mac with a Secure Enclave, the device keys stay in it. Elsewhere they are kept in the key file, which only you can read, sealed with a passphrase that every command asks for on the terminal. `init --keys software` leaves the passphrase out, for a device that opens the vault with nobody there to type one, such as a container.
@@ -98,7 +100,7 @@ It runs rustfmt, then clippy and the tests on this Mac and in a Linux container,
 Each build knows its version and the commit it was built from. `openvault --version` prints them, as in `openvault 0.2.0 (8edda7f)`, and `openvault service` logs the same line when it starts. A build made outside a git checkout shows `unknown` for the commit. One made with uncommitted changes shows the commit those changes are on.
 
 Until 1.0, versions are `0.MINOR.PATCH`:
-- **MINOR** goes up when the store version or a protocol changes, in the same commit. An older build refuses a newer store, and can't speak a newer protocol, so devices on the same minor version can share a vault. Two tests fail until both are changed together. 0.2 is M2: store version 6, `openvault/sync/1` and `openvault/join/1`. 0.3 adds M3's `openvault/coord/1`.
+- **MINOR** goes up when the store version or a protocol changes, in the same commit. An older build refuses a newer store, and can't speak a newer protocol, so devices on the same minor version can share a vault. Two tests fail until both are changed together. 0.2 is M2: store version 6, `openvault/sync/1` and `openvault/join/1`. 0.3 adds M3's `openvault/coord/1`. 0.4 is store version 7, with files, and 0.5 adds `openvault/chunks/1`.
 - **PATCH** goes up for any other release.
 
 Each release is tagged on `main`, as `v0.2.0`.

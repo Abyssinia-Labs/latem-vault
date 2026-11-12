@@ -66,7 +66,7 @@ Each device runs one iroh endpoint (design §10):
 - **Identity.** Its secret key is the transport key (records.md, local store), so its endpoint id is the transport key in the device's add_device entry.
 - **Relays.** It never connects to n0's relays. With a coordinator configured, and built with the `coordinator` feature, it uses the grandfather's relay and no other (coordinator.md, devices); otherwise no relay at all.
 - **No publishing.** It uses no DNS or pkarr address lookup and no port mapping. Without a coordinator, nothing outside the local network learns the endpoint id or addresses; with one, the grandfather does.
-- **Protocols.** It accepts connections with ALPN `openvault/sync/1` (sync.md) and runs a session on each. Joining uses `openvault/join/1` on endpoints of its own (join.md, commands).
+- **Protocols.** It accepts connections with ALPN `openvault/sync/1` (sync.md) and runs a session on each, and with `openvault/chunks/1` (files.md, sync) and answers the chunk requests on each. Joining uses `openvault/join/1` on endpoints of its own (join.md, commands).
 
 ### Discovery
 
@@ -166,16 +166,20 @@ Since 0.4.0 ([files.md](files.md#the-service)). get, set, delete, list and folde
 | `0x19` | write chunk | collection (str) ‖ data (bytes, 1 B to 1 MiB) |
 | `0x1a` | read chunk | collection (str) ‖ epoch (u32) ‖ chunk id (32) |
 | `0x1b` | placement | collection (str) ‖ placement (u8: `0x00` leave it, `0x01` keep, `0x02` on demand) |
+| `0x1c` | fetch | collection (str) ‖ name (str) |
 
 | Type | Response | Body |
 | --- | --- | --- |
 | `0x94` | chunk written | chunk id (32) ‖ epoch (u32) |
 | `0x95` | chunk | data (bytes) |
 | `0x96` | placement | placement (u8) |
+| `0x97` | fetched | missing (u64) |
 
 - **write chunk** seals a piece of a file under the collection's current key and keeps it (files.md, local store). It answers with its id and the epoch it's sealed under, which the manifest names. The CLI sends a file this way one piece at a time, then sets its manifest.
 - **read chunk** checks a chunk against its id and opens it under the epoch its manifest names. It fails if this device doesn't hold it.
-- **placement** returns this device's placement for a collection, after setting it unless the request says `0x00`.
+- **placement** returns this device's placement for a collection, after setting it unless the request says `0x00`. Set to keep through the service, the collection gets its missing chunks at once.
+- **fetch** (0.5.0) gets the chunks of a file that aren't on this device from the devices that read its collection, and answers once they're all here, or with how many none of them had (files.md, asking). It answers only when it's done, which for a large file takes as long as the transfer. Without the service, it only counts them, since only the service has the endpoint. `get` and `run` send it before they read a file with chunks.
+- When a fetch stores chunks, watching apps get an entries event for the collection, so they can show its files as here.
 - A set or delete that leaves chunks no current version names sweeps one batch of those due (files.md, dropping chunks). The service also sweeps when it starts.
 - The Swift bindings leave files out of entries until the Mac app shows them (files.md, M4 stage 4).
 
@@ -256,6 +260,7 @@ Since 0.3.3, for the Mac app (design §12), which reaches the service through th
 | A command | One socket round trip, plus the same database reads as opening the vault directly, minus unlocking the keys. |
 | A change by another process | One extra read of the membership state, on the next request. |
 | mDNS that keeps stopping | A new lookup per wait: its sockets and one announcement. After the first few, at most one every 5 minutes. |
+| A session that catches up | A flag and a map, to see whether a kept collection needs chunks (files.md, asking). If one does: one query for the files with chunks missing, and one record opened for each. |
 
 **What to watch once it runs:**
 - mDNS packets per minute on the local network. They should stay flat as the vault grows.

@@ -60,6 +60,10 @@ pub const CHUNK_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 pub const SWEEP_BATCH: usize = 1000;
 /// `used` changes at most this often, so reading a file doesn't write to the store each time.
 const USED_RESOLUTION_SECS: i64 = 24 * 60 * 60;
+/// The most chunks of on-demand collections a device keeps (files.md, placement).
+pub const CACHE_LIMIT: u64 = 2 << 30;
+/// The longest a sealed chunk can be: a whole chunk, its nonce and its tag.
+const MAX_SEALED: usize = CHUNK_SIZE + 24 + 16;
 
 /// Which chunks this device keeps for a collection (files.md, placement).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +220,184 @@ impl<K: DeviceKeys> Vault<K> {
         Ok(plaintext)
     }
 
+    /// A chunk this device holds in `collection`, still sealed, for a peer that asks (files.md,
+    /// sync). `None` if it isn't here. Serving it isn't a use, so `used` stays.
+    pub fn sealed_chunk(&self, collection: CollectionId, id: &ChunkId) -> Result<Option<Vec<u8>>> {
+        let held_in: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT collection_id FROM chunks WHERE chunk_id = ?1",
+                [&id[..]],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if held_in.as_deref() != Some(&collection.as_bytes()[..]) {
+            return Ok(None);
+        }
+        let sealed = match fs::read(self.chunk_path(id)) {
+            Ok(sealed) => sealed,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if chunk_id(&sealed) != *id {
+            return Err(Error::Corrupt("a chunk doesn't match its id"));
+        }
+        Ok(Some(sealed))
+    }
+
+    /// The ones among `ids` that this device doesn't hold, each once, in order.
+    pub fn chunks_not_held(&self, ids: &[ChunkId]) -> Result<Vec<ChunkId>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT 1 FROM chunks WHERE chunk_id = ?1")?;
+        let mut seen = HashSet::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for id in ids {
+            if seen.insert(id) && !statement.exists([&id[..]])? {
+                missing.push(*id);
+            }
+        }
+        Ok(missing)
+    }
+
+    /// Keeps a chunk a peer sent (files.md, sync): one a current file in `collection` names,
+    /// sealed under `epoch` as that file's manifest says. True if it's new here. As for a written
+    /// chunk, the row comes first, unreferenced until the file is whole, so a crash leaves
+    /// nothing the sweep wouldn't find.
+    pub fn receive_chunk(
+        &mut self,
+        collection: CollectionId,
+        epoch: u32,
+        id: &ChunkId,
+        sealed: &[u8],
+    ) -> Result<bool> {
+        if sealed.len() > MAX_SEALED {
+            return Err(Error::ChunkTooLarge);
+        }
+        if chunk_id(sealed) != *id {
+            return Err(Error::Corrupt("a chunk doesn't match its id"));
+        }
+        let named = self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM file_chunks WHERE collection_id = ?1 AND chunk_id = ?2 LIMIT 1",
+            )?
+            .exists(params![&collection.as_bytes()[..], &id[..]])?;
+        if !named {
+            return Err(Error::ChunkUnwanted);
+        }
+        let path = self.chunk_path(id);
+        let known = self
+            .conn
+            .prepare_cached("SELECT 1 FROM chunks WHERE chunk_id = ?1")?
+            .exists([&id[..]])?;
+        if known && path.exists() {
+            return Ok(false);
+        }
+        let now = now();
+        if !known {
+            self.conn.execute(
+                "INSERT INTO chunks VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    &id[..],
+                    &collection.as_bytes()[..],
+                    epoch,
+                    i64::try_from(sealed.len()).expect("a chunk is small"),
+                    now,
+                    now
+                ],
+            )?;
+        }
+        if let Err(e) = self.write_chunk_file(&path, sealed) {
+            if !known {
+                self.conn
+                    .execute("DELETE FROM chunks WHERE chunk_id = ?1", [&id[..]])?;
+            }
+            return Err(e);
+        }
+        self.conn.execute(
+            "UPDATE chunks SET unreferenced = NULL WHERE chunk_id = ?1",
+            [&id[..]],
+        )?;
+        Ok(true)
+    }
+
+    /// Whether a received record made a file that names chunks current since this was last
+    /// asked, so it's worth looking for missing chunks.
+    pub fn take_files_arrived(&self) -> bool {
+        self.arrived.swap(false, Ordering::Relaxed)
+    }
+
+    /// Drops the least recently used chunks of on-demand collections until they take at most
+    /// [`CACHE_LIMIT`], sparing `spare`: the chunks of a file being read. Returns how many it
+    /// dropped. Reads nothing more when no collection is on demand. Dropped chunks are the
+    /// files' again to fetch, so they're deleted at once rather than after 30 days.
+    pub fn trim_cache(&mut self, spare: &[ChunkId]) -> Result<usize> {
+        self.trim_cache_to(CACHE_LIMIT, spare)
+    }
+
+    pub(super) fn trim_cache_to(&mut self, limit: u64, spare: &[ChunkId]) -> Result<usize> {
+        let collections: Vec<CollectionId> = self
+            .membership
+            .as_ref()
+            .map(|membership| membership.collections().collect())
+            .unwrap_or_default();
+        let mut held: Vec<(i64, Vec<u8>, i64)> = Vec::new();
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT used, chunk_id, size FROM chunks WHERE collection_id = ?1")?;
+        for collection in collections {
+            if self.placement_of(collection)? != Placement::OnDemand {
+                continue;
+            }
+            let rows = statement.query_map([&collection.as_bytes()[..]], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            for row in rows {
+                held.push(row?);
+            }
+        }
+        drop(statement);
+        let mut total: u64 = held
+            .iter()
+            .map(|(_, _, size)| u64::try_from(*size).unwrap_or(0))
+            .sum();
+        if total <= limit {
+            return Ok(0);
+        }
+        held.sort();
+        let spare: HashSet<&[u8]> = spare.iter().map(|id| &id[..]).collect();
+        let mut dropped = Vec::new();
+        for (_, id, size) in held {
+            if total <= limit {
+                break;
+            }
+            if spare.contains(&id[..]) {
+                continue;
+            }
+            total -= u64::try_from(size).unwrap_or(0);
+            dropped.push(id);
+        }
+        // The files first, as the sweep does.
+        for id in &dropped {
+            let id: ChunkId = id
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Corrupt("chunk id"))?;
+            match fs::remove_file(self.chunk_path(&id)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for id in &dropped {
+            tx.execute("DELETE FROM chunks WHERE chunk_id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(dropped.len())
+    }
+
     /// For each current file in `collection` with chunks this device doesn't hold, how many.
     pub fn missing_chunks(&self, collection: CollectionId) -> Result<HashMap<String, u64>> {
         let mut statement = self.conn.prepare(
@@ -245,6 +427,11 @@ impl<K: DeviceKeys> Vault<K> {
     /// This device's placement for `collection`.
     pub fn placement(&self, collection: CollectionId) -> Result<Placement> {
         self.epoch(collection)?;
+        self.placement_of(collection)
+    }
+
+    /// The placement stored for `collection`, or the default.
+    fn placement_of(&self, collection: CollectionId) -> Result<Placement> {
         let code: Option<u8> = self
             .conn
             .query_row(

@@ -1404,6 +1404,84 @@ fn services_sync_a_joined_device() {
     assert!(admin_service.stop());
 }
 
+/// A file's chunks follow its record to a device that keeps the collection, and come when it's
+/// read on a device that fetches on demand (files.md, sync).
+#[cfg(unix)]
+#[test]
+fn files_reach_the_other_devices() {
+    let admin = Device::new();
+    admin.set("latem/prod/REGION", "--var", b"eu west");
+    let joiner = Device::empty();
+    join(&admin, &joiner);
+    let src = admin.home.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let import = |file: &str, bytes: &[u8]| {
+        let path = src.join(file);
+        std::fs::write(&path, bytes).unwrap();
+        let path = path.to_str().unwrap();
+        admin.ok(&[
+            "import",
+            path,
+            "--collection",
+            "latem",
+            "--into",
+            "release",
+            "--disk-not-encrypted",
+        ]);
+    };
+    import("big.bin", &big_file());
+    let admin_service = Service::start(&admin);
+    let joiner_service = Service::start(&joiner);
+    // latem is kept, so its chunks come after the record, without being read.
+    eventually(
+        &joiner,
+        &["list", "latem"],
+        "file    release/big.bin  2.5 MiB\n",
+    );
+    assert_eq!(chunk_files(&joiner), 3);
+    let output = joiner.run(&["get", "latem/release/big.bin"]);
+    assert!(output.stdout == big_file(), "{}", joiner_service.log());
+    assert!(
+        admin_service.log().contains("sent chunks"),
+        "{}",
+        admin_service.log()
+    );
+
+    // On demand, a new file's chunks come only when it's read.
+    joiner.ok(&["placement", "latem", "on-demand"]);
+    let other: Vec<u8> = (0..(3usize << 19)).map(|i| (i % 241) as u8).collect();
+    import("other.bin", &other);
+    eventually(
+        &joiner,
+        &["list", "latem"],
+        "file    release/other.bin  1.5 MiB, 2 chunks not here\n",
+    );
+    let output = joiner.run(&["get", "latem/release/other.bin"]);
+    assert!(
+        output.stdout == other,
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        joiner_service.log()
+    );
+    assert!(
+        joiner
+            .ok(&["list", "latem"])
+            .contains("file    release/other.bin  1.5 MiB\n")
+    );
+
+    // Without its service, a device can't fetch, and says so.
+    let third: Vec<u8> = (0..(2usize << 20) + 5).map(|i| (i % 239) as u8).collect();
+    import("third.bin", &third);
+    eventually(&joiner, &["list", "latem"], "3 chunks not here");
+    assert!(admin_service.stop());
+    assert!(joiner_service.stop());
+    let output = joiner.run(&["get", "latem/release/third.bin"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("start the service"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
 /// The requests the Mac app makes (service.md, for apps), straight on the socket.
 #[cfg(unix)]
 #[test]

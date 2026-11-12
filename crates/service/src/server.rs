@@ -29,6 +29,7 @@ use crate::api::{self, ErrorCode, JoinRequestSummary, Joiner, Request, Response}
 #[cfg(feature = "coordinator")]
 use crate::coordinator;
 use crate::engine::Engine;
+use crate::fetch::Fetcher;
 use crate::handler::{self, Context, transport_endpoint};
 use crate::{ADMIN_KEY, LOCK, SOCKET, VAULT};
 
@@ -45,6 +46,7 @@ struct Shared {
     admin_key: PathBuf,
     node: Arc<Node>,
     engine: Arc<Engine>,
+    fetcher: Arc<Fetcher>,
     version: String,
     /// What watching apps hear of.
     events: broadcast::Sender<api::Event>,
@@ -61,11 +63,13 @@ struct Joins {
     tries: HashMap<EndpointKey, u8>,
 }
 
-/// What a request changed, which sync passes on.
+/// What a request changed, which sync or fetching passes on.
 enum Change {
     /// The records of the collection with this name.
     Records(String),
     Log,
+    /// The collection with this name is kept: it gets the chunks it's missing.
+    Kept(String),
 }
 
 /// Runs the service for the vault in `dir` until Ctrl-C or SIGTERM. `keys` are the device's
@@ -116,7 +120,10 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
     };
     let relay = coordinator.as_ref().map(|address| address.relay_url());
     let options = Options {
-        alpns: vec![openvault_net::sync::ALPN.to_vec()],
+        alpns: vec![
+            openvault_net::sync::ALPN.to_vec(),
+            openvault_net::chunks::ALPN.to_vec(),
+        ],
         relay: relay.clone().map(Relay::new),
         ..Options::default()
     };
@@ -133,8 +140,21 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
 
     let vault = Arc::new(Mutex::new(vault));
     let app_events = broadcast::channel(64).0;
+    let fetcher = Fetcher::new(
+        node.clone(),
+        vault.clone(),
+        relay.clone(),
+        app_events.clone(),
+    );
     let shared = Arc::new(Shared {
-        engine: Engine::new(node.clone(), vault.clone(), relay, app_events.clone()),
+        engine: Engine::new(
+            node.clone(),
+            vault.clone(),
+            relay,
+            app_events.clone(),
+            fetcher.clone(),
+        ),
+        fetcher,
         vault,
         admin_key: dir.join(ADMIN_KEY),
         node,
@@ -179,6 +199,19 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
                     match incoming.await {
                         Ok(connection) if connection.alpn() == openvault_net::sync::ALPN => {
                             shared.engine.accept(connection);
+                        }
+                        Ok(connection) if connection.alpn() == openvault_net::chunks::ALPN => {
+                            let served = openvault_net::chunks::serve(
+                                connection,
+                                shared.vault.clone(),
+                                openvault_net::chunks::IDLE,
+                            )
+                            .await;
+                            match served {
+                                Ok(0) => {}
+                                Ok(sent) => info!(sent, "sent chunks to another device"),
+                                Err(e) => warn!("a chunk request failed: {e}"),
+                            }
                         }
                         Ok(connection) => connection.close(0u32.into(), b"unknown protocol"),
                         Err(e) => debug!("an incoming connection failed: {e}"),
@@ -254,6 +287,12 @@ async fn serve(shared: &Arc<Shared>, mut stream: UnixStream) -> Result<()> {
                     recovery_phrase,
                 }) => approve(shared, session, scopes, recovery_phrase).await,
                 Ok(Request::Refuse { session }) => refuse(shared, session).await,
+                Ok(Request::Fetch { collection, name }) => {
+                    match shared.fetcher.file(&collection, &name).await {
+                        Ok(missing) => Response::Fetched { missing },
+                        Err(e) => Response::error(format!("{e:#}")),
+                    }
+                }
                 Ok(request) => {
                     let shared = shared.clone();
                     tokio::task::spawn_blocking(move || answer(&shared, request)).await?
@@ -290,10 +329,14 @@ fn answer(shared: &Shared, request: Request) -> Response {
         | Request::Revoke { .. }
         | Request::SetScope { .. }
         | Request::SetScopes { .. } => Some(Change::Log),
+        Request::Placement {
+            collection,
+            set: Some(openvault_core::Placement::Keep),
+        } => Some(Change::Kept(collection.clone())),
         _ => None,
     };
     let visible = shared.node.visible();
-    let (response, set) = {
+    let (response, set, kept) = {
         let mut vault = shared.vault.lock().expect("poisoned");
         // Another process may have written while the service wasn't looking (service.md, the
         // store).
@@ -312,13 +355,22 @@ fn answer(shared: &Shared, request: Request) -> Response {
             Some(Change::Records(name)) => vault.collection(name).ok().map(SetId::records),
             _ => None,
         };
-        (response, set)
+        let kept = match &change {
+            Some(Change::Kept(name)) => vault.collection(name).ok(),
+            _ => None,
+        };
+        (response, set, kept)
     };
     if !matches!(response, Response::Error { .. }) {
         match (change, set) {
             (Some(Change::Records(name)), Some(set)) => {
                 shared.engine.changed(set);
                 emit(shared, api::Event::ENTRIES, vec![name]);
+            }
+            (Some(Change::Kept(_)), _) => {
+                if let Some(collection) = kept {
+                    shared.fetcher.kept(collection);
+                }
             }
             (Some(Change::Log), _) => {
                 shared.engine.log_changed();

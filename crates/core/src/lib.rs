@@ -21,8 +21,8 @@ pub use ids::{CollectionId, DeviceId, VaultId};
 pub use keys::{DeviceKeys, SoftwareKeys, transport_seed};
 pub use record::{Kind, Version};
 pub use store::{
-    Approval, CHUNK_RETENTION_SECS, CollectionInfo, Entry, EntryInfo, Placement, Received, Review,
-    Revocation, SWEEP_BATCH, ScopeChange, Swept, Vault, Written, WrittenChunk,
+    Approval, CACHE_LIMIT, CHUNK_RETENTION_SECS, CollectionInfo, Entry, EntryInfo, Placement,
+    Received, Review, Revocation, SWEEP_BATCH, ScopeChange, Swept, Vault, Written, WrittenChunk,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +47,8 @@ pub enum Error {
     ChunkMissing(file::ChunkId),
     #[error("a chunk is at most {} bytes", file::CHUNK_SIZE)]
     ChunkTooLarge,
+    #[error("no current file in that collection names that chunk")]
+    ChunkUnwanted,
     #[error("only secrets, variables and files can be set")]
     NotSettable,
     #[error("a vault already exists at {}", .0.display())]

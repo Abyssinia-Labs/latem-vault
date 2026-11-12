@@ -45,6 +45,33 @@ impl Access {
         }
     }
 
+    /// Gets the chunks of the file `collection`/`name` that aren't on this device from the
+    /// devices that share its collection (files.md, asking). Only the service can, since it
+    /// holds the endpoint; without it this fails if any are missing.
+    fn fetch(&mut self, collection: &str, name: &str) -> Result<()> {
+        let missing = match self.call(Request::Fetch {
+            collection: collection.into(),
+            name: name.into(),
+        })? {
+            Response::Fetched { missing } => missing,
+            other => return Err(unexpected(&other)),
+        };
+        if missing == 0 {
+            return Ok(());
+        }
+        let chunks = if missing == 1 { "chunk" } else { "chunks" };
+        if self.is_service() {
+            bail!(
+                "{missing} {chunks} of {collection}/{name} aren't on this device, and none of \
+                 your devices that could be reached had them"
+            );
+        }
+        bail!(
+            "{missing} {chunks} of {collection}/{name} aren't on this device; start the service \
+             (`openvault service`) to fetch them from your other devices"
+        )
+    }
+
     fn placement(&mut self, collection: &str, set: Option<Placement>) -> Result<Placement> {
         match self.call(Request::Placement {
             collection: collection.into(),
@@ -356,6 +383,9 @@ pub fn get(
     output: Option<&Path>,
 ) -> Result<()> {
     let context = || format!("can't read {collection}/{name}");
+    if matches!(manifest.content, Content::Chunks { .. }) {
+        access.fetch(collection, name)?;
+    }
     match output {
         None => write_contents(access, collection, manifest, &mut io::stdout().lock())
             .with_context(context),
@@ -453,6 +483,9 @@ pub fn run_with_files(
                 "{collection}/{other} and {collection}/{} would both set {var}",
                 item.name
             );
+        }
+        if matches!(manifest.content, Content::Chunks { .. }) {
+            access.fetch(collection, &item.name)?;
         }
         let path = dir.0.join(within);
         if let Some(parent) = path.parent() {

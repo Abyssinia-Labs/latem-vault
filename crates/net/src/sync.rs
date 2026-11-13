@@ -1016,9 +1016,10 @@ pub(crate) mod session_tests {
             &approval.grants,
         )
         .unwrap();
+        // Tests reach these by address (lib.rs, `quiet_test_options`).
         let options = || Options {
             alpns: vec![ALPN.to_vec(), crate::chunks::ALPN.to_vec()],
-            ..crate::test_options()
+            ..crate::quiet_test_options()
         };
         Pair {
             _dir: dir,
@@ -1054,8 +1055,12 @@ pub(crate) mod session_tests {
             )
             .await
         });
-        let id = iroh::EndpointId::from_bytes(&accepter.0.id()).unwrap();
-        let connection = opener.0.endpoint().connect(id, ALPN).await.unwrap();
+        let connection = opener
+            .0
+            .endpoint()
+            .connect(crate::direct_addr(accepter.0), ALPN)
+            .await
+            .unwrap();
         let (tx, rx) = mpsc::channel(8);
         let opening = tokio::spawn(run(
             connection,
@@ -1176,8 +1181,12 @@ pub(crate) mod session_tests {
             )
             .await
         });
-        let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
-        let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+        let connection = p
+            .admin_node
+            .endpoint()
+            .connect(crate::direct_addr(&p.joined_node), ALPN)
+            .await
+            .unwrap();
         let (open_tx, open_rx) = mpsc::channel(8);
         let (heard_tx, mut heard) = mpsc::unbounded_channel();
         let opening = tokio::spawn(run(
@@ -1246,8 +1255,12 @@ pub(crate) mod session_tests {
             )
             .await
         });
-        let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
-        let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+        let connection = p
+            .admin_node
+            .endpoint()
+            .connect(crate::direct_addr(&p.joined_node), ALPN)
+            .await
+            .unwrap();
         let (open_tx, open_rx) = mpsc::channel(8);
         let (heard_tx, mut heard) = mpsc::unbounded_channel();
         let opening = tokio::spawn(run(
@@ -1324,8 +1337,12 @@ pub(crate) mod session_tests {
                 )
                 .await
             });
-            let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
-            let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+            let connection = p
+                .admin_node
+                .endpoint()
+                .connect(crate::direct_addr(&p.joined_node), ALPN)
+                .await
+                .unwrap();
             let (open_tx, open_rx) = mpsc::channel(8);
             let (admin_tx, mut admin_heard) = mpsc::unbounded_channel();
             let opened = run(
@@ -1384,8 +1401,12 @@ pub(crate) mod session_tests {
             )
             .await
         });
-        let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
-        let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+        let connection = p
+            .admin_node
+            .endpoint()
+            .connect(crate::direct_addr(&p.joined_node), ALPN)
+            .await
+            .unwrap();
         let (open_tx, open_rx) = mpsc::channel(8);
         let opening = tokio::spawn(run(
             connection,
@@ -1432,8 +1453,12 @@ pub(crate) mod session_tests {
             let connection = endpoint.accept().await.unwrap().await.unwrap();
             close_duplicate(&connection);
         });
-        let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
-        let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+        let connection = p
+            .admin_node
+            .endpoint()
+            .connect(crate::direct_addr(&p.joined_node), ALPN)
+            .await
+            .unwrap();
         let (_notices, rx) = mpsc::channel(1);
         let result = run(
             connection,
@@ -1630,8 +1655,12 @@ pub(crate) mod session_tests {
             )
             .await
         });
-        let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
-        let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+        let connection = p
+            .admin_node
+            .endpoint()
+            .connect(crate::direct_addr(&p.joined_node), ALPN)
+            .await
+            .unwrap();
         // Room for one notice, so a send returns only once the session has taken the one before.
         let (open_tx, open_rx) = mpsc::channel(1);
         let (heard_tx, mut heard) = mpsc::unbounded_channel();

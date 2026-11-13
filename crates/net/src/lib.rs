@@ -367,6 +367,36 @@ pub(crate) fn test_options() -> Options {
     }
 }
 
+/// Options for a test that isn't about finding devices: its endpoints don't advertise, and
+/// others reach them by [`direct_addr`]. A connection by id alone waits for an mDNS lookup that
+/// gives up after 11 seconds, and with every test's endpoints answering under one name, the
+/// lookups ran out of time on a busy machine.
+#[cfg(test)]
+pub(crate) fn quiet_test_options() -> Options {
+    Options {
+        advertise: false,
+        ..test_options()
+    }
+}
+
+/// Where a test reaches `node` on this machine: its id and the loopback address of each socket
+/// it's bound on, so connecting needs no lookup.
+#[cfg(test)]
+pub(crate) fn direct_addr(node: &Node) -> EndpointAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let endpoint = node.endpoint();
+    let addrs = endpoint.bound_sockets().into_iter().map(|bound| {
+        let ip = match bound.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ip => ip,
+        };
+        iroh::TransportAddr::Ip(SocketAddr::new(ip, bound.port()))
+    });
+    EndpointAddr::from_parts(endpoint.id(), addrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

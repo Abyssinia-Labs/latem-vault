@@ -353,8 +353,10 @@ mod tests {
     }
 
     async fn connect(from: &Node, to: &Node) -> Connection {
-        let id = iroh::EndpointId::from_bytes(&to.id()).unwrap();
-        from.endpoint().connect(id, ALPN).await.unwrap()
+        from.endpoint()
+            .connect(crate::direct_addr(to), ALPN)
+            .await
+            .unwrap()
     }
 
     /// Keeps what the peer sends in `store`, as the service does.
@@ -430,7 +432,7 @@ mod tests {
         let stranger = SoftwareKeys::generate();
         let (stranger, _) = Node::start(
             &openvault_core::transport_seed(&stranger),
-            crate::test_options(),
+            crate::quiet_test_options(),
         )
         .await
         .unwrap();

@@ -949,11 +949,44 @@ fn open_saves_each_change_and_deletes_the_copy() {
         .read_to_string(&mut stdout)
         .unwrap();
     assert!(open.0.wait().unwrap().success(), "{stdout}");
+    // macOS's `open` says when an app has it; `xdg-open` doesn't always say when none did.
+    let first = if cfg!(target_os = "macos") {
+        "Opened latem/prod/upload.jks in its app, from a copy at "
+    } else {
+        "Asked xdg-open to open latem/prod/upload.jks, from a copy at "
+    };
+    assert!(stdout.starts_with(first), "{stdout}");
     assert_eq!(stdout.matches("Saved a new version").count(), 2, "{stdout}");
     assert!(stdout.ends_with("Deleted the copy.\n"), "{stdout}");
     assert!(!copy.parent().unwrap().exists());
     let output = device.run(&["get", "latem/prod/upload.jks"]);
     assert_eq!(output.stdout, b"edited twice");
+
+    // An opener that fails at once is said, with where the copy is.
+    for name in ["open", "xdg-open"] {
+        std::fs::write(bin.join(name), "#!/bin/sh\nexit 3\n").unwrap();
+    }
+    let output = device
+        .command(&["open", "latem/prod/upload.jks"])
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(b"\n")?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.starts_with("Can't open latem/prod/upload.jks in its app (")
+            && stdout.contains("). Open the copy yourself: "),
+        "{stdout}"
+    );
 }
 
 #[cfg(unix)]

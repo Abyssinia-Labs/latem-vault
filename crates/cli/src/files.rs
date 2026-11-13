@@ -406,8 +406,13 @@ pub fn open(access: &mut Access, collection: &str, name: &str, manifest: &Manife
         fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
     }
     match launch(&path) {
-        Ok(()) => println!(
+        Ok(Launched::Opened) => println!(
             "Opened {entry} in its app, from a copy at {}",
+            path.display()
+        ),
+        Ok(Launched::Asked) => println!(
+            "Asked xdg-open to open {entry}, from a copy at {}. If no app opens it, open the \
+             copy yourself.",
             path.display()
         ),
         Err(e) => println!(
@@ -524,10 +529,20 @@ fn signature(path: &Path) -> Option<(u64, i64, i64, i64, u64)> {
     ))
 }
 
+/// What opening a copy in its app came to.
+#[cfg(unix)]
+enum Launched {
+    /// The app has it: macOS's `open` says so.
+    Opened,
+    /// `xdg-open` took it without failing, which doesn't mean an app did: with no app for the
+    /// file's type, it can exit 0 after its last fallback, a browser, isn't found.
+    Asked,
+}
+
 /// Opens `path` in its default app: `open` on macOS, which returns once the app has it, or
 /// `xdg-open` elsewhere, which may stay with it, so it's waited for only 2 seconds.
 #[cfg(unix)]
-fn launch(path: &Path) -> Result<()> {
+fn launch(path: &Path) -> Result<Launched> {
     let mut command = process::Command::new(if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -542,26 +557,23 @@ fn launch(path: &Path) -> Result<()> {
         if !status.success() {
             bail!("open found no app for it");
         }
-    } else {
-        // It may run the app itself and stay until the app quits, so it gets 2 seconds: if it
-        // fails in that time, as when no app takes the file's type, that's said with where the
-        // copy is, rather than its own complaint.
-        let mut child = command
-            .stderr(process::Stdio::null())
-            .spawn()
-            .context("can't run xdg-open")?;
-        let started = std::time::Instant::now();
-        while started.elapsed() < std::time::Duration::from_secs(2) {
-            if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    bail!("xdg-open found no app for it, {status}");
-                }
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        return Ok(Launched::Opened);
     }
-    Ok(())
+    // It may run the app itself and stay until the app quits, so it gets 2 seconds, and a
+    // failure it reports in that time is said. Its own complaints stay on stderr, since it
+    // doesn't report every failure.
+    let mut child = command.spawn().context("can't run xdg-open")?;
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(2) {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                bail!("xdg-open failed, {status}");
+            }
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(Launched::Asked)
 }
 
 /// `UPLOAD_JKS` for `upload.jks`: upper case, with everything but A–Z and 0–9 turned into `_`.

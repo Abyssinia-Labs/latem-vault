@@ -59,6 +59,13 @@ All integers are big-endian.
 
 **The store.** The service keeps one connection to the store and handles requests one at a time. Before each request it checks SQLite's `data_version`, which changes when another process has written. If it has changed, the service reloads the membership it keeps in memory. A command run while the service starts up, before the socket is there, therefore can't leave the service with a stale log.
 
+**Asking for Touch ID.** Some requests are signed with this device's admin key: create collection, revoke, set scope, set scopes and approve. For these, the service asks for Touch ID before it locks the vault, so sync sessions and other requests go on while the dialog is open.
+1. Under the lock, it runs the checks that come before asking, such as whether the collection exists or the device already has that scope, and works out what the dialog says.
+2. It lets go of the lock and asks (keystore.md, asking first).
+3. Once the user has answered, it locks the vault again, runs the checks again, and signs without asking. If the log has changed meanwhile and the key is no longer an admin, the request runs as on a device without one.
+
+Before 0.5.8 the service held the lock while the dialog was open. Every session stopped until the user answered, and a peer closed any session that had gone a minute without a message (sync.md, lifetime). A device with no admin key gives its recovery phrase with the request, so it has nothing to ask.
+
 ## Endpoint
 
 Each device runs one iroh endpoint (design §10):
@@ -260,6 +267,7 @@ Since 0.3.3, for the Mac app (design §12), which reaches the service through th
 | Idle | One mDNS query every 5 seconds or more, each answered by every OpenVault device on the network: a few hundred bytes of multicast. No connections and no database reads. |
 | A command | One socket round trip, plus the same database reads as opening the vault directly, minus unlocking the keys. |
 | A change by another process | One extra read of the membership state, on the next request. |
+| A request an admin signs | The vault is locked twice: once for the checks before Touch ID, once to sign. The second lock adds one more `data_version` check, and nothing else is read twice. |
 | mDNS that keeps stopping | A new lookup per wait: its sockets and one announcement. After the first few, at most one every 5 minutes. |
 | A session that catches up | A flag and a map, to see whether a kept collection needs chunks (files.md, asking). If one does: one query for the files with chunks missing, and one record opened for each. |
 

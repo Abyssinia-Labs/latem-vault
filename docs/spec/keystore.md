@@ -154,8 +154,13 @@ The device that administers the vault, the MacBook in design §12, has an admin 
 **One approval, one prompt.**
 - An approval that signs several things asks once. A join, for example, signs add_device and its set_scope entries; a revocation signs rotate_epoch entries and grants too.
 - The `LAContext` is authenticated once, with a reason that names the whole approval, and is then passed to every signature in it.
-- In `crates/keystore`, an `AdminKey` restores its key with one context on its first signature and signs every later one with that key, so one approval uses one `AdminKey`.
-- Checked on a MacBook with macOS 26 on 2026-11-07: `cargo test -p openvault-keystore -- --ignored` signs three times and asks once.
+- In `crates/keystore`, an `AdminKey` restores its key with one context the first time it's used, and signs every later signature with that key, so one approval uses one `AdminKey`.
+- Checked on a MacBook with macOS 26 on 2026-11-07: `cargo test -p openvault-keystore -- --ignored` signs three times and asks once. Since 0.5.8 the test authenticates first (below), then signs three times. Checked again on 2026-11-13: one prompt, and coreauthd logged one signing evaluation (`evaluateACL … operation:osgn`) and one Touch ID match for the four signatures.
+
+**Asking first.** A caller can ask before it signs. The service does this so that the vault isn't locked while the dialog is open (service.md, asking for Touch ID).
+- `AdminKey::authenticate` restores the key with its context and signs the fixed input `openvault v1 admin presence`, which asks. The approval's signatures then use the same context and don't ask.
+- Every signature openvault checks covers a context label first (`openvault v1 sig …`), so this one can't pass for any of them. It's dropped as soon as it's made, and never stored or sent.
+- A signature, rather than evaluating the key's access control with `LAContext`, because it's the call the approval's other signatures already make, so the same context is known to carry the authentication over.
 
 **The admin key file.** It sits next to the key file, as `admin` in the `openvault` directory, with the same rules: created only if absent, mode 0600, refused if others can read it or if it's over 16 KiB.
 

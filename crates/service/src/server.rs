@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use openvault_core::membership::Scope;
+use openvault_core::membership::{AdminKey as AdminKeyTrait, Scope};
 use openvault_core::sets::SetId;
 use openvault_core::{DeviceId, Vault, transport_seed};
 use openvault_keystore::Keys;
@@ -335,6 +335,20 @@ fn answer(shared: &Shared, request: Request) -> Response {
         } => Some(Change::Kept(collection.clone())),
         _ => None,
     };
+    // Touch ID is asked for before the vault is locked, so sessions and other requests go on
+    // while its dialog is open (service.md, asking for Touch ID).
+    let approved = if handler::signed_by_admin(&request) {
+        match handler::approve_first(
+            &shared.vault,
+            |vault| handler::admin_reason(vault, &request),
+            handler::admin_key_for(&shared.admin_key),
+        ) {
+            Ok(approved) => approved,
+            Err(error) => return handler::error_response(error),
+        }
+    } else {
+        None
+    };
     let visible = shared.node.visible();
     let (response, set, kept) = {
         let mut vault = shared.vault.lock().expect("poisoned");
@@ -347,6 +361,7 @@ fn answer(shared: &Shared, request: Request) -> Response {
             &mut Context {
                 vault: &mut vault,
                 admin_key: &shared.admin_key,
+                admin: approved.as_ref().map(|key| key as &dyn AdminKeyTrait),
                 visible: Some(&visible),
             },
             request,
@@ -574,11 +589,19 @@ async fn approve(
     let signed = {
         let shared = shared.clone();
         tokio::task::spawn_blocking(move || {
+            // Touch ID first, with the vault unlocked, as for other requests (service.md, asking
+            // for Touch ID).
+            let approved = handler::approve_first(
+                &shared.vault,
+                |vault| Ok(Some(handler::joining(vault, &request, &scopes)?.1)),
+                handler::admin_key_for(&shared.admin_key),
+            )?;
             let mut vault = shared.vault.lock().expect("poisoned");
             vault.refresh()?;
             let approval = handler::approve_join(
                 &mut vault,
                 &shared.admin_key,
+                approved.as_ref().map(|key| key as &dyn AdminKeyTrait),
                 &request,
                 &scopes,
                 recovery_phrase.as_deref().map(String::as_str),

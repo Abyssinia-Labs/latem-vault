@@ -91,7 +91,18 @@ impl AdminSigner {
     pub(crate) fn sign(&self, input: &[u8]) -> Result<Signature> {
         Ok(Signature::from_p256_der(&self.key.sign(input)?)?)
     }
+
+    /// Asks for Touch ID or the password now, by signing [`PRESENCE`], so the signatures that
+    /// follow don't ask (keystore.md, asking first).
+    pub(crate) fn authenticate(&self) -> Result<()> {
+        self.key.sign(PRESENCE).map(drop)
+    }
 }
+
+/// What an admin key signs to ask for Touch ID ahead of the signatures that need it. Every
+/// signature openvault checks covers a context label first (`openvault v1 sig ...`), so this one
+/// can't pass for any of them, and it's dropped as soon as it's made.
+const PRESENCE: &[u8] = b"openvault v1 admin presence";
 
 /// A device's wrapping and signing keys in the Secure Enclave, plus its local key, which is
 /// kept in the key file wrapped to the Secure Enclave wrapping key.

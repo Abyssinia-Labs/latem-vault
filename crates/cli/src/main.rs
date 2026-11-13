@@ -532,6 +532,8 @@ impl Access {
                 &mut handler::Context {
                     vault,
                     admin_key,
+                    // Without the service, nothing else waits on the vault while Touch ID asks.
+                    admin: None,
                     visible: None,
                 },
                 request,

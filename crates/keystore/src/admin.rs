@@ -73,6 +73,32 @@ impl AdminKey {
         self.reason = reason.into();
         self
     }
+
+    /// Asks for Touch ID or the password now, with the dialog showing the reason, so the
+    /// signatures that follow don't ask (keystore.md, asking first). A caller holding a lock that
+    /// others wait on asks before taking it.
+    pub fn authenticate(&self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.signer()?.authenticate()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            unreachable!("an admin key can't be loaded without a Secure Enclave")
+        }
+    }
+
+    /// The signer, restored with its authentication context the first time it's needed.
+    #[cfg(target_os = "macos")]
+    fn signer(&self) -> Result<&crate::secure_enclave::AdminSigner> {
+        match self.signer.get() {
+            Some(signer) => Ok(signer),
+            None => {
+                let signer = crate::secure_enclave::AdminSigner::new(&self.blob, &self.reason)?;
+                Ok(self.signer.get_or_init(|| signer))
+            }
+        }
+    }
 }
 
 impl membership::AdminKey for AdminKey {
@@ -84,14 +110,7 @@ impl membership::AdminKey for AdminKey {
         #[cfg(target_os = "macos")]
         {
             let input = openvault_crypto::sign::signing_input(context, message);
-            let signer = match self.signer.get() {
-                Some(signer) => signer,
-                None => {
-                    let signer = crate::secure_enclave::AdminSigner::new(&self.blob, &self.reason)?;
-                    self.signer.get_or_init(|| signer)
-                }
-            };
-            Ok(signer.sign(&input)?)
+            Ok(self.signer()?.sign(&input)?)
         }
         #[cfg(not(target_os = "macos"))]
         {

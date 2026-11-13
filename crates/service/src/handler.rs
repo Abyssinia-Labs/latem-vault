@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use openvault_core::join::JoinRequest;
@@ -26,8 +27,91 @@ pub struct Context<'a> {
     pub vault: &'a mut Vault<Keys>,
     /// Where this device's admin key file would be.
     pub admin_key: &'a Path,
+    /// This device's admin key, if [`approve_first`] already asked for it for this request.
+    /// Without one, a request an admin signs loads the key from `admin_key`, and its first
+    /// signature asks.
+    pub admin: Option<&'a dyn AdminKeyTrait>,
     /// The OpenVault endpoints mDNS can see; `None` without the service.
     pub visible: Option<&'a BTreeSet<EndpointKey>>,
+}
+
+/// An admin key that asks the user before it signs, as this device's does with Touch ID
+/// (keystore.md, admin key).
+pub trait Asks: AdminKeyTrait {
+    /// Asks now, so the signatures that follow don't.
+    fn ask(&self) -> Result<()>;
+}
+
+impl Asks for AdminKey {
+    fn ask(&self) -> Result<()> {
+        Ok(self.authenticate()?)
+    }
+}
+
+/// For a request this device's admin key signs: asks for the key's approval before the vault is
+/// locked, so sync sessions and other requests go on while the Touch ID dialog is open (service.md,
+/// asking for Touch ID). `reason` runs the checks that come before asking, so a request that would
+/// fail asks for nothing, and says what the dialog shows; `None` means no admin signs the request.
+/// `key` is this device's admin key with that reason, if the vault lists one. Returns the key,
+/// approved, for [`Context::admin`]; `None` leaves the request to ask as it signs, or to use the
+/// recovery phrase.
+pub fn approve_first<K: Asks>(
+    vault: &Mutex<Vault<Keys>>,
+    reason: impl FnOnce(&Vault<Keys>) -> Result<Option<String>>,
+    key: impl FnOnce(&Vault<Keys>, String) -> Result<Option<K>>,
+) -> Result<Option<K>> {
+    let key = {
+        let mut vault = vault.lock().expect("poisoned");
+        vault.refresh()?;
+        let Some(reason) = reason(&vault)? else {
+            return Ok(None);
+        };
+        let Some(key) = key(&vault, reason)? else {
+            return Ok(None);
+        };
+        key
+    };
+    key.ask()?;
+    Ok(Some(key))
+}
+
+/// This device's admin key, if the vault lists it, with `reason` for its dialog: the `key` for
+/// [`approve_first`].
+pub fn admin_key_for(
+    path: &Path,
+) -> impl FnOnce(&Vault<Keys>, String) -> Result<Option<AdminKey>> + '_ {
+    move |vault, reason| Ok(listed_admin_key(vault, path)?.map(|key| key.with_reason(reason)))
+}
+
+/// Whether an admin signs `request`, so [`approve_first`] has something to ask. The same requests
+/// as [`admin_reason`].
+pub fn signed_by_admin(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::CreateCollection { .. }
+            | Request::Revoke { .. }
+            | Request::SetScope { .. }
+            | Request::SetScopes { .. }
+    )
+}
+
+/// What the dialog says for `request` if an admin signs it, after the checks that come before
+/// asking: the `reason` for [`approve_first`].
+pub fn admin_reason(vault: &Vault<Keys>, request: &Request) -> Result<Option<String>> {
+    Ok(Some(match request {
+        Request::CreateCollection { name, .. } => new_collection(vault, name)?,
+        Request::Revoke { device, .. } => revoking(vault, *device),
+        Request::SetScope {
+            device,
+            collection,
+            scope,
+            ..
+        } => scope_change(vault, *device, collection, *scope)?.1,
+        Request::SetScopes {
+            device, changes, ..
+        } => scope_changes(vault, *device, changes)?.1,
+        _ => return Ok(None),
+    }))
 }
 
 /// A failure that the CLI answers by asking for the recovery phrase and trying again.
@@ -60,13 +144,34 @@ pub fn needs_recovery_phrase(error: &anyhow::Error) -> bool {
 
 /// Approves a join with `scopes`, signed like revoke: with this device's admin key, which asks
 /// for Touch ID, or with the recovery phrase (join.md, approval).
+/// `approved` is this device's admin key if [`approve_first`] already asked for it.
 pub fn approve_join(
     vault: &mut Vault<Keys>,
     admin_key: &Path,
+    approved: Option<&dyn AdminKeyTrait>,
     request: &JoinRequest,
     scopes: &[(String, Scope)],
     recovery_phrase: Option<&str>,
 ) -> Result<Approval> {
+    let (collections, reason) = joining(vault, request, scopes)?;
+    as_admin(
+        vault,
+        admin_key,
+        approved,
+        recovery_phrase,
+        "approving a device",
+        reason,
+        |vault, admin| vault.approve_join(request, &collections, &admin),
+    )
+}
+
+/// The collections a join is approved with, and what the dialog says, after the checks that come
+/// before asking.
+pub fn joining(
+    vault: &Vault<Keys>,
+    request: &JoinRequest,
+    scopes: &[(String, Scope)],
+) -> Result<(Vec<(CollectionId, Scope)>, String)> {
     if vault.membership().is_none() {
         bail!("this vault has no membership log yet; creating a collection starts it");
     }
@@ -78,14 +183,10 @@ pub fn approve_join(
         }
         collections.push((id, *scope));
     }
-    as_admin(
-        vault,
-        admin_key,
-        recovery_phrase,
-        "approving a device",
+    Ok((
+        collections,
         format!("add {} to your vault", request.name.name),
-        |vault, admin| vault.approve_join(request, &collections, &admin),
-    )
+    ))
 }
 
 fn run(cx: &mut Context, request: Request) -> Result<Response> {
@@ -105,6 +206,7 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
             create_collection(
                 vault,
                 cx.admin_key,
+                cx.admin,
                 &name,
                 recovery_phrase.as_ref().map(|phrase| phrase.as_str()),
             )?;
@@ -226,13 +328,14 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
             device,
             recovery_phrase,
         } => {
-            let name = device_name(vault, device);
+            let reason = revoking(vault, device);
             let revocation = as_admin(
                 vault,
                 cx.admin_key,
+                cx.admin,
                 recovery_phrase.as_deref().map(String::as_str),
                 "revoking a device",
-                format!("remove {name} from your vault"),
+                reason,
                 |vault, admin| vault.revoke_device(device, &admin),
             )?;
             revoked(vault, &revocation)?
@@ -243,21 +346,14 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
             scope,
             recovery_phrase,
         } => {
-            let id = vault.collection(&collection)?;
-            let name = device_name(vault, device);
-            // Checked before asking for Touch ID or 24 words.
-            if vault
-                .membership()
-                .is_some_and(|m| m.scope(device, id) == scope)
-            {
-                bail!("{name} already has that scope on {collection}");
-            }
+            let (id, reason) = scope_change(vault, device, &collection, scope)?;
             let change = as_admin(
                 vault,
                 cx.admin_key,
+                cx.admin,
                 recovery_phrase.as_deref().map(String::as_str),
                 "changing a scope",
-                format!("change what {name} may do with {collection}"),
+                reason,
                 |vault, admin| vault.set_scope(device, id, scope, &admin),
             )?;
             Response::ScopeSet {
@@ -310,36 +406,14 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
             changes,
             recovery_phrase,
         } => {
-            let name = device_name(vault, device);
-            let mut ids: Vec<(CollectionId, Scope, &str)> = Vec::with_capacity(changes.len());
-            for (collection, scope) in &changes {
-                let id = vault.collection(collection)?;
-                if ids.iter().any(|(other, ..)| *other == id) {
-                    bail!("{collection} is given more than one scope");
-                }
-                // Changes to the scope the device already has are skipped.
-                if vault
-                    .membership()
-                    .is_none_or(|m| m.scope(device, id) != *scope)
-                {
-                    ids.push((id, *scope, collection.as_str()));
-                }
-            }
-            // Checked before asking for Touch ID or 24 words.
-            if ids.is_empty() {
-                bail!("{name} already has those scopes");
-            }
-            let collections = ids
-                .iter()
-                .map(|(.., collection)| *collection)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let (ids, reason) = scope_changes(vault, device, &changes)?;
             let changed = as_admin(
                 vault,
                 cx.admin_key,
+                cx.admin,
                 recovery_phrase.as_deref().map(String::as_str),
                 "changing a scope",
-                format!("change what {name} may do with {collections}"),
+                reason,
                 |vault, admin| {
                     ids.iter()
                         .map(|(id, scope, _)| vault.set_scope(device, *id, *scope, &admin))
@@ -484,17 +558,23 @@ fn log_lines(vault: &Vault<Keys>, admin_key: &Path, from: u64, max: u16) -> Resu
         .collect())
 }
 
-/// Runs `f` with an admin signature: this device's admin key when it has one, which asks for
-/// Touch ID with `reason`, and otherwise the recovery key from `recovery_phrase`. Without a
-/// phrase it fails with [`RecoveryPhraseNeeded`] for `action`.
+/// Runs `f` with an admin signature: this device's admin key when it has one, which is
+/// `approved` if [`approve_first`] asked already and otherwise asks for Touch ID with `reason`,
+/// and the recovery key from `recovery_phrase` when it has none. Without a phrase it fails with
+/// [`RecoveryPhraseNeeded`] for `action`.
 fn as_admin<T>(
     vault: &mut Vault<Keys>,
     admin_key: &Path,
+    approved: Option<&dyn AdminKeyTrait>,
     recovery_phrase: Option<&str>,
     action: &'static str,
     reason: String,
     f: impl FnOnce(&mut Vault<Keys>, &dyn AdminKeyTrait) -> openvault_core::Result<T>,
 ) -> Result<T> {
+    // Listed when it was asked for; checked again, since the log may have changed since.
+    if let Some(admin) = approved.filter(|admin| is_admin(vault, admin)) {
+        return Ok(f(vault, admin)?);
+    }
     if let Some(admin) = listed_admin_key(vault, admin_key)? {
         return Ok(f(vault, &admin.with_reason(reason))?);
     }
@@ -534,22 +614,23 @@ fn revoked(vault: &Vault<Keys>, revocation: &Revocation) -> Result<Response> {
     })
 }
 
-/// Signs with this device's admin key when it has one, which asks for Touch ID, and with the
-/// recovery key otherwise. A vault from before the membership log starts it first.
+/// Signs with this device's admin key when it has one, `approved` or asking for Touch ID as
+/// [`as_admin`] does, and with the recovery key otherwise. A vault from before the membership log
+/// starts it first.
 fn create_collection(
     vault: &mut Vault<Keys>,
     admin_key: &Path,
+    approved: Option<&dyn AdminKeyTrait>,
     name: &str,
     recovery_phrase: Option<&str>,
 ) -> Result<()> {
-    names::check_collection(name)?;
-    // Checked before asking for Touch ID or 24 words.
-    if vault.collection(name).is_ok() {
-        bail!("collection {name} already exists");
+    let reason = new_collection(vault, name)?;
+    if let Some(admin) = approved.filter(|admin| is_admin(vault, admin)) {
+        vault.create_collection(name, &admin)?;
+        return Ok(());
     }
     if let Some(admin) = listed_admin_key(vault, admin_key)? {
-        let admin = admin.with_reason(format!("create the collection {name}"));
-        vault.create_collection(name, &admin)?;
+        vault.create_collection(name, &admin.with_reason(reason))?;
         return Ok(());
     }
     let phrase = recovery_phrase.ok_or(RecoveryPhraseNeeded("creating a collection"))?;
@@ -566,17 +647,88 @@ fn create_collection(
 
 /// This device's admin key, if it has one and the vault lists it as an admin.
 fn listed_admin_key(vault: &Vault<Keys>, path: &Path) -> Result<Option<AdminKey>> {
-    use openvault_core::membership::AdminKey as _;
-
     let key = match AdminKey::load(path) {
         Ok(key) => key,
         Err(openvault_keystore::Error::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e).context("can't load this device's admin key"),
     };
-    let listed = vault
+    Ok(is_admin(vault, &key).then_some(key))
+}
+
+/// Whether the vault lists `key` as an admin.
+fn is_admin(vault: &Vault<Keys>, key: &dyn AdminKeyTrait) -> bool {
+    vault
         .membership()
-        .is_some_and(|m| m.admins().contains(&key.verifying_key()));
-    Ok(listed.then_some(key))
+        .is_some_and(|m| m.admins().contains(&key.verifying_key()))
+}
+
+/// What the dialog says for creating the collection `name`, after the checks that come before
+/// asking for Touch ID or 24 words.
+fn new_collection(vault: &Vault<Keys>, name: &str) -> Result<String> {
+    names::check_collection(name)?;
+    if vault.collection(name).is_ok() {
+        bail!("collection {name} already exists");
+    }
+    Ok(format!("create the collection {name}"))
+}
+
+/// What the dialog says for revoking `device`.
+fn revoking(vault: &Vault<Keys>, device: DeviceId) -> String {
+    format!("remove {} from your vault", device_name(vault, device))
+}
+
+/// The collection a scope change is for and what the dialog says, after the checks that come
+/// before asking for Touch ID or 24 words.
+fn scope_change(
+    vault: &Vault<Keys>,
+    device: DeviceId,
+    collection: &str,
+    scope: Scope,
+) -> Result<(CollectionId, String)> {
+    let id = vault.collection(collection)?;
+    let name = device_name(vault, device);
+    if vault
+        .membership()
+        .is_some_and(|m| m.scope(device, id) == scope)
+    {
+        bail!("{name} already has that scope on {collection}");
+    }
+    Ok((id, format!("change what {name} may do with {collection}")))
+}
+
+/// A scope change to make: the collection, the new scope, and the collection's name.
+type ScopeChange<'c> = (CollectionId, Scope, &'c str);
+
+/// The scope changes to make and what the dialog says, after the checks that come before asking
+/// for Touch ID or 24 words. Changes to the scope the device already has are left out.
+fn scope_changes<'c>(
+    vault: &Vault<Keys>,
+    device: DeviceId,
+    changes: &'c [(String, Scope)],
+) -> Result<(Vec<ScopeChange<'c>>, String)> {
+    let name = device_name(vault, device);
+    let mut ids: Vec<ScopeChange> = Vec::with_capacity(changes.len());
+    for (collection, scope) in changes {
+        let id = vault.collection(collection)?;
+        if ids.iter().any(|(other, ..)| *other == id) {
+            bail!("{collection} is given more than one scope");
+        }
+        if vault
+            .membership()
+            .is_none_or(|m| m.scope(device, id) != *scope)
+        {
+            ids.push((id, *scope, collection.as_str()));
+        }
+    }
+    if ids.is_empty() {
+        bail!("{name} already has those scopes");
+    }
+    let collections = ids
+        .iter()
+        .map(|(.., collection)| *collection)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok((ids, format!("change what {name} may do with {collections}")))
 }
 
 /// The log's devices, this one first, then by name.
@@ -626,5 +778,204 @@ pub fn unexpected(response: &Response) -> anyhow::Error {
     match response {
         Response::Error { message, .. } => anyhow!("{message}"),
         other => anyhow!("unexpected response from the service: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    use openvault_crypto::{Signature, SignatureContext, SigningKey, VerifyingKey};
+    use openvault_keystore::Backend;
+
+    use super::*;
+
+    /// An admin key that asks like the Secure Enclave's: `ask`, or else its first signature, waits
+    /// for the user, who here is the test.
+    struct Asking {
+        key: SigningKey,
+        approved: AtomicBool,
+        prompts: AtomicUsize,
+        /// Told when the key starts asking.
+        asking: Mutex<mpsc::Sender<()>>,
+        /// The user's answer.
+        answer: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Asking {
+        fn wait_for_user(&self) {
+            if !self.approved.load(Ordering::SeqCst) {
+                self.prompts.fetch_add(1, Ordering::SeqCst);
+                self.asking.lock().unwrap().send(()).unwrap();
+                self.answer.lock().unwrap().recv().unwrap();
+                self.approved.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl AdminKeyTrait for Asking {
+        fn verifying_key(&self) -> VerifyingKey {
+            self.key.verifying_key()
+        }
+
+        fn sign(
+            &self,
+            context: SignatureContext,
+            message: &[u8],
+        ) -> openvault_core::Result<Signature> {
+            self.wait_for_user();
+            Ok(self.key.sign(context, message))
+        }
+    }
+
+    impl Asks for Asking {
+        fn ask(&self) -> Result<()> {
+            self.wait_for_user();
+            Ok(())
+        }
+    }
+
+    impl Asks for &Asking {
+        fn ask(&self) -> Result<()> {
+            (**self).ask()
+        }
+    }
+
+    struct Setup {
+        _dir: tempfile::TempDir,
+        vault: Arc<Mutex<Vault<Keys>>>,
+        admin_key: std::path::PathBuf,
+        key: Asking,
+        asking: mpsc::Receiver<()>,
+        answer: mpsc::Sender<()>,
+        recovery: RecoveryKey,
+    }
+
+    /// A vault whose admins are the recovery key and an [`Asking`] key.
+    fn setup() -> Setup {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Keys::create(&dir.path().join("keys"), Backend::Software).unwrap();
+        let key = SigningKey::generate_p256();
+        let recovery = RecoveryKey::generate();
+        let vault = Vault::create(
+            &dir.path().join("vault"),
+            keys,
+            &recovery,
+            "Mac",
+            Some(key.verifying_key()),
+        )
+        .unwrap();
+        let (tell, asking) = mpsc::channel();
+        let (answer, answers) = mpsc::channel();
+        Setup {
+            admin_key: dir.path().join("no admin key file"),
+            _dir: dir,
+            vault: Arc::new(Mutex::new(vault)),
+            key: Asking {
+                key,
+                approved: AtomicBool::new(false),
+                prompts: AtomicUsize::new(0),
+                asking: Mutex::new(tell),
+                answer: Mutex::new(answers),
+            },
+            asking,
+            answer,
+            recovery,
+        }
+    }
+
+    /// Runs `request` as the service does (server.rs, `answer`), with `key` as this device's
+    /// admin key.
+    fn answer(
+        vault: &Mutex<Vault<Keys>>,
+        admin_key: &Path,
+        key: Asking,
+        request: Request,
+    ) -> (Response, Asking) {
+        let approved = match approve_first(
+            vault,
+            |vault| admin_reason(vault, &request),
+            |_, _| Ok(Some(key)),
+        ) {
+            Ok(approved) => approved.expect("an admin signs it"),
+            Err(error) => panic!("{error:#}"),
+        };
+        let mut vault = vault.lock().unwrap();
+        let response = handle(
+            &mut Context {
+                vault: &mut vault,
+                admin_key,
+                admin: Some(&approved),
+                visible: None,
+            },
+            request,
+        );
+        (response, approved)
+    }
+
+    #[test]
+    fn touch_id_is_asked_for_with_the_vault_unlocked() {
+        let s = setup();
+        let request = Request::CreateCollection {
+            name: "documents".to_owned(),
+            recovery_phrase: None,
+        };
+        let running = {
+            let vault = s.vault.clone();
+            let admin_key = s.admin_key.clone();
+            std::thread::spawn(move || answer(&vault, &admin_key, s.key, request))
+        };
+        s.asking
+            .recv_timeout(Duration::from_secs(10))
+            .expect("asks for Touch ID");
+
+        // While the dialog is open, sync sessions and other requests still get the vault.
+        let mut vault = s
+            .vault
+            .try_lock()
+            .expect("the vault is unlocked while Touch ID asks");
+        let listed = handle(
+            &mut Context {
+                vault: &mut vault,
+                admin_key: &s.admin_key,
+                admin: None,
+                visible: None,
+            },
+            Request::Collections,
+        );
+        assert!(matches!(listed, Response::Names(names) if names.is_empty()));
+        drop(vault);
+
+        s.answer.send(()).unwrap();
+        let (response, key) = running.join().unwrap();
+        assert!(matches!(response, Response::Done), "{response:?}");
+        assert_eq!(key.prompts.load(Ordering::SeqCst), 1, "asked once");
+        assert!(s.vault.lock().unwrap().collection("documents").is_ok());
+    }
+
+    #[test]
+    fn a_request_that_fails_its_checks_asks_for_nothing() {
+        let s = setup();
+        s.vault
+            .lock()
+            .unwrap()
+            .create_collection("documents", &s.recovery.admin_signing_key())
+            .unwrap();
+        let request = Request::CreateCollection {
+            name: "documents".to_owned(),
+            recovery_phrase: None,
+        };
+        let Err(error) = approve_first(
+            &s.vault,
+            |vault| admin_reason(vault, &request),
+            |_, _| Ok(Some(&s.key)),
+        ) else {
+            panic!("a collection that exists is created again");
+        };
+        assert_eq!(error.to_string(), "collection documents already exists");
+        assert_eq!(s.key.prompts.load(Ordering::SeqCst), 0);
+        assert!(s.asking.try_recv().is_err());
     }
 }

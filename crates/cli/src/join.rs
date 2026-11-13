@@ -159,11 +159,11 @@ fn approve_with(
             request.name.name
         );
     }
-    let approval = match handler::approve_join(vault, &home.admin(), &request, &named, None) {
+    let approval = match handler::approve_join(vault, &home.admin(), None, &request, &named, None) {
         Err(error) if handler::needs_recovery_phrase(&error) => {
             recovery_phrase_note();
             let phrase = read_recovery_phrase()?;
-            handler::approve_join(vault, &home.admin(), &request, &named, Some(&phrase))
+            handler::approve_join(vault, &home.admin(), None, &request, &named, Some(&phrase))
         }
         approval => approval,
     };

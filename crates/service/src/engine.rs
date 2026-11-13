@@ -1,8 +1,8 @@
 //! Running sync sessions (sync.md, when devices sync): one at a time with each visible member,
 //! started when it becomes visible, after a local write to a set it shares, and after the log
-//! changes. There are no timers besides the retries of sessions that failed. With a coordinator
-//! configured, members are dialed through the grandfather's relay as well as directly
-//! (coordinator.md, devices).
+//! grows, whether from a local change, a session or the coordinator. There are no timers besides
+//! the retries of sessions that failed. With a coordinator configured, members are dialed through
+//! the grandfather's relay as well as directly (coordinator.md, devices).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use openvault_core::sets::SetId;
 use openvault_core::{DeviceId, Vault};
 use openvault_keystore::Keys;
-use openvault_net::sync::{self, Notice, Outcome, Role, SyncError};
+use openvault_net::sync::{self, Notice, Outcome, Report, Role, SyncError};
 use openvault_net::{EndpointAddr, EndpointId, EndpointKey, Node, RelayUrl};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::AbortHandle;
@@ -90,7 +90,7 @@ impl Engine {
         }
         let (notices, receive) = mpsc::channel(32);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (quiet, on_quiet) = self.quiet_flag();
+        let (quiet, reports) = self.reports();
         let engine = self.clone();
         let task = tokio::spawn(async move {
             let result = match EndpointId::from_bytes(&peer) {
@@ -107,7 +107,7 @@ impl Engine {
                             engine.vault.clone(),
                             receive,
                             sync::IDLE,
-                            on_quiet,
+                            reports,
                         )
                         .await
                     }
@@ -145,7 +145,7 @@ impl Engine {
         }
         let (notices, receive) = mpsc::channel(32);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (quiet, on_quiet) = self.quiet_flag();
+        let (quiet, reports) = self.reports();
         let engine = self.clone();
         let task = tokio::spawn(async move {
             let result = sync::run(
@@ -154,7 +154,7 @@ impl Engine {
                 engine.vault.clone(),
                 receive,
                 sync::IDLE,
-                on_quiet,
+                reports,
             )
             .await;
             engine.finished(peer, id, result);
@@ -197,7 +197,10 @@ impl Engine {
         }
     }
 
-    /// Entries from the coordinator grew the log: every visible member hears of them.
+    /// Entries from the coordinator or a session grew the log: running sessions and every visible
+    /// member hear of them. The session that took them has sent its peer the new head already,
+    /// so the notice changes nothing there. The coordinator isn't told: the device that made the
+    /// entries tells it, and the rest exchange with it every 15 minutes (coordinator.md).
     pub(crate) fn log_grew(self: &Arc<Self>) {
         self.notify(Notice::Log);
         for peer in self.visible_members() {
@@ -254,19 +257,26 @@ impl Engine {
             .collect()
     }
 
-    /// A new session's quiet flag, and what its session calls when it goes quiet or has work
-    /// again: watching apps hear of each change (service.md, peers).
-    fn quiet_flag(self: &Arc<Self>) -> (Arc<AtomicBool>, impl FnMut(bool) + Send + 'static) {
+    /// A new session's quiet flag, and what hears its session's reports. When the session goes
+    /// quiet or has work again, watching apps hear of it (service.md, peers).
+    fn reports(self: &Arc<Self>) -> (Arc<AtomicBool>, impl FnMut(Report) + Send + 'static) {
         let quiet = Arc::new(AtomicBool::new(false));
         let flag = quiet.clone();
         let engine = Arc::downgrade(self);
-        (quiet, move |now| {
-            flag.store(now, Ordering::Relaxed);
-            if let Some(engine) = engine.upgrade() {
-                engine.emit(Event::DEVICES);
-                // Caught up: whatever records came are in the store.
-                if now {
-                    engine.fetcher.synced();
+        (quiet, move |report| match report {
+            Report::Quiet(now) => {
+                flag.store(now, Ordering::Relaxed);
+                if let Some(engine) = engine.upgrade() {
+                    engine.emit(Event::DEVICES);
+                    // Caught up: whatever records came are in the store.
+                    if now {
+                        engine.fetcher.synced();
+                    }
+                }
+            }
+            Report::Log => {
+                if let Some(engine) = engine.upgrade() {
+                    engine.log_grew();
                 }
             }
         })
@@ -428,7 +438,196 @@ fn counts(log_entries: usize, items: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use openvault_core::join::JoinRequest;
+    use openvault_core::membership::{DeviceName, Scope};
+    use openvault_core::{CollectionId, SoftwareKeys, transport_seed};
+    use openvault_crypto::RecoveryKey;
+    use openvault_net::Options;
+
     use super::*;
+
+    type Store = Mutex<Vault<Keys>>;
+
+    /// A device joined to `admin`'s vault at `path` with `scopes`, and its transport seed.
+    fn join(
+        admin: &mut Vault<Keys>,
+        recovery: &RecoveryKey,
+        path: &Path,
+        name: &str,
+        scopes: &[(CollectionId, Scope)],
+    ) -> (Vault<Keys>, zeroize::Zeroizing<[u8; 32]>) {
+        let keys = SoftwareKeys::generate();
+        let seed = transport_seed(&keys);
+        let device = DeviceId::random();
+        let name = DeviceName {
+            platform: "linux".into(),
+            name: name.into(),
+        };
+        let request = JoinRequest::sign(&[1; 32], device, &keys, name.clone()).unwrap();
+        let approval = admin
+            .approve_join(&request, scopes, &recovery.admin_signing_key())
+            .unwrap();
+        let head = admin.membership().unwrap().head();
+        let joined = Vault::join(
+            path,
+            Keys::Software(keys),
+            device,
+            &name,
+            head,
+            &approval.log,
+            &approval.grants,
+        )
+        .unwrap();
+        (joined, seed)
+    }
+
+    /// Options under an mDNS service name for this test process alone, so its nodes meet only
+    /// each other, and no real device on the network sees them (service.md, finding devices).
+    fn test_options() -> Options {
+        Options {
+            mdns_service: format!("ovt-{:x}", std::process::id()),
+            ..Options::default()
+        }
+    }
+
+    /// A session `store` opens with the endpoint `to`, and what it reports.
+    async fn open(
+        node: &Node,
+        store: &Arc<Store>,
+        to: EndpointKey,
+    ) -> (
+        mpsc::Sender<Notice>,
+        mpsc::UnboundedReceiver<Report>,
+        tokio::task::JoinHandle<Result<Outcome, SyncError>>,
+    ) {
+        let to = EndpointId::from_bytes(&to).unwrap();
+        let connection = node.endpoint().connect(to, sync::ALPN).await.unwrap();
+        let (notices, receive) = mpsc::channel(8);
+        let (heard_tx, heard) = mpsc::unbounded_channel();
+        let session = tokio::spawn(sync::run(
+            connection,
+            Role::Opener,
+            store.clone(),
+            receive,
+            Duration::from_secs(20),
+            move |report| {
+                let _ = heard_tx.send(report);
+            },
+        ));
+        (notices, heard, session)
+    }
+
+    /// Whether `heard` hears `report` within 10 seconds.
+    async fn hears(heard: &mut mpsc::UnboundedReceiver<Report>, report: Report) -> bool {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(next) = heard.recv().await {
+                if next == report {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Log entries the mini takes in its session with the MacBook reach the desktop through the
+    /// mini's session with it, which was already running and had caught up. The MacBook has no
+    /// session with the desktop. Before 0.5.7 nothing passed them on, so the desktop heard of a
+    /// scope change only once something else started a session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn entries_one_session_takes_reach_the_devices_other_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery = RecoveryKey::generate();
+        let admin_keys = SoftwareKeys::generate();
+        let admin_seed = transport_seed(&admin_keys);
+        let mut admin = Vault::create(
+            &dir.path().join("macbook.db"),
+            Keys::Software(admin_keys),
+            &recovery,
+            "MacBook",
+            None,
+        )
+        .unwrap();
+        let latem = admin
+            .create_collection("latem", &recovery.admin_signing_key())
+            .unwrap();
+        let ssh = admin
+            .create_collection("ssh", &recovery.admin_signing_key())
+            .unwrap();
+        let read_latem = [(latem, Scope::Read)];
+        let (mut mini, mini_seed) = join(
+            &mut admin,
+            &recovery,
+            &dir.path().join("mini.db"),
+            "Mac mini",
+            &read_latem,
+        );
+        let (desktop, desktop_seed) = join(
+            &mut admin,
+            &recovery,
+            &dir.path().join("desktop.db"),
+            "Desktop",
+            &read_latem,
+        );
+        // All three level, with the desktop's join, before any session.
+        let behind = mini.membership().unwrap().head().0;
+        mini.append_log(&admin.log_from(behind + 1, 64).unwrap())
+            .unwrap();
+        let desktop_id = desktop.device_id();
+        let admin = Arc::new(Mutex::new(admin));
+        let mini = Arc::new(Mutex::new(mini));
+        let desktop = Arc::new(Mutex::new(desktop));
+
+        // The mini runs an engine and takes sessions; the other two only open them.
+        let options = Options {
+            alpns: vec![sync::ALPN.to_vec()],
+            ..test_options()
+        };
+        let mini_node = Arc::new(Node::start(&mini_seed, options).await.unwrap().0);
+        let events = broadcast::channel(8).0;
+        let fetcher = Fetcher::new(mini_node.clone(), mini.clone(), None, events.clone());
+        let engine = Engine::new(mini_node.clone(), mini.clone(), None, events, fetcher);
+        let accepting = {
+            let (node, engine) = (mini_node.clone(), engine.clone());
+            tokio::spawn(async move {
+                while let Some(incoming) = node.endpoint().accept().await {
+                    if let Ok(connection) = incoming.await {
+                        engine.accept(connection);
+                    }
+                }
+            })
+        };
+        let admin_node = Node::start(&admin_seed, test_options()).await.unwrap().0;
+        let desktop_node = Node::start(&desktop_seed, test_options()).await.unwrap().0;
+
+        let (_desktop_notices, mut desktop_heard, _desktop_session) =
+            open(&desktop_node, &desktop, mini_node.id()).await;
+        assert!(hears(&mut desktop_heard, Report::Quiet(true)).await);
+        let (admin_notices, mut admin_heard, _admin_session) =
+            open(&admin_node, &admin, mini_node.id()).await;
+        assert!(hears(&mut admin_heard, Report::Quiet(true)).await);
+
+        // A scope change on the MacBook reaches the mini in their session.
+        admin
+            .lock()
+            .unwrap()
+            .set_scope(desktop_id, ssh, Scope::Read, &recovery.admin_signing_key())
+            .unwrap();
+        admin_notices.send(Notice::Log).await.unwrap();
+
+        assert!(
+            hears(&mut desktop_heard, Report::Log).await,
+            "the desktop took the entries from the mini"
+        );
+        assert_eq!(
+            desktop.lock().unwrap().membership().unwrap().head(),
+            admin.lock().unwrap().membership().unwrap().head()
+        );
+        accepting.abort();
+    }
 
     #[test]
     fn outcomes_read_as_sentences() {

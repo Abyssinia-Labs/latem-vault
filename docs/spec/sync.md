@@ -59,11 +59,14 @@ There are no timers and no periodic scans.
 **Starting a session.** A device starts one with a peer:
 - when mDNS shows a member that wasn't visible before, which includes every member visible when it starts;
 - after a local write, with every visible member that shares the collection;
-- after appending a log entry, with every visible member.
+- after its log grows, with every visible member. The entries may be its own, the coordinator's (coordinator.md), or taken from a peer in a session. Only entries the device didn't have count, so passing them on stops at devices that have them.
 
 `openvault service` starts them (service.md). A write made through the service is a local write. So is a log entry `approve` appends, which it reports to the service with a changed request.
 
 **During a session.** After a local write, a device sends the changed set's root at once (roots), and the opener reconciles that set again; the new records follow as items. A device announces a new log head by sending hello again. That costs one extra round trip compared with pushing the records themselves, and sends nothing a reconciliation wouldn't.
+- Every running session announces it, whatever brought the entries: a local change, the coordinator, or another session.
+- A session that has already sent that head sends nothing, as the session that took the entries does when it hears of them. Its roots started over when it sent it. Starting them over again would drop roots the peer has sent since, and the opener wouldn't reconcile again in that session.
+- Before 0.5.7, entries a session took reached neither the device's other running sessions nor its other visible members. They waited until something else started a session: a write, mDNS seeing a device again, or a session closing and a later one starting. A second notice of the same head also started the roots over.
 
 **Retries.**
 - If a session with a visible peer fails, the device logs why and retries after 30 seconds, doubling up to an hour.
@@ -80,7 +83,7 @@ There are no timers and no periodic scans.
 
 The session then idles until it closes or more work arrives.
 
-**After a log change.** When a device's log grows during a session, from a local change or from entries the peer sent, it sends hello again and the session goes back through steps 2 to 5. The peer's membership is checked again, both sides send their roots again, and the opener reconciles every set whose roots differ, since records dropped before may pass now (dropped records).
+**After a log change.** When a device's log grows during a session, from a local change, from entries the peer sent, or from entries another session or the coordinator brought (during a session, above), it sends hello again and the session goes back through steps 2 to 5. It does this once per new head. The peer's membership is checked again, both sides send their roots again, and the opener reconciles every set whose roots differ, since records dropped before may pass now (dropped records).
 - Until the logs are level again, the peer may still be answering under the older log, so the two can disagree on what they share. A reconcile, want or items message is therefore checked against the device's current log, not the roots. It is answered or taken only if the device shares the set with the peer now.
 - A message about a set the device doesn't share is ignored: not answered, not stored, and the session goes on. The peer may not yet have heard that the set was taken away.
 - A peer that the change revoked ends the session with "not a member" at its next such message, or once the logs are level.
@@ -270,11 +273,12 @@ The device doing this makes the new keys and signs the grants, so it must be abl
 | Session with nothing to do | Hello (61 bytes each way, framing included), plus roots: 41 bytes and one database read per shared set. Under 2 KB for 20 collections. |
 | After a local write | One session per visible peer that shares the collection: a hello, the roots, then the record itself (about 1 KB for a secret). |
 | After a log change | In each running session: a hello each way, one log request per 64 new entries, then the roots again as for a session with nothing to do, and a reconcile of each set whose roots differ. |
+| After log entries from a peer | As after a log change, in each of the device's other running sessions, and a session with each visible member that has none. A peer that already has the entries costs a session with nothing to do. Each device passes a batch of entries on once, when they are new to it, and nothing runs on a timer. |
 | Reconciling a set that differs | About log₁₆ n rounds. Each round reads at most the set's n ids from the local index; n is in the thousands for secrets and variables. Each message about a set also looks up the peer's membership and the shared sets, which are in memory, so no database read. |
 | Retries | Only to visible peers, from 30 seconds doubling to an hour. |
 
 **What to watch once it runs:**
-- Sessions per device per hour. They should follow writes and network changes, not the clock.
+- Sessions per device per hour. They should follow writes, log changes and network changes, not the clock. A log change should start at most one session between each pair of visible devices.
 - Bytes per session.
 - Retries per peer.
 

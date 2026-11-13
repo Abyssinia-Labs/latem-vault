@@ -2,8 +2,10 @@
 //! members exchange hellos, bring their logs level, then reconcile every set they share.
 //!
 //! A session runs until 60 seconds pass without a message. While it runs, the device tells it of
-//! local writes and log changes through [`Notice`]s, so they reach the peer straight away. It
-//! counts as quiet once 2 seconds pass without a message: caught up, and only waiting.
+//! local writes and log changes through [`Notice`]s, so they reach the peer straight away, and
+//! the session tells the device through [`Report`]s when it goes quiet and when it took log
+//! entries the device didn't have. It counts as quiet once 2 seconds pass without a message:
+//! caught up, and only waiting.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -72,6 +74,18 @@ pub enum Notice {
     /// A local write changed this set.
     Changed(SetId),
     /// The log has new entries.
+    Log,
+}
+
+/// What a running session tells the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Report {
+    /// `true` when the session has gone [`QUIET`] without a message: caught up, and only
+    /// waiting. `false` when a message comes after that.
+    Quiet(bool),
+    /// The session took log entries this device didn't have. The device's other sessions and
+    /// visible members should hear of them (sync.md, when devices sync). Entries it already had
+    /// aren't reported, so passing them on stops at devices that have them.
     Log,
 }
 
@@ -151,6 +165,8 @@ struct Session<S: SyncStore> {
     peer_endpoint: EndpointKey,
     vault: VaultId,
     peer_head: Option<(u64, Hash)>,
+    /// The head in the last hello this device sent. The roots started over when it was sent.
+    announced: Option<(u64, Hash)>,
     /// Set once the logs are level and the peer is known to be a member.
     peer: Option<DeviceId>,
     shared: Vec<SetId>,
@@ -162,22 +178,25 @@ struct Session<S: SyncStore> {
     peer_roots: HashMap<SetId, (u64, Fingerprint)>,
     reconciled: HashSet<SetId>,
     log_requested: bool,
+    /// Set when the last message brought log entries this device didn't have, until the device
+    /// hears of them ([`Report::Log`]).
+    log_grew: bool,
     outcome: Outcome,
 }
 
 /// Runs a session on `connection` until `idle` passes without a message ([`IDLE`] outside
-/// tests), the peer closes it, or it fails. `quiet` hears `true` each time the session goes
-/// [`QUIET`] without a message, and `false` when a message comes after that. A session starts
-/// with work to do.
+/// tests), the peer closes it, or it fails. `report` hears [`Report::Quiet`] each time the
+/// session goes quiet or has work again, and [`Report::Log`] each time it took log entries this
+/// device didn't have. A session starts with work to do.
 pub async fn run<S: SyncStore>(
     connection: Connection,
     role: Role,
     store: Arc<S>,
     mut notices: mpsc::Receiver<Notice>,
     idle: Duration,
-    mut quiet: impl FnMut(bool) + Send,
+    mut report: impl FnMut(Report) + Send,
 ) -> Result<Outcome, SyncError> {
-    let result = session(&connection, role, store, &mut notices, idle, &mut quiet).await;
+    let result = session(&connection, role, store, &mut notices, idle, &mut report).await;
     let duplicate = matches!(
         connection.close_reason(),
         Some(ConnectionError::ApplicationClosed(close)) if u64::from(close.error_code) == u64::from(DUPLICATE)
@@ -201,7 +220,7 @@ async fn session<S: SyncStore>(
     store: Arc<S>,
     notices: &mut mpsc::Receiver<Notice>,
     idle: Duration,
-    quiet: &mut (impl FnMut(bool) + Send),
+    report: &mut (impl FnMut(Report) + Send),
 ) -> Result<Outcome, SyncError> {
     let peer_endpoint = *connection.remote_id().as_bytes();
     let (send, recv) = match role {
@@ -217,6 +236,7 @@ async fn session<S: SyncStore>(
         peer_endpoint,
         vault,
         peer_head: None,
+        announced: None,
         peer: None,
         shared: Vec::new(),
         roots_sent: false,
@@ -224,9 +244,10 @@ async fn session<S: SyncStore>(
         peer_roots: HashMap::new(),
         reconciled: HashSet::new(),
         log_requested: false,
+        log_grew: false,
         outcome: Outcome::default(),
     };
-    let result = session.drive(recv, notices, idle, quiet).await;
+    let result = session.drive(recv, notices, idle, report).await;
     if let Err(error) = &result {
         if let Some(reason) = error.reason() {
             frame::send_error(&mut session.send, reason, &error.to_string()).await;
@@ -243,9 +264,10 @@ impl<S: SyncStore> Session<S> {
         recv: RecvStream,
         notices: &mut mpsc::Receiver<Notice>,
         idle: Duration,
-        quiet: &mut (impl FnMut(bool) + Send),
+        report: &mut (impl FnMut(Report) + Send),
     ) -> Result<(), SyncError> {
-        self.send_hello().await?;
+        let head = self.head()?;
+        self.send_hello(head).await?;
         // One read stays in flight across the loop. `select!` drops the branches it doesn't take,
         // and a read dropped part way through a message would lose the bytes it had read.
         let mut reading = Box::pin(next_message(recv));
@@ -266,9 +288,15 @@ impl<S: SyncStore> Session<S> {
                     reading.set(next_message(recv));
                     deadline = Instant::now() + idle;
                     if quiet_at.replace(Instant::now() + QUIET).is_none() {
-                        quiet(false);
+                        report(Report::Quiet(false));
                     }
-                    if let Err(error) = self.handle(kind, &body).await {
+                    let handled = self.handle(kind, &body).await;
+                    // Entries the device took are passed on even if the session then ends, as
+                    // it does when they revoked the peer.
+                    if std::mem::take(&mut self.log_grew) {
+                        report(Report::Log);
+                    }
+                    if let Err(error) = handled {
                         return Err(peer_reason(&mut reading, error).await);
                     }
                 }
@@ -276,7 +304,7 @@ impl<S: SyncStore> Session<S> {
                     match self.notice(notice).await {
                         Ok(sent) => {
                             if sent && quiet_at.replace(Instant::now() + QUIET).is_none() {
-                                quiet(false);
+                                report(Report::Quiet(false));
                             }
                         }
                         Err(error) => return Err(peer_reason(&mut reading, error).await),
@@ -284,7 +312,7 @@ impl<S: SyncStore> Session<S> {
                 }
                 () = sleep_until(quiet_at.unwrap_or(deadline)), if quiet_at.is_some() => {
                     quiet_at = None;
-                    quiet(true);
+                    report(Report::Quiet(true));
                 }
                 () = sleep_until(deadline) => return Ok(()),
             }
@@ -325,9 +353,11 @@ impl<S: SyncStore> Session<S> {
                 }
                 let new = blocking(|| self.store.append_log(&entries))?;
                 if new > 0 {
+                    self.log_grew = true;
                     // The log changed, so what the devices share may have: start the roots over.
                     self.reset_roots();
-                    self.send_hello().await?;
+                    let head = self.head()?;
+                    self.send_hello(head).await?;
                 }
                 self.progress().await
             }
@@ -467,8 +497,16 @@ impl<S: SyncStore> Session<S> {
     async fn notice(&mut self, notice: Notice) -> Result<bool, SyncError> {
         match notice {
             Notice::Log => {
+                let head = self.head()?;
+                // This session sent the peer this head already, and its roots started over
+                // then. Starting them over again would drop roots the peer has sent since, and
+                // the opener wouldn't reconcile again (sync.md, during a session). The session
+                // that took the entries hears of them this way too.
+                if self.announced == Some(head) {
+                    return Ok(false);
+                }
                 self.reset_roots();
-                self.send_hello().await?;
+                self.send_hello(head).await?;
                 self.progress().await?;
                 Ok(true)
             }
@@ -553,9 +591,15 @@ impl<S: SyncStore> Session<S> {
         Ok(())
     }
 
-    async fn send_hello(&mut self) -> Result<(), SyncError> {
-        let (vault, seq, hash) = blocking(|| self.store.hello())?;
-        frame::write(&mut self.send, HELLO, &wire::hello(vault, seq, &hash)).await?;
+    /// This device's log head now.
+    fn head(&self) -> Result<(u64, Hash), SyncError> {
+        let (_, seq, hash) = blocking(|| self.store.hello())?;
+        Ok((seq, hash))
+    }
+
+    async fn send_hello(&mut self, (seq, hash): (u64, Hash)) -> Result<(), SyncError> {
+        frame::write(&mut self.send, HELLO, &wire::hello(self.vault, seq, &hash)).await?;
+        self.announced = Some((seq, hash));
         Ok(())
     }
 
@@ -1142,8 +1186,10 @@ pub(crate) mod session_tests {
             p.admin.clone(),
             open_rx,
             idle,
-            move |quiet| {
-                let _ = heard_tx.send(quiet);
+            move |report| {
+                if let Report::Quiet(quiet) = report {
+                    let _ = heard_tx.send(quiet);
+                }
             },
         ));
 
@@ -1174,6 +1220,147 @@ pub(crate) mod session_tests {
         opening.await.unwrap().unwrap();
         accepting.await.unwrap().unwrap();
         assert_eq!(heard.recv().await, None, "nothing after the last quiet");
+    }
+
+    /// A log notice for a head the session has sent already changes nothing, as when the session
+    /// that took the entries hears of them from the device. Before 0.5.7 it started the roots
+    /// over: the joined device's roots, which had come, were dropped, so the admin, which opened
+    /// the session, didn't reconcile its next write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_log_notice_for_a_head_already_sent_changes_nothing() {
+        let p = pair(1).await;
+        // Long enough to go quiet after the notices even if the joined device answers nothing.
+        let idle = Duration::from_secs(6);
+        let (accept_tx, accept_rx) = mpsc::channel(8);
+        let accept_store = p.joined.clone();
+        let endpoint = p.joined_node.endpoint().clone();
+        let accepting = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            run(
+                connection,
+                Role::Accepter,
+                accept_store,
+                accept_rx,
+                idle,
+                |_| {},
+            )
+            .await
+        });
+        let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
+        let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+        let (open_tx, open_rx) = mpsc::channel(8);
+        let (heard_tx, mut heard) = mpsc::unbounded_channel();
+        let opening = tokio::spawn(run(
+            connection,
+            Role::Opener,
+            p.admin.clone(),
+            open_rx,
+            idle,
+            move |report| {
+                let _ = heard_tx.send(report);
+            },
+        ));
+        // Caught up, so each side has the other's roots.
+        assert_eq!(heard.recv().await, Some(Report::Quiet(true)));
+
+        open_tx.send(Notice::Log).await.unwrap();
+        p.admin
+            .lock()
+            .unwrap()
+            .set(p.latem, "prod/LATER", Kind::Var, b"later")
+            .unwrap();
+        open_tx
+            .send(Notice::Changed(SetId::records(p.latem)))
+            .await
+            .unwrap();
+        // Only the write wakes the session.
+        assert_eq!(heard.recv().await, Some(Report::Quiet(false)));
+        assert_eq!(heard.recv().await, Some(Report::Quiet(true)));
+        assert_eq!(
+            p.joined.lock().unwrap().list(p.latem).unwrap().len(),
+            2,
+            "the write reached the joined device"
+        );
+
+        drop((open_tx, accept_tx));
+        opening.await.unwrap().unwrap();
+        accepting.await.unwrap().unwrap();
+        assert_eq!(heard.recv().await, None, "no log entries came");
+    }
+
+    /// The side that takes log entries it didn't have reports them, once per message that
+    /// brought some. The side that sent them, and a later session with nothing new, report none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_reports_log_entries_new_to_the_device() {
+        let p = pair(0).await;
+        let ssh = p.admin.lock().unwrap().collection("ssh").unwrap();
+        let joined_device = p.joined.lock().unwrap().device_id();
+        p.admin
+            .lock()
+            .unwrap()
+            .set_scope(
+                joined_device,
+                ssh,
+                Scope::Read,
+                &p.recovery.admin_signing_key(),
+            )
+            .unwrap();
+        for round in 0..2 {
+            let (accept_tx, accept_rx) = mpsc::channel(8);
+            let accept_store = p.joined.clone();
+            let endpoint = p.joined_node.endpoint().clone();
+            let (joined_tx, mut joined_heard) = mpsc::unbounded_channel();
+            let accepting = tokio::spawn(async move {
+                let connection = endpoint.accept().await.unwrap().await.unwrap();
+                run(
+                    connection,
+                    Role::Accepter,
+                    accept_store,
+                    accept_rx,
+                    Duration::from_secs(2),
+                    move |report| {
+                        let _ = joined_tx.send(report);
+                    },
+                )
+                .await
+            });
+            let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
+            let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+            let (open_tx, open_rx) = mpsc::channel(8);
+            let (admin_tx, mut admin_heard) = mpsc::unbounded_channel();
+            let opened = run(
+                connection,
+                Role::Opener,
+                p.admin.clone(),
+                open_rx,
+                Duration::from_secs(2),
+                move |report| {
+                    let _ = admin_tx.send(report);
+                },
+            )
+            .await
+            .unwrap();
+            drop((open_tx, accept_tx));
+            let accepted = accepting.await.unwrap().unwrap();
+            let logs = |heard: &mut mpsc::UnboundedReceiver<Report>| {
+                std::iter::from_fn(|| heard.try_recv().ok())
+                    .filter(|report| *report == Report::Log)
+                    .count()
+            };
+            assert_eq!(logs(&mut admin_heard), 0, "round {round}");
+            if round == 0 {
+                assert!(accepted.log_received > 0, "{accepted:?}");
+                assert_eq!(opened.log_sent, accepted.log_received);
+                assert_eq!(logs(&mut joined_heard), 1, "one message of entries");
+            } else {
+                assert_eq!(accepted.log_received, 0, "{accepted:?}");
+                assert_eq!(logs(&mut joined_heard), 0, "nothing new");
+            }
+        }
+        assert_eq!(
+            p.joined.lock().unwrap().membership().unwrap().head(),
+            p.admin.lock().unwrap().membership().unwrap().head()
+        );
     }
 
     /// A session ends once both sides know the peer was revoked, even when the revoked device has
@@ -1454,8 +1641,10 @@ pub(crate) mod session_tests {
             p.admin.clone(),
             open_rx,
             idle,
-            move |quiet| {
-                let _ = heard_tx.send(quiet);
+            move |report| {
+                if let Report::Quiet(quiet) = report {
+                    let _ = heard_tx.send(quiet);
+                }
             },
         ));
         assert_eq!(heard.recv().await, Some(true), "caught up");

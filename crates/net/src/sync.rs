@@ -155,6 +155,10 @@ struct Session<S: SyncStore> {
     peer: Option<DeviceId>,
     shared: Vec<SetId>,
     roots_sent: bool,
+    /// Set the first time the logs are level and the peer is known to be a member. Unlike the
+    /// roots, a log change doesn't clear it: the peer has passed the checks once, and messages
+    /// about sets are taken from then on (sync.md, after a log change).
+    leveled: bool,
     peer_roots: HashMap<SetId, (u64, Fingerprint)>,
     reconciled: HashSet<SetId>,
     log_requested: bool,
@@ -216,6 +220,7 @@ async fn session<S: SyncStore>(
         peer: None,
         shared: Vec::new(),
         roots_sent: false,
+        leveled: false,
         peer_roots: HashMap::new(),
         reconciled: HashSet::new(),
         log_requested: false,
@@ -340,7 +345,9 @@ impl<S: SyncStore> Session<S> {
             }
             RECONCILE => {
                 let (set, ranges) = parse_reconcile(body)?;
-                self.require_shared(set)?;
+                if !self.shares(set)? {
+                    return Ok(());
+                }
                 self.answer(set, ranges).await
             }
             WANT => {
@@ -354,12 +361,16 @@ impl<S: SyncStore> Session<S> {
                     .map(|_| reader.array())
                     .collect::<Result<_, _>>()?;
                 reader.finish()?;
-                self.require_shared(set)?;
+                if !self.shares(set)? {
+                    return Ok(());
+                }
                 self.send_items(set, &ids).await
             }
             ITEMS => {
                 let (set, items) = wire::parse_items(body)?;
-                self.require_shared(set)?;
+                if !self.shares(set)? {
+                    return Ok(());
+                }
                 for item in items {
                     match blocking(|| self.store.receive(set, item)) {
                         Ok(Received::New) => self.outcome.received += 1,
@@ -414,6 +425,7 @@ impl<S: SyncStore> Session<S> {
             let peer = blocking(|| self.store.member(&endpoint))
                 .ok_or(SyncError::Refused(Reason::NotAMember))?;
             self.peer = Some(peer);
+            self.leveled = true;
         }
         if !self.roots_sent {
             let peer = self.peer.expect("set above");
@@ -560,7 +572,8 @@ impl<S: SyncStore> Session<S> {
     }
 
     /// Starts the roots over after the log changed. The peer's membership is checked again once
-    /// the logs are level, since the change may have revoked it.
+    /// the logs are level, since the change may have revoked it, and at each message about a set
+    /// before then ([`Self::shares`]).
     fn reset_roots(&mut self) {
         self.peer = None;
         self.roots_sent = false;
@@ -568,12 +581,24 @@ impl<S: SyncStore> Session<S> {
         self.reconciled.clear();
     }
 
-    fn require_shared(&self, set: SetId) -> Result<(), SyncError> {
-        if self.roots_sent && self.shared.contains(&set) {
-            Ok(())
+    /// Whether to act on the peer's message about `set`: true if the device shares it with the
+    /// peer under its current log (design §9, serving). The roots aren't asked, since a log
+    /// change starts them over while the peer may still be answering under the older log
+    /// (sync.md, after a log change). A set it doesn't share is ignored for the same reason,
+    /// and a revoked peer ends the session.
+    fn shares(&self, set: SetId) -> Result<bool, SyncError> {
+        if !self.leveled {
+            // Sets come after the roots, and the roots after the logs are level.
+            return Err(FrameError::Bad("a set before the logs were level").into());
+        }
+        let endpoint = self.peer_endpoint;
+        let peer = blocking(|| self.store.member(&endpoint))
+            .ok_or(SyncError::Refused(Reason::NotAMember))?;
+        if blocking(|| self.store.shared_sets(peer)).contains(&set) {
+            Ok(true)
         } else {
-            // Only sets both devices may hold are served (design §9, serving).
-            Err(FrameError::Bad("a set this device doesn't share with the peer").into())
+            debug!("ignored a message about a set this device doesn't share with the peer");
+            Ok(false)
         }
     }
 }
@@ -1309,5 +1334,280 @@ pub(crate) mod session_tests {
         assert_eq!(joined_records, admin_records);
         let listed = p.joined.lock().unwrap().list(p.latem).unwrap().len();
         assert_eq!(listed, 100);
+    }
+
+    /// A store that can hold up its next read of a set's ids until the test lets it go. A device
+    /// answering a reconcile reads its ids first, so its answer waits too.
+    struct Holding {
+        store: Arc<Store>,
+        hold: Mutex<Option<Hold>>,
+    }
+
+    /// What a held read tells when it starts waiting, and what lets it go.
+    type Hold = (
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+
+    impl SyncStore for Holding {
+        fn hello(&self) -> openvault_core::Result<(VaultId, u64, Hash)> {
+            self.store.hello()
+        }
+
+        fn log_from(&self, from: u64, max: u16) -> openvault_core::Result<Vec<LogEntry>> {
+            self.store.log_from(from, max)
+        }
+
+        fn append_log(&self, entries: &[LogEntry]) -> openvault_core::Result<usize> {
+            self.store.append_log(entries)
+        }
+
+        fn member(&self, endpoint: &EndpointKey) -> Option<DeviceId> {
+            self.store.member(endpoint)
+        }
+
+        fn shared_sets(&self, peer: DeviceId) -> Vec<SetId> {
+            self.store.shared_sets(peer)
+        }
+
+        fn summary(&self, set: SetId) -> openvault_core::Result<Summary> {
+            self.store.summary(set)
+        }
+
+        fn ids(
+            &self,
+            set: SetId,
+            lower: &ItemId,
+            upper: Option<&ItemId>,
+        ) -> openvault_core::Result<Vec<ItemId>> {
+            let hold = self.hold.lock().unwrap().take();
+            if let Some((waiting, release)) = hold {
+                let _ = waiting.send(());
+                let _ = release.recv();
+            }
+            self.store.ids(set, lower, upper)
+        }
+
+        fn items(&self, set: SetId, ids: &[ItemId]) -> openvault_core::Result<Vec<Vec<u8>>> {
+            self.store.items(set, ids)
+        }
+
+        fn receive(&self, set: SetId, item: &[u8]) -> openvault_core::Result<Received> {
+            self.store.receive(set, item)
+        }
+    }
+
+    /// A session the admin opened with the joined device, still running.
+    struct Live {
+        opening: tokio::task::JoinHandle<Result<Outcome, SyncError>>,
+        accepting: tokio::task::JoinHandle<Result<Outcome, SyncError>>,
+        notices: (mpsc::Sender<Notice>, mpsc::Sender<Notice>),
+    }
+
+    impl Live {
+        /// Whether either side has ended.
+        fn ended(&self) -> bool {
+            self.opening.is_finished() || self.accepting.is_finished()
+        }
+
+        /// Lets both sides go idle, and returns what each did.
+        async fn end(self) -> (Result<Outcome, SyncError>, Result<Outcome, SyncError>) {
+            drop(self.notices);
+            (self.opening.await.unwrap(), self.accepting.await.unwrap())
+        }
+    }
+
+    /// Opens a session from the admin to the joined device and, once it has caught up, makes
+    /// `change` to the admin's log while the joined device is part way through answering a
+    /// reconcile of latem, as when a scope change lands during a live session. The admin's
+    /// session acts on the change, starting its roots over, before the answer arrives: the
+    /// joined device sent it under the older log.
+    async fn change_mid_answer(p: &Pair, change: impl FnOnce(&mut Vault<SoftwareKeys>)) -> Live {
+        let idle = Duration::from_secs(5);
+        let holding = Arc::new(Holding {
+            store: p.joined.clone(),
+            hold: Mutex::new(None),
+        });
+        let (accept_tx, accept_rx) = mpsc::channel(8);
+        let accept_store = holding.clone();
+        let endpoint = p.joined_node.endpoint().clone();
+        let accepting = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            run(
+                connection,
+                Role::Accepter,
+                accept_store,
+                accept_rx,
+                idle,
+                |_| {},
+            )
+            .await
+        });
+        let id = iroh::EndpointId::from_bytes(&p.joined_node.id()).unwrap();
+        let connection = p.admin_node.endpoint().connect(id, ALPN).await.unwrap();
+        // Room for one notice, so a send returns only once the session has taken the one before.
+        let (open_tx, open_rx) = mpsc::channel(1);
+        let (heard_tx, mut heard) = mpsc::unbounded_channel();
+        let opening = tokio::spawn(run(
+            connection,
+            Role::Opener,
+            p.admin.clone(),
+            open_rx,
+            idle,
+            move |quiet| {
+                let _ = heard_tx.send(quiet);
+            },
+        ));
+        assert_eq!(heard.recv().await, Some(true), "caught up");
+
+        // A write to latem: the admin sends its root and reconciles it, and the joined device's
+        // answer waits.
+        let (waiting_tx, waiting) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *holding.hold.lock().unwrap() = Some((waiting_tx, release_rx));
+        p.admin
+            .lock()
+            .unwrap()
+            .set(p.latem, "prod/LATER", Kind::Var, b"later")
+            .unwrap();
+        open_tx
+            .send(Notice::Changed(SetId::records(p.latem)))
+            .await
+            .unwrap();
+        waiting.await.unwrap();
+
+        change(&mut p.admin.lock().unwrap());
+        open_tx.send(Notice::Log).await.unwrap();
+        // A notice that does nothing, twice: the second send returns once the session has taken
+        // the first, so it has finished acting on the log's.
+        let nothing = Notice::Changed(SetId::records(CollectionId::random()));
+        open_tx.send(nothing).await.unwrap();
+        open_tx.send(nothing).await.unwrap();
+        release.send(()).unwrap();
+        Live {
+            opening,
+            accepting,
+            notices: (open_tx, accept_tx),
+        }
+    }
+
+    /// A scope change that newly shares a set, landing during a live session, leaves the session
+    /// up, and the set syncs in it. The answer the joined device sent under the older log is
+    /// still taken (sync.md, after a log change).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scope_change_during_a_session_shares_its_set_in_it() {
+        let p = pair(1).await;
+        let ssh = p.admin.lock().unwrap().collection("ssh").unwrap();
+        p.admin
+            .lock()
+            .unwrap()
+            .set(ssh, "deploy/KEY", Kind::Secret, b"ssh key")
+            .unwrap();
+        let joined = p.joined.lock().unwrap().device_id();
+        let admin_key = p.recovery.admin_signing_key();
+        let live = change_mid_answer(&p, |admin| {
+            admin
+                .set_scope(joined, ssh, Scope::Read, &admin_key)
+                .unwrap();
+        })
+        .await;
+
+        let read = || {
+            let mut vault = p.joined.lock().unwrap();
+            let ssh = vault.collection("ssh").ok()?;
+            vault.get(ssh, "deploy/KEY").ok().flatten()
+        };
+        let synced = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(entry) = read() {
+                    return Some(entry);
+                }
+                if live.ended() {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("ssh reached the joined device within 10 seconds");
+        let Some(entry) = synced else {
+            panic!("the session ended: {:?}", live.end().await);
+        };
+        assert_eq!(&entry.value[..], b"ssh key");
+        let later = p
+            .joined
+            .lock()
+            .unwrap()
+            .get(p.latem, "prod/LATER")
+            .unwrap()
+            .expect("the held answer was answered");
+        assert_eq!(&later.value[..], b"later");
+
+        let (opened, accepted) = live.end().await;
+        let (opened, accepted) = (opened.unwrap(), accepted.unwrap());
+        assert_eq!((opened.log_sent, accepted.log_received), (1, 1));
+        assert_eq!(opened.dropped + accepted.dropped, 0);
+    }
+
+    /// A scope change that takes a set away, landing while the joined device is asking for that
+    /// set's items, serves nothing more from it (design §9, serving): the admin goes by its
+    /// current log, not the one the request was made under. The session stays up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_set_taken_away_during_a_session_is_no_longer_served() {
+        let p = pair(1).await;
+        let joined = p.joined.lock().unwrap().device_id();
+        let admin_key = p.recovery.admin_signing_key();
+        let latem = p.latem;
+        let live = change_mid_answer(&p, |admin| {
+            admin
+                .set_scope(joined, latem, Scope::None, &admin_key)
+                .unwrap();
+        })
+        .await;
+        let (opened, accepted) = live.end().await;
+        let (opened, accepted) = (opened.unwrap(), accepted.unwrap());
+        // The set_scope and the rotation of latem's key.
+        assert_eq!((opened.log_sent, accepted.log_received), (2, 2));
+        let (admin_records, _) = summaries(&p.admin, latem);
+        let (joined_records, _) = summaries(&p.joined, latem);
+        assert_eq!(
+            joined_records.count + 1,
+            admin_records.count,
+            "the record it asked for wasn't sent"
+        );
+        let admin = p.admin.lock().unwrap().device_id();
+        assert!(
+            !p.joined
+                .lock()
+                .unwrap()
+                .shared_sets(admin)
+                .contains(&SetId::records(latem))
+        );
+    }
+
+    /// A device revoked while it's answering a reconcile has its session ended with "not a
+    /// member" when the answer arrives, and is sent nothing more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_revoked_during_an_answer_has_its_session_ended() {
+        let p = pair(1).await;
+        let joined = p.joined.lock().unwrap().device_id();
+        let admin_key = p.recovery.admin_signing_key();
+        let live = change_mid_answer(&p, |admin| {
+            admin.revoke_device(joined, &admin_key).unwrap();
+        })
+        .await;
+        for side in [live.opening, live.accepting] {
+            let result = tokio::time::timeout(Duration::from_secs(5), side)
+                .await
+                .expect("the session ended")
+                .unwrap();
+            assert!(
+                matches!(result, Err(SyncError::Refused(Reason::NotAMember))),
+                "{result:?}"
+            );
+        }
+        let (admin_records, _) = summaries(&p.admin, p.latem);
+        let (joined_records, _) = summaries(&p.joined, p.latem);
+        assert_eq!(joined_records.count + 1, admin_records.count);
     }
 }

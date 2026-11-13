@@ -80,6 +80,13 @@ There are no timers and no periodic scans.
 
 The session then idles until it closes or more work arrives.
 
+**After a log change.** When a device's log grows during a session, from a local change or from entries the peer sent, it sends hello again and the session goes back through steps 2 to 5. The peer's membership is checked again, both sides send their roots again, and the opener reconciles every set whose roots differ, since records dropped before may pass now (dropped records).
+- Until the logs are level again, the peer may still be answering under the older log, so the two can disagree on what they share. A reconcile, want or items message is therefore checked against the device's current log, not the roots. It is answered or taken only if the device shares the set with the peer now.
+- A message about a set the device doesn't share is ignored: not answered, not stored, and the session goes on. The peer may not yet have heard that the set was taken away.
+- A peer that the change revoked ends the session with "not a member" at its next such message, or once the logs are level.
+- Before the logs are first level in a session, such a message is a bad message.
+- Before 0.5.6, any such message between a log change and the logs coming level again ended the session as a bad message. A scope change during a live session therefore ended it, until the retry 30 seconds later.
+
 ### Log exchange
 
 | Type | Message | Body |
@@ -160,7 +167,7 @@ mode    0x00 skip           settled
 
 **Items.**
 - An items message holds as many whole items as fit in 2 MiB. A record is at most about 1 MiB (records.md).
-- A device sends items only from sets it shares with the peer, and only items the peer asked for (want), items it found missing (ids), or records it just wrote.
+- A device sends items only from sets it shares with the peer under its current log (after a log change), and only items the peer asked for (want), items it found missing (ids), or records it just wrote.
 
 ## Accepting records
 
@@ -232,7 +239,7 @@ The device doing this makes the new keys and signs the grants, so it must be abl
 
 **Recounting.** Each device that applies a rotate_epoch recounts that collection's entries (records.md, versions): a current version from an older epoch whose author no longer has `write` stops counting, and the newest version of its name that still counts takes its place. Only those entries' records are read, unless one stopped counting; then the collection's records are read once, to find the versions that take their place.
 
-**Sessions.** A running session checks the peer's membership again whenever the log changes, once the two logs are level. A session with a device that has just been revoked therefore ends with "not a member", even when the revoked device already has the newest log.
+**Sessions.** A running session checks the peer's membership again whenever the log changes: at each message about a set, and once the two logs are level (after a log change). A session with a device that has just been revoked therefore ends with "not a member", even when the revoked device already has the newest log.
 
 **Versions from a removed writer.**
 - A device that has lost `write` keeps its signing key and the old collection keys. It can still sign records under old epochs, with any name and any Lamport clock, and they pass the header checks.
@@ -262,7 +269,8 @@ The device doing this makes the new keys and signs the grants, so it must be abl
 | Idle | No connections, no traffic and no database reads. |
 | Session with nothing to do | Hello (61 bytes each way, framing included), plus roots: 41 bytes and one database read per shared set. Under 2 KB for 20 collections. |
 | After a local write | One session per visible peer that shares the collection: a hello, the roots, then the record itself (about 1 KB for a secret). |
-| Reconciling a set that differs | About log₁₆ n rounds. Each round reads at most the set's n ids from the local index; n is in the thousands for secrets and variables. |
+| After a log change | In each running session: a hello each way, one log request per 64 new entries, then the roots again as for a session with nothing to do, and a reconcile of each set whose roots differ. |
+| Reconciling a set that differs | About log₁₆ n rounds. Each round reads at most the set's n ids from the local index; n is in the thousands for secrets and variables. Each message about a set also looks up the peer's membership and the shared sets, which are in memory, so no database read. |
 | Retries | Only to visible peers, from 30 seconds doubling to an hour. |
 
 **What to watch once it runs:**

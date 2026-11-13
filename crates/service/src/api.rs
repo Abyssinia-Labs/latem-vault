@@ -687,6 +687,14 @@ impl Response {
                         w.u8(entry.deleted.into());
                     }
                 }
+                w.count(review.files.len());
+                for (collection, names) in &review.files {
+                    w.str(collection);
+                    w.count(names.len());
+                    for name in names {
+                        w.str(name);
+                    }
+                }
             }),
             Self::Revoked { rotated, carried } => frame(0x88, |w| {
                 w.count(rotated.len());
@@ -923,6 +931,15 @@ impl Response {
                         });
                     }
                     review.wrote_last.push((collection, written));
+                }
+                for _ in 0..r.count()? {
+                    let collection = r.string()?;
+                    let count = r.count()?;
+                    let mut names = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        names.push(r.string()?);
+                    }
+                    review.files.push((collection, names));
                 }
                 Self::Review(review)
             }
@@ -1495,6 +1512,7 @@ mod tests {
 
         let review = Review {
             secrets: vec![("latem".into(), vec!["prod/SENTRY_DSN".into()])],
+            files: vec![("latem".into(), vec!["prod/upload.jks".into()])],
             wrote_last: vec![(
                 "latem".into(),
                 vec![
@@ -1513,6 +1531,7 @@ mod tests {
             panic!("not a review");
         };
         assert_eq!(decoded.secrets[0].1, ["prod/SENTRY_DSN"]);
+        assert_eq!(decoded.files[0].1, ["prod/upload.jks"]);
         assert_eq!(decoded.wrote_last[0].1.len(), 2);
         assert!(decoded.wrote_last[0].1[1].deleted);
         let Response::ScopeSet {

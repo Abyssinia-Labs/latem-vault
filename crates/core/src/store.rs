@@ -2293,12 +2293,29 @@ mod tests {
         let joiner_keys = SoftwareKeys::generate();
         let (mut admin, joined, latem, _) = joined_pair(&s, &joiner_keys);
         let ssh = admin.collection("ssh").unwrap();
+        // A file it could read is listed too, apart from the secrets: a keystore is a key.
+        let keystore = Manifest {
+            size: 5,
+            executable: false,
+            mtime: 0,
+            content: crate::file::Content::Inline(Zeroizing::new(b"store".to_vec())),
+        };
+        admin
+            .set(latem, "prod/upload.jks", Kind::File, &keystore.encode())
+            .unwrap();
         let review = admin.review_revocation(joined.device_id()).unwrap();
         assert_eq!(
             review.secrets,
             [("latem".to_owned(), vec!["prod/SENTRY_DSN".to_owned()])]
         );
-        assert!(review.wrote_last.is_empty());
+        assert_eq!(
+            review.files,
+            [("latem".to_owned(), vec!["prod/upload.jks".to_owned()])]
+        );
+        assert!(
+            review.wrote_last.is_empty(),
+            "the admin wrote the file, not the device"
+        );
 
         let revocation = admin.revoke_device(joined.device_id(), &s.admin()).unwrap();
         assert_eq!(revocation.rotated, [latem], "not ssh: it couldn't read it");

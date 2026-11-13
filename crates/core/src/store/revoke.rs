@@ -42,6 +42,10 @@ pub struct Review {
     /// Each collection it can read, with the names of its current secrets, to change at their
     /// providers once it's revoked.
     pub secrets: Vec<(String, Vec<String>)>,
+    /// Each collection it can read, with the names of its current files, to replace where they
+    /// hold a key, such as a keystore or an API key's `.p8`. Listed whether or not it fetched
+    /// their chunks: it could have.
+    pub files: Vec<(String, Vec<String>)>,
     /// Each collection's current entries that it wrote last.
     pub wrote_last: Vec<(String, Vec<Written>)>,
 }
@@ -71,13 +75,16 @@ impl<K: DeviceKeys> Vault<K> {
         let mut review = Review::default();
         for collection in self.collections()? {
             if membership.scope(device, collection.id) >= Scope::Read {
-                let secrets = self
-                    .list(collection.id)?
-                    .into_iter()
-                    .filter(|entry| entry.kind == Kind::Secret)
-                    .map(|entry| entry.name)
-                    .collect();
+                let (mut secrets, mut files) = (Vec::new(), Vec::new());
+                for entry in self.list(collection.id)? {
+                    match entry.kind {
+                        Kind::Secret => secrets.push(entry.name),
+                        Kind::File => files.push(entry.name),
+                        Kind::Var | Kind::Collection => {}
+                    }
+                }
                 review.secrets.push((collection.name.clone(), secrets));
+                review.files.push((collection.name.clone(), files));
             }
             let written: Vec<Written> = self
                 .written_by(collection.id, device)?

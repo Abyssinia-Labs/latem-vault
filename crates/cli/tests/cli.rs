@@ -1456,6 +1456,17 @@ fn services_sync_a_joined_device() {
     // what it could read.
     let admin_service = Service::start(&admin);
     eventually(&admin, &["devices"], "visible");
+    let keystore = admin.home.path().join("upload.jks");
+    std::fs::write(&keystore, b"a keystore").unwrap();
+    admin.ok(&[
+        "import",
+        keystore.to_str().unwrap(),
+        "--collection",
+        "latem",
+        "--into",
+        "prod",
+        "--disk-not-encrypted",
+    ]);
     let answers = format!("y\n{}\n", admin.phrase);
     let output = admin.run_with_stdin(&["devices", "revoke", "Desktop"], answers.as_bytes());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1464,9 +1475,17 @@ fn services_sync_a_joined_device() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("Reads     latem (1 secret)"), "{stdout}");
+    assert!(
+        stdout.contains("Reads     latem (1 secret, 1 file)"),
+        "{stdout}"
+    );
     assert!(stdout.contains("New keys for latem"), "{stdout}");
     assert!(stdout.contains("  latem/prod/SENTRY_DSN"), "{stdout}");
+    assert!(
+        stdout
+            .contains("Replace any that hold a key, such as a keystore:\n  latem/prod/upload.jks"),
+        "{stdout}"
+    );
     let devices = admin.ok(&["devices"]);
     assert!(
         devices

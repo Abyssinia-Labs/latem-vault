@@ -246,7 +246,7 @@ The device doing this makes the new keys and signs the grants, so it must be abl
 - If no device with `write` remains, those entries stay in history only, until a device is given `write` and restores them.
 - **In v1,** only the device that signs the revocation does this, where it has `write`. Other writers learn of the rotation before they hold the new key, and until then they'd have to remember the entries to write again. Until the carried versions arrive, a device that applied the rotation shows each such entry's previous version, or none.
 
-**Reviewing.** `openvault devices revoke` lists the entries the device wrote last, for review, and the secrets it could read, to rotate at their providers (design §7).
+**Reviewing.** `openvault devices revoke` lists the entries the device wrote last, for review, and the secrets it could read, to rotate at their providers (design §7). Since 0.5.3 it also lists the files it could read, to replace any that hold a key, such as a keystore. A file is listed whether or not the device fetched its chunks, since it could have.
 
 **A gap.** A writer that received a forged version from the removed device before it learned of the removal can carry the forgery forward. Sessions exchange the log before records, so the gap closes at that writer's first sync with a device that knows of the removal.
 

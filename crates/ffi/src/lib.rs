@@ -264,6 +264,8 @@ pub struct CollectionNames {
 pub struct Review {
     /// Each collection the device can read, with its current secrets' names.
     pub secrets: Vec<CollectionNames>,
+    /// Each collection the device can read, with its current files' names.
+    pub files: Vec<CollectionNames>,
     /// Each collection's current entries the device wrote last.
     pub wrote_last: Vec<CollectionNames>,
 }
@@ -859,6 +861,11 @@ impl Client {
             Response::Review(review) => Ok(Review {
                 secrets: review
                     .secrets
+                    .into_iter()
+                    .map(|(collection, names)| CollectionNames { collection, names })
+                    .collect(),
+                files: review
+                    .files
                     .into_iter()
                     .map(|(collection, names)| CollectionNames { collection, names })
                     .collect(),

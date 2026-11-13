@@ -836,7 +836,8 @@ fn devices(home: &Home) -> Result<()> {
 }
 
 /// Revokes a device, after showing what it can read and what it wrote last (sync.md,
-/// reviewing), and then lists the secrets to change at their providers.
+/// reviewing), and then lists the secrets to change at their providers and the files it could
+/// read.
 fn revoke(home: &Home, query: &str) -> Result<()> {
     let mut access = home.access()?;
     let devices = access.devices()?;
@@ -862,9 +863,13 @@ fn revoke(home: &Home, query: &str) -> Result<()> {
     let reads: Vec<String> = review
         .secrets
         .iter()
-        .map(|(collection, secrets)| match secrets.len() {
-            1 => format!("{collection} (1 secret)"),
-            n => format!("{collection} ({n} secrets)"),
+        .zip(&review.files)
+        .map(|((collection, secrets), (_, files))| {
+            let mut counts = vec![counted(secrets.len(), "secret")];
+            if !files.is_empty() {
+                counts.push(counted(files.len(), "file"));
+            }
+            format!("{collection} ({})", counts.join(", "))
         })
         .collect();
     if reads.is_empty() {
@@ -933,13 +938,15 @@ fn revoke(home: &Home, query: &str) -> Result<()> {
             "Its last changes to {carried} entries were written again with the new keys, so they're kept."
         );
     }
-    let secrets: Vec<String> = review
-        .secrets
-        .iter()
-        .flat_map(|(collection, names)| {
-            names.iter().map(move |name| format!("{collection}/{name}"))
-        })
-        .collect();
+    let paths = |lists: &[(String, Vec<String>)]| -> Vec<String> {
+        lists
+            .iter()
+            .flat_map(|(collection, names)| {
+                names.iter().map(move |name| format!("{collection}/{name}"))
+            })
+            .collect()
+    };
+    let secrets = paths(&review.secrets);
     if !secrets.is_empty() {
         println!();
         println!("It could read these secrets. Change them where they were issued:");
@@ -947,7 +954,23 @@ fn revoke(home: &Home, query: &str) -> Result<()> {
             println!("  {secret}");
         }
     }
+    let files = paths(&review.files);
+    if !files.is_empty() {
+        println!();
+        println!("It could read these files. Replace any that hold a key, such as a keystore:");
+        for file in files {
+            println!("  {file}");
+        }
+    }
     Ok(())
+}
+
+/// `1 secret`, `2 secrets`.
+fn counted(count: usize, noun: &str) -> String {
+    match count {
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
+    }
 }
 
 /// Changes a device's scope on a collection (sync.md, revoking and reducing scopes).

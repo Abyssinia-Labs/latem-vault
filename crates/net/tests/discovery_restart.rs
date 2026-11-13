@@ -10,6 +10,15 @@ use tokio::sync::mpsc;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+/// Options under an mDNS service name for this test process alone, so its nodes meet only each
+/// other, and no real device on the network sees them (service.md, finding devices).
+fn options() -> Options {
+    Options {
+        mdns_service: format!("ovt-{:x}", std::process::id()),
+        ..Options::default()
+    }
+}
+
 /// Waits for `expected`, skipping other events: other tests' endpoints share the network.
 async fn until(events: &mut mpsc::Receiver<Event>, expected: Event, wait: Duration) {
     tokio::time::timeout(wait, async {
@@ -27,8 +36,8 @@ async fn discovery_starts_again_after_it_stops() {
     tracing_subscriber::registry()
         .with(discovery_watch())
         .init();
-    let (a, mut a_events) = Node::start(&[1; 32], Options::default()).await.unwrap();
-    let (b, mut b_events) = Node::start(&[2; 32], Options::default()).await.unwrap();
+    let (a, mut a_events) = Node::start(&[1; 32], options()).await.unwrap();
+    let (b, mut b_events) = Node::start(&[2; 32], options()).await.unwrap();
     until(
         &mut a_events,
         Event::Visible(b.id()),

@@ -46,6 +46,13 @@ impl Device {
         command
             .args(args)
             .env("OPENVAULT_HOME", self.home.path())
+            // An mDNS service name for this test process alone: its devices find only each
+            // other, and no real device or app on the network sees them or their joiners
+            // (service.md, finding devices).
+            .env(
+                "OPENVAULT_MDNS_SERVICE",
+                format!("ovt-{:x}", std::process::id()),
+            )
             .stdin(Stdio::null());
         // No controlling terminal, as in CI, so a command that asks for a passphrase fails
         // instead of waiting for someone to type it.

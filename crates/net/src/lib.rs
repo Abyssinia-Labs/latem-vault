@@ -37,6 +37,30 @@ pub use watch::{discovery_stops, discovery_watch};
 /// The mDNS service name: endpoints appear as `<endpoint id>._openvault._udp.local.`.
 pub const MDNS_SERVICE: &str = "openvault";
 
+/// Names another mDNS service for this process's endpoints, so that they find only endpoints
+/// started with the same name. Tests set it, so their devices never meet the real ones on the
+/// network, nor a real app see their joiners (service.md, finding devices).
+pub const MDNS_SERVICE_VAR: &str = "OPENVAULT_MDNS_SERVICE";
+
+/// The mDNS service name endpoints use: [`MDNS_SERVICE_VAR`]'s, if it's set, else
+/// [`MDNS_SERVICE`].
+pub fn mdns_service() -> String {
+    std::env::var(MDNS_SERVICE_VAR)
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| MDNS_SERVICE.to_owned())
+}
+
+/// A DNS-SD service name (RFC 6335): 1 to 15 letters, digits and hyphens, starting with a
+/// letter, with no hyphen at the end or two together.
+fn valid_service(name: &str) -> bool {
+    (1..=15).contains(&name.len())
+        && name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 /// How often mDNS queries go out, before swarm-discovery's random delay.
 const MDNS_CADENCE: Duration = Duration::from_secs(5);
 
@@ -76,6 +100,8 @@ pub struct Options {
     pub announcement: Option<String>,
     /// The grandfather's relay, for a device with a coordinator configured.
     pub relay: Option<Relay>,
+    /// The mDNS service it announces and looks under: [`mdns_service`] unless a test names one.
+    pub mdns_service: String,
 }
 
 impl Default for Options {
@@ -85,6 +111,7 @@ impl Default for Options {
             advertise: true,
             announcement: None,
             relay: None,
+            mdns_service: mdns_service(),
         }
     }
 }
@@ -156,7 +183,7 @@ impl Node {
             .bind()
             .await
             .map_err(|e| Error::Bind(e.to_string()))?;
-        let mdns = start_mdns(&endpoint, options.advertise)?;
+        let mdns = start_mdns(&endpoint, options.advertise, &options.mdns_service)?;
 
         let visible = Arc::new(Mutex::new(BTreeMap::new()));
         let (send, receive) = mpsc::channel(64);
@@ -164,6 +191,7 @@ impl Node {
         let discovery = tokio::spawn(discover(
             endpoint.clone(),
             options.advertise,
+            options.mdns_service,
             mdns,
             events,
             visible.clone(),
@@ -225,9 +253,19 @@ type Visible = Arc<Mutex<BTreeMap<EndpointKey, Option<String>>>>;
 
 /// Starts mDNS discovery for `endpoint`, in place of any lookup it had. Its preset
 /// (`presets::Minimal`) has none of its own, so the only one replaced is a stopped mDNS.
-fn start_mdns(endpoint: &Endpoint, advertise: bool) -> Result<MdnsAddressLookup, Error> {
+fn start_mdns(
+    endpoint: &Endpoint,
+    advertise: bool,
+    service: &str,
+) -> Result<MdnsAddressLookup, Error> {
+    if !valid_service(service) {
+        return Err(Error::Mdns(format!(
+            "{service:?} isn't an mDNS service name: {MDNS_SERVICE_VAR} takes 1 to 15 letters, \
+             digits and hyphens, starting with a letter"
+        )));
+    }
     let mdns = MdnsAddressLookup::builder()
-        .service_name(MDNS_SERVICE)
+        .service_name(service)
         .discovery_cadence(MDNS_CADENCE)
         .advertise(advertise)
         .build(endpoint.id())
@@ -246,6 +284,7 @@ fn start_mdns(endpoint: &Endpoint, advertise: bool) -> Result<MdnsAddressLookup,
 async fn discover(
     endpoint: Endpoint,
     advertise: bool,
+    service: String,
     mdns: MdnsAddressLookup,
     mut events: BoxStream<DiscoveryEvent>,
     visible: Visible,
@@ -282,7 +321,7 @@ async fn discover(
                 loop {
                     tokio::time::sleep(wait).await;
                     wait = (wait * 2).min(RESTART_LONGEST);
-                    match start_mdns(&endpoint, advertise) {
+                    match start_mdns(&endpoint, advertise, &service) {
                         Ok(mdns) => {
                             events = mdns.subscribe().await.boxed();
                             _mdns = mdns;
@@ -319,6 +358,15 @@ fn change(visible: &Visible, event: DiscoveryEvent) -> Option<Event> {
     }
 }
 
+/// An mDNS service name for this test process alone, so its endpoints meet only each other.
+#[cfg(test)]
+pub(crate) fn test_options() -> Options {
+    Options {
+        mdns_service: format!("ovt-{:x}", std::process::id()),
+        ..Options::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,7 +377,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn the_endpoint_id_is_the_transport_key() {
-        let (node, _events) = Node::start(&seed(7), Options::default()).await.unwrap();
+        let (node, _events) = Node::start(&seed(7), test_options()).await.unwrap();
         let expected = SecretKey::from_bytes(&seed(7)).public();
         assert_eq!(node.id(), *expected.as_bytes());
         node.close().await;
@@ -339,10 +387,10 @@ mod tests {
     /// closes. Needs a network interface that carries multicast.
     #[tokio::test(flavor = "multi_thread")]
     async fn endpoints_find_each_other() {
-        let (a, mut a_events) = Node::start(&seed(1), Options::default()).await.unwrap();
+        let (a, mut a_events) = Node::start(&seed(1), test_options()).await.unwrap();
         let announced = Options {
             announcement: Some("join:linux:Desktop".into()),
-            ..Options::default()
+            ..test_options()
         };
         let (b, mut b_events) = Node::start(&seed(2), announced).await.unwrap();
         let wait = Duration::from_secs(30);
@@ -369,5 +417,66 @@ mod tests {
         until(&mut a_events, Event::Gone(b_id), Duration::from_secs(120)).await;
         assert!(!a.visible().contains(&b_id));
         a.close().await;
+    }
+
+    /// Endpoints under another mDNS service name don't find these, nor these them, though both
+    /// find their own: tests' devices never meet the real ones. Needs a network interface that
+    /// carries multicast.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn endpoints_under_other_service_names_stay_apart() {
+        let other = Options {
+            mdns_service: format!("ovo-{:x}", std::process::id()),
+            announcement: Some("join:linux:Elsewhere".into()),
+            ..test_options()
+        };
+        let (a, mut a_events) = Node::start(&seed(11), test_options()).await.unwrap();
+        let (stranger, _) = Node::start(&seed(12), other.clone()).await.unwrap();
+        let (c, _) = Node::start(&seed(13), test_options()).await.unwrap();
+        let (d, mut d_events) = Node::start(&seed(14), other).await.unwrap();
+        let wait = Duration::from_secs(30);
+        // Each finds the one under its own name, by which time it would have found the other.
+        tokio::time::timeout(wait, async {
+            while a_events.recv().await != Some(Event::Visible(c.id())) {}
+        })
+        .await
+        .expect("a never found c, under the same name");
+        tokio::time::timeout(wait, async {
+            while d_events.recv().await != Some(Event::Visible(stranger.id())) {}
+        })
+        .await
+        .expect("d never found the stranger, under the same name");
+        assert!(!a.visible().contains(&stranger.id()));
+        assert!(!a.visible().contains(&d.id()));
+        // Other tests in this process announce under its name; only the other name's joiner
+        // must not be heard.
+        assert!(
+            !a.announcements()
+                .iter()
+                .any(|(_, announcement)| announcement == "join:linux:Elsewhere")
+        );
+        assert!(!d.visible().contains(&a.id()));
+        assert!(!d.visible().contains(&c.id()));
+        for node in [a, stranger, c, d] {
+            node.close().await;
+        }
+    }
+
+    #[test]
+    fn service_names_follow_dns_sd() {
+        for good in ["openvault", "ovt-1a2b3c4d", "a", "abcdefghijklmno"] {
+            assert!(valid_service(good), "{good}");
+        }
+        for bad in [
+            "",
+            "1abc",
+            "-abc",
+            "abc-",
+            "a--b",
+            "a_b",
+            "a.b",
+            "abcdefghijklmnop",
+        ] {
+            assert!(!valid_service(bad), "{bad}");
+        }
     }
 }

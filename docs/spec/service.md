@@ -72,6 +72,7 @@ Each device runs one iroh endpoint (design §10):
 
 - The endpoint finds others with mDNS, under the service name `openvault`: `<endpoint id>._openvault._udp.local.`.
   - Other iroh applications use their own service names, so they don't see OpenVault devices and OpenVault doesn't see them.
+  - `OPENVAULT_MDNS_SERVICE` names another service, 1 to 15 letters, digits and hyphens starting with a letter, for every endpoint the process starts. The tests and `scripts/swift-bindings.sh` set it to one of their own (`ovt-<pid>`), so their devices find only each other: before, a real service saw a test's joiner, and the Mac app showed it asking to join. A name that doesn't fit stops the endpoint with an error.
   - Devices that are members announce nothing besides their endpoint id and addresses. A joining device also announces its platform and name (join.md, finding the device).
 - mDNS queries go out every 5 seconds, plus a random delay that grows with the number of peers. A peer that stops answering expires after a few cycles.
 - **When mDNS stops.** swarm-discovery, under iroh's mDNS lookup, stops all of mDNS when one of its sockets fails: the device stops announcing itself and hears nobody. It happens, for instance, on a Mac whose service starts while macOS is still deciding whether it may use the local network. The only sign is a warning from swarm-discovery, so the service watches its log for it, whatever `OPENVAULT_LOG` shows. Then:

@@ -307,8 +307,8 @@ mod tests {
     use openvault_core::{Kind, SoftwareKeys};
 
     use super::*;
+    use crate::Node;
     use crate::sync::session_tests::{Pair, Store, pair};
-    use crate::{Node, Options};
 
     /// Writes a file of a full chunk and a short one in `collection` on the admin, and gives the
     /// joined device its record and the grants, as sync would. Returns its manifest's epoch and
@@ -430,7 +430,7 @@ mod tests {
         let stranger = SoftwareKeys::generate();
         let (stranger, _) = Node::start(
             &openvault_core::transport_seed(&stranger),
-            Options::default(),
+            crate::test_options(),
         )
         .await
         .unwrap();

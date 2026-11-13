@@ -33,6 +33,8 @@ cleanup() {
 }
 trap cleanup EXIT
 export OPENVAULT_HOME="$home"
+# Its own mDNS service name, so no real device or app on the network sees this one.
+export OPENVAULT_MDNS_SERVICE="ovt-$$"
 openvault=$build/openvault
 # The phrase's numbered words run down columns, so each number is followed by its word.
 phrase=$("$openvault" init --keys software --name smoke </dev/null | awk '

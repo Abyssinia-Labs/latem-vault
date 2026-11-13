@@ -369,7 +369,7 @@ mod tests {
         let options = Options {
             alpns: vec![ALPN.to_vec()],
             announcement: Some(announcement(&desktop())),
-            ..Options::default()
+            ..crate::test_options()
         };
         Node::start(&transport_seed(keys), options).await.unwrap().0
     }
@@ -377,7 +377,7 @@ mod tests {
     async fn admin_node(seed: &[u8; 32]) -> Node {
         let options = Options {
             advertise: false,
-            ..Options::default()
+            ..crate::test_options()
         };
         Node::start(seed, options).await.unwrap().0
     }

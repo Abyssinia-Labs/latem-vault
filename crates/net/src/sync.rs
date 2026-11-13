@@ -974,7 +974,7 @@ pub(crate) mod session_tests {
         .unwrap();
         let options = || Options {
             alpns: vec![ALPN.to_vec(), crate::chunks::ALPN.to_vec()],
-            ..Options::default()
+            ..crate::test_options()
         };
         Pair {
             _dir: dir,

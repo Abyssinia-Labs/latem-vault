@@ -866,8 +866,9 @@ fn revoke(home: &Home, query: &str) -> Result<()> {
         .zip(&review.files)
         .map(|((collection, secrets), (_, files))| {
             let mut counts = vec![counted(secrets.len(), "secret")];
-            if !files.is_empty() {
-                counts.push(counted(files.len(), "file"));
+            let files: usize = files.iter().map(|line| line.files as usize).sum();
+            if files > 0 {
+                counts.push(counted(files, "file"));
             }
             format!("{collection} ({})", counts.join(", "))
         })
@@ -938,15 +939,13 @@ fn revoke(home: &Home, query: &str) -> Result<()> {
             "Its last changes to {carried} entries were written again with the new keys, so they're kept."
         );
     }
-    let paths = |lists: &[(String, Vec<String>)]| -> Vec<String> {
-        lists
-            .iter()
-            .flat_map(|(collection, names)| {
-                names.iter().map(move |name| format!("{collection}/{name}"))
-            })
-            .collect()
-    };
-    let secrets = paths(&review.secrets);
+    let secrets: Vec<String> = review
+        .secrets
+        .iter()
+        .flat_map(|(collection, names)| {
+            names.iter().map(move |name| format!("{collection}/{name}"))
+        })
+        .collect();
     if !secrets.is_empty() {
         println!();
         println!("It could read these secrets. Change them where they were issued:");
@@ -954,7 +953,17 @@ fn revoke(home: &Home, query: &str) -> Result<()> {
             println!("  {secret}");
         }
     }
-    let files = paths(&review.files);
+    // A folder stands for its files once a collection has more than 10 (sync.md, reviewing).
+    let files: Vec<String> = review
+        .files
+        .iter()
+        .flat_map(|(collection, lines)| {
+            lines.iter().map(move |line| match line.files {
+                1 => format!("{collection}/{}", line.name),
+                n => format!("{collection}/{} ({n} files)", line.name),
+            })
+        })
+        .collect();
     if !files.is_empty() {
         println!();
         println!("It could read these files. Replace any that hold a key, such as a keystore:");
@@ -1046,10 +1055,22 @@ fn set_scope(home: &Home, query: &str, collection: &str, scope: Scope) -> Result
 
 /// The device `query` names: by its name, or by the start of its id.
 fn find_device<'a>(devices: &'a [DeviceSummary], query: &str) -> Result<&'a DeviceSummary> {
-    let named: Vec<&DeviceSummary> = devices
+    let mut named: Vec<&DeviceSummary> = devices
         .iter()
         .filter(|device| device.name.as_ref().is_some_and(|(_, name)| name == query))
         .collect();
+    // A device that joins again keeps its name, beside the one revoked: the name means the
+    // one that isn't revoked, when there's only one.
+    if named.len() > 1 {
+        let current: Vec<&DeviceSummary> = named
+            .iter()
+            .copied()
+            .filter(|device| !device.revoked)
+            .collect();
+        if current.len() == 1 {
+            named = current;
+        }
+    }
     let found = if named.is_empty() && query.len() >= 4 {
         let prefix = query.to_ascii_lowercase();
         devices
@@ -1520,4 +1541,36 @@ fn read_value(kind: Kind) -> Result<Zeroizing<Vec<u8>>> {
         }
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use openvault_core::DeviceId;
+    use openvault_service::api::DeviceSummary;
+
+    use super::find_device;
+
+    fn device(byte: u8, name: &str, revoked: bool) -> DeviceSummary {
+        DeviceSummary {
+            id: DeviceId::from_bytes([byte; 16]),
+            this: false,
+            revoked,
+            visible: false,
+            hardware: false,
+            name: Some(("linux".into(), name.into())),
+        }
+    }
+
+    #[test]
+    fn a_name_means_the_device_that_isnt_revoked() {
+        let devices = [device(1, "Desktop", true), device(2, "Desktop", false)];
+        assert_eq!(find_device(&devices, "Desktop").unwrap().id, devices[1].id);
+        // Two current devices with one name still need an id.
+        let devices = [device(1, "Desktop", false), device(2, "Desktop", false)];
+        let error = find_device(&devices, "Desktop").unwrap_err().to_string();
+        assert!(error.contains("2 devices are called Desktop"), "{error}");
+        // A revoked device on its own is still found, so revoking it says it already is.
+        let devices = [device(1, "Desktop", true)];
+        assert!(find_device(&devices, "Desktop").unwrap().revoked);
+    }
 }

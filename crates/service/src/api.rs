@@ -7,7 +7,7 @@ use std::io::{self, Read, Write};
 
 use openvault_core::file::ChunkId;
 use openvault_core::membership::Scope;
-use openvault_core::{DeviceId, Kind, Placement, Review, VaultId, Written};
+use openvault_core::{DeviceId, FileLine, Kind, Placement, Review, VaultId, Written};
 use zeroize::Zeroizing;
 
 /// The longest message, type and body: a folder of large values still fits.
@@ -688,11 +688,12 @@ impl Response {
                     }
                 }
                 w.count(review.files.len());
-                for (collection, names) in &review.files {
+                for (collection, lines) in &review.files {
                     w.str(collection);
-                    w.count(names.len());
-                    for name in names {
-                        w.str(name);
+                    w.count(lines.len());
+                    for line in lines {
+                        w.str(&line.name);
+                        w.put(&line.files.to_be_bytes());
                     }
                 }
             }),
@@ -935,11 +936,14 @@ impl Response {
                 for _ in 0..r.count()? {
                     let collection = r.string()?;
                     let count = r.count()?;
-                    let mut names = Vec::with_capacity(count);
+                    let mut lines = Vec::with_capacity(count);
                     for _ in 0..count {
-                        names.push(r.string()?);
+                        lines.push(FileLine {
+                            name: r.string()?,
+                            files: r.u32()?,
+                        });
                     }
-                    review.files.push((collection, names));
+                    review.files.push((collection, lines));
                 }
                 Self::Review(review)
             }
@@ -1512,7 +1516,19 @@ mod tests {
 
         let review = Review {
             secrets: vec![("latem".into(), vec!["prod/SENTRY_DSN".into()])],
-            files: vec![("latem".into(), vec!["prod/upload.jks".into()])],
+            files: vec![(
+                "documents".into(),
+                vec![
+                    FileLine {
+                        name: "notes.md".into(),
+                        files: 1,
+                    },
+                    FileLine {
+                        name: "sample/".into(),
+                        files: 12,
+                    },
+                ],
+            )],
             wrote_last: vec![(
                 "latem".into(),
                 vec![
@@ -1531,7 +1547,14 @@ mod tests {
             panic!("not a review");
         };
         assert_eq!(decoded.secrets[0].1, ["prod/SENTRY_DSN"]);
-        assert_eq!(decoded.files[0].1, ["prod/upload.jks"]);
+        assert_eq!(decoded.files[0].0, "documents");
+        assert_eq!(
+            decoded.files[0].1[1],
+            FileLine {
+                name: "sample/".into(),
+                files: 12,
+            }
+        );
         assert_eq!(decoded.wrote_last[0].1.len(), 2);
         assert!(decoded.wrote_last[0].1[1].deleted);
         let Response::ScopeSet {

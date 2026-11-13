@@ -5,7 +5,7 @@ mod revoke;
 mod sync;
 
 pub use files::{CACHE_LIMIT, CHUNK_RETENTION_SECS, Placement, SWEEP_BATCH, Swept, WrittenChunk};
-pub use revoke::{Review, Revocation, ScopeChange, Written};
+pub use revoke::{FileLine, NAMED_FILES, Review, Revocation, ScopeChange, Written};
 pub use sync::Received;
 
 use std::collections::HashMap;
@@ -2310,7 +2310,13 @@ mod tests {
         );
         assert_eq!(
             review.files,
-            [("latem".to_owned(), vec!["prod/upload.jks".to_owned()])]
+            [(
+                "latem".to_owned(),
+                vec![FileLine {
+                    name: "prod/upload.jks".to_owned(),
+                    files: 1
+                }]
+            )]
         );
         assert!(
             review.wrote_last.is_empty(),

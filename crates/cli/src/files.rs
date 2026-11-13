@@ -525,7 +525,7 @@ fn signature(path: &Path) -> Option<(u64, i64, i64, i64, u64)> {
 }
 
 /// Opens `path` in its default app: `open` on macOS, which returns once the app has it, or
-/// `xdg-open` elsewhere, which may stay with it, so it isn't waited for.
+/// `xdg-open` elsewhere, which may stay with it, so it's waited for only 2 seconds.
 #[cfg(unix)]
 fn launch(path: &Path) -> Result<()> {
     let mut command = process::Command::new(if cfg!(target_os = "macos") {
@@ -543,7 +543,23 @@ fn launch(path: &Path) -> Result<()> {
             bail!("open found no app for it");
         }
     } else {
-        command.spawn().context("can't run xdg-open")?;
+        // It may run the app itself and stay until the app quits, so it gets 2 seconds: if it
+        // fails in that time, as when no app takes the file's type, that's said with where the
+        // copy is, rather than its own complaint.
+        let mut child = command
+            .stderr(process::Stdio::null())
+            .spawn()
+            .context("can't run xdg-open")?;
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(2) {
+            if let Some(status) = child.try_wait()? {
+                if !status.success() {
+                    bail!("xdg-open found no app for it, {status}");
+                }
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     Ok(())
 }

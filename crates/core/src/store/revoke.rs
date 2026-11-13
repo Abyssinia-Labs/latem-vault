@@ -42,12 +42,26 @@ pub struct Review {
     /// Each collection it can read, with the names of its current secrets, to change at their
     /// providers once it's revoked.
     pub secrets: Vec<(String, Vec<String>)>,
-    /// Each collection it can read, with the names of its current files, to replace where they
-    /// hold a key, such as a keystore or an API key's `.p8`. Listed whether or not it fetched
-    /// their chunks: it could have.
-    pub files: Vec<(String, Vec<String>)>,
+    /// Each collection it can read, with its current files, to replace where they hold a key,
+    /// such as a keystore or an API key's `.p8`. Listed whether or not it fetched their chunks:
+    /// it could have. A collection with more than [`NAMED_FILES`] lists each folder at its top
+    /// as one line, so a documents folder doesn't make the list as long as the folder.
+    pub files: Vec<(String, Vec<FileLine>)>,
     /// Each collection's current entries that it wrote last.
     pub wrote_last: Vec<(String, Vec<Written>)>,
+}
+
+/// A collection with at most this many files names each of them in a review.
+pub const NAMED_FILES: usize = 10;
+
+/// A line of a review's files: one file, or a folder at the top of the collection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileLine {
+    /// The file's name, or the folder's, which ends in `/`.
+    pub name: String,
+    /// How many files: 1 for a file. A folder holds at least 2, since a folder with one file
+    /// is listed as that file.
+    pub files: u32,
 }
 
 /// A current entry, as written by one device.
@@ -63,6 +77,45 @@ struct Current {
     kind: Kind,
     deleted: bool,
     record_id: Vec<u8>,
+}
+
+/// A collection's files as a review lists them: each by name when there are at most
+/// [`NAMED_FILES`], and otherwise each folder at the top as one line with its count. Files at
+/// the top of the collection are named either way.
+fn listed(names: Vec<String>) -> Vec<FileLine> {
+    if names.len() <= NAMED_FILES {
+        return names
+            .into_iter()
+            .map(|name| FileLine { name, files: 1 })
+            .collect();
+    }
+    // Each line, and for a folder the name of its first file, in case it's the only one.
+    let mut lines: Vec<(FileLine, Option<String>)> = Vec::new();
+    let mut folders: HashMap<String, usize> = HashMap::new();
+    for name in names {
+        let Some((folder, _)) = name.split_once('/') else {
+            lines.push((FileLine { name, files: 1 }, None));
+            continue;
+        };
+        match folders.get(folder) {
+            Some(&at) => lines[at].0.files += 1,
+            None => {
+                folders.insert(folder.to_owned(), lines.len());
+                let line = FileLine {
+                    name: format!("{folder}/"),
+                    files: 1,
+                };
+                lines.push((line, Some(name)));
+            }
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(line, first)| match first {
+            Some(name) if line.files == 1 => FileLine { name, files: 1 },
+            _ => line,
+        })
+        .collect()
 }
 
 impl<K: DeviceKeys> Vault<K> {
@@ -84,7 +137,7 @@ impl<K: DeviceKeys> Vault<K> {
                     }
                 }
                 review.secrets.push((collection.name.clone(), secrets));
-                review.files.push((collection.name.clone(), files));
+                review.files.push((collection.name.clone(), listed(files)));
             }
             let written: Vec<Written> = self
                 .written_by(collection.id, device)?
@@ -468,5 +521,56 @@ impl<K: DeviceKeys> Vault<K> {
         }
         written.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileLine, NAMED_FILES, listed};
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|&name| name.to_owned()).collect()
+    }
+
+    fn line(name: &str, files: u32) -> FileLine {
+        FileLine {
+            name: name.to_owned(),
+            files,
+        }
+    }
+
+    #[test]
+    fn a_review_names_up_to_ten_files() {
+        let few = names(&["docs/a.txt", "docs/b.txt", "upload.jks"]);
+        assert_eq!(
+            listed(few),
+            [
+                line("docs/a.txt", 1),
+                line("docs/b.txt", 1),
+                line("upload.jks", 1)
+            ]
+        );
+        let ten: Vec<String> = (0..NAMED_FILES).map(|i| format!("docs/{i}.txt")).collect();
+        assert_eq!(listed(ten).len(), NAMED_FILES);
+    }
+
+    #[test]
+    fn past_ten_a_review_counts_each_folder_at_the_top() {
+        let mut many = names(&["a.txt", "keys/upload.jks", "notes.md"]);
+        many.extend((0..10).map(|i| format!("docs/2026/{i}.txt")));
+        many.push("docs/passport.pdf".to_owned());
+        many.push("docs.txt".to_owned());
+        assert_eq!(
+            listed(many),
+            [
+                line("a.txt", 1),
+                // A folder with one file is that file.
+                line("keys/upload.jks", 1),
+                line("notes.md", 1),
+                line("docs/", 11),
+                // A file at the top beside a folder of the same stem stays apart.
+                line("docs.txt", 1),
+            ]
+        );
     }
 }

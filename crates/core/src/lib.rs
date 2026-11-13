@@ -21,8 +21,9 @@ pub use ids::{CollectionId, DeviceId, VaultId};
 pub use keys::{DeviceKeys, SoftwareKeys, transport_seed};
 pub use record::{Kind, Version};
 pub use store::{
-    Approval, CACHE_LIMIT, CHUNK_RETENTION_SECS, CollectionInfo, Entry, EntryInfo, Placement,
-    Received, Review, Revocation, SWEEP_BATCH, ScopeChange, Swept, Vault, Written, WrittenChunk,
+    Approval, CACHE_LIMIT, CHUNK_RETENTION_SECS, CollectionInfo, Entry, EntryInfo, FileLine,
+    NAMED_FILES, Placement, Received, Review, Revocation, SWEEP_BATCH, ScopeChange, Swept, Vault,
+    Written, WrittenChunk,
 };
 
 #[derive(Debug, thiserror::Error)]

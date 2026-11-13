@@ -260,12 +260,28 @@ pub struct CollectionNames {
     pub names: Vec<String>,
 }
 
+/// A line of a review's files: one file, or a folder at the top of its collection.
+#[derive(Debug, uniffi::Record)]
+pub struct FileLine {
+    /// The file's name, or the folder's, which ends in `/`.
+    pub name: String,
+    /// 1 for a file, and how many it holds for a folder.
+    pub files: u32,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct CollectionFiles {
+    pub collection: String,
+    pub files: Vec<FileLine>,
+}
+
 #[derive(Debug, uniffi::Record)]
 pub struct Review {
     /// Each collection the device can read, with its current secrets' names.
     pub secrets: Vec<CollectionNames>,
-    /// Each collection the device can read, with its current files' names.
-    pub files: Vec<CollectionNames>,
+    /// Each collection the device can read, with its current files: each named when it has at
+    /// most 10, and otherwise each folder at its top as one line with its count.
+    pub files: Vec<CollectionFiles>,
     /// Each collection's current entries the device wrote last.
     pub wrote_last: Vec<CollectionNames>,
 }
@@ -867,7 +883,16 @@ impl Client {
                 files: review
                     .files
                     .into_iter()
-                    .map(|(collection, names)| CollectionNames { collection, names })
+                    .map(|(collection, lines)| CollectionFiles {
+                        collection,
+                        files: lines
+                            .into_iter()
+                            .map(|line| FileLine {
+                                name: line.name,
+                                files: line.files,
+                            })
+                            .collect(),
+                    })
                     .collect(),
                 wrote_last: review
                     .wrote_last

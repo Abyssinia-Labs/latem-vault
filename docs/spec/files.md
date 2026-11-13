@@ -1,6 +1,6 @@
 # Files spec, v1
 
-Status: stage 1 built in 0.4.0, 2026-11-11: files on one device, with the manifest, chunks, the local store, `import`, `get`, `list`, `run` and `placement`. Stage 2 built in 0.5.0, 2026-11-12: chunk sync over `openvault/chunks/1`, fetching, and the on-demand cache's limit. Stage 3 built in 0.5.1, 2026-11-12: `open`. Stage 4 built in 0.5.2 and the Mac app, 2026-11-12: files in the app (below). Stage 5 under way: since 0.5.3, 2026-11-12, a revoke lists the files the device could read. Builds on [records.md](records.md), [crypto.md](crypto.md) and [sync.md](sync.md). The design is in [design §13](../design.md#13-files), and it settles [§19, decision 3](../design.md#19-open-decisions).
+Status: stage 1 built in 0.4.0, 2026-11-11: files on one device, with the manifest, chunks, the local store, `import`, `get`, `list`, `run` and `placement`. Stage 2 built in 0.5.0, 2026-11-12: chunk sync over `openvault/chunks/1`, fetching, and the on-demand cache's limit. Stage 3 built in 0.5.1, 2026-11-12: `open`. Stage 4 built in 0.5.2 and the Mac app, 2026-11-12: files in the app (below). Stage 5 built in 0.5.3 and 0.5.4, 2026-11-12: the other machines. A revoke lists the files the device could read, a folder at a time past 10, and a documents folder was imported, opened and saved on the MacBook, the desktop and the mini, which finished M4 (design §18). Builds on [records.md](records.md), [crypto.md](crypto.md) and [sync.md](sync.md). The design is in [design §13](../design.md#13-files), and it settles [§19, decision 3](../design.md#19-open-decisions).
 
 A file is an entry like a secret: a name in a collection, with versions, written by devices with `write` and read by devices with `read`. Its record holds a manifest. A small file's bytes are in the manifest; a larger file's are in sealed chunks, which live outside the database and travel between devices only when a device needs them.
 
@@ -127,7 +127,7 @@ openvault list <collection>[/<folder>]                         files show their 
 **get** writes a file's bytes to stdout, or to `-o <path>` with mode 0600 (0700 if it's executable) and its `mtime`. The path is written through a private file beside it, renamed into place once whole. `-o` also writes a secret's or variable's value; without it they print as before.
 
 **open**
-- It fetches the file's chunks if any aren't here, as `get` does. It then writes the file to a private directory (0700) in the user's temporary directory, under the file's own name, and opens it with its default app (`open` on macOS, `xdg-open` on Linux). If that fails, it says where the copy is.
+- It fetches the file's chunks if any aren't here, as `get` does. It then writes the file to a private directory (0700) in the user's temporary directory, under the file's own name, and opens it with its default app (`open` on macOS, `xdg-open` on Linux). If that fails, it says where the copy is. `xdg-open` may stay running with the app, so it's given 2 seconds: one that fails in that time, as when no app takes the file's type, counts as failing (since 0.5.4).
 - It stays in the foreground. Each time the copy is saved, it writes a new version, once the file has been unchanged for 2 seconds, so an app that saves in several steps makes one version. A save is noticed by the copy's length, modification and change times, and inode, looked at every half second. A save whose contents are the same as the last version's, as when only the time changed, writes nothing.
 - On a device that can read the collection but not write to it, the copy is read-only (0400), so its app shows it can't be changed, and nothing is saved.
 - It ends on Enter or Ctrl-C (or SIGTERM or SIGHUP). A save that hasn't become a version yet is written first, then the copy and its directory are deleted. If that write fails, the copy stays, and it says where. There is no general way to see an app close a document, so it says so when it starts.
@@ -155,7 +155,7 @@ Since 0.5.2 the Swift bindings list files with their sizes and how many of their
 - **Imports** files and folders, from the file picker or dropped on a collection, with `import`'s rules for names, what's left out and disk encryption; the sheet lists what it will write before it does. A file whose contents haven't changed isn't written again.
 - **Shows and sets placement** for a collection with files: keep all, or on demand.
 - ⌘K finds secrets and variables only, since it copies values.
-- **Revoking** a device lists the files it could read after its secrets, in the review and in the list to tick off once it's revoked, each with the command that imports a new copy (since 0.5.3).
+- **Revoking** a device lists the files it could read after its secrets, in the review and in the list to tick off once it's revoked, each with the command that imports a new copy (since 0.5.3). Past 10 files in a collection, a folder at its top is one line, with how many files it holds (since 0.5.4).
 
 ## Cost
 

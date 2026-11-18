@@ -145,7 +145,7 @@ jobs:
           # The short names, as latem has ltm: relative links, so they run the latem-vault
           # beside them wherever the archive is unpacked. The same list as SHORT in
           # crates/cli/src/name.rs.
-          short_names="vault lv"
+          short_names="lv vlt"
           for name in $short_names; do
             ln -s latem-vault "dist/$name"
           done

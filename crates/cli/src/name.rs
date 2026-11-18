@@ -1,5 +1,5 @@
-//! The name the person typed for this command, which hints use: someone who typed `vault` is told
-//! to run `vault service install`. Homebrew and the release archives put in `vault` and `lv` as
+//! The name the person typed for this command, which hints use: someone who typed `lv` is told
+//! to run `lv service install`. Homebrew and the release archives put in `lv` and `vlt` as
 //! links to `latem-vault`. Any other name, such as the `openvault` shim's (which runs this binary
 //! as `latem-vault`) or a copy renamed by hand, gets `latem-vault`, the name latem looks for.
 //!
@@ -18,7 +18,7 @@ pub const FULL: &str = "latem-vault";
 
 /// The short names, as latem has `ltm`. The same list is in release.yml's archive step, the
 /// test that runs them (tests/cli.rs) and the README, and the tap's formula links them.
-const SHORT: [&str; 2] = ["vault", "lv"];
+const SHORT: [&str; 2] = ["lv", "vlt"];
 
 /// The name to put in hints for a program run as `argv0`.
 pub fn chosen(argv0: Option<&OsStr>) -> &'static str {
@@ -149,8 +149,8 @@ mod tests {
     #[test]
     fn hints_name_the_command_as_typed() {
         assert_eq!(
-            hint_as("run `latem-vault service install` here", "vault"),
-            "run `vault service install` here"
+            hint_as("run `latem-vault service install` here", "vlt"),
+            "run `vlt service install` here"
         );
         assert_eq!(
             hint_as(
@@ -172,7 +172,7 @@ mod tests {
             "macOS asks whether latem-vault may find devices on your local network",
             "Written to ~/.latem-vault/keys",
         ] {
-            assert!(matches!(hint_as(text, "vault"), Cow::Borrowed(t) if t == text));
+            assert!(matches!(hint_as(text, "vlt"), Cow::Borrowed(t) if t == text));
         }
         let text = "run `latem-vault init`";
         assert!(matches!(hint_as(text, FULL), Cow::Borrowed(t) if t == text));

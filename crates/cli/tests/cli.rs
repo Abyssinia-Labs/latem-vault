@@ -2002,7 +2002,7 @@ fn approve_goes_through_the_service() {
     assert!(devices.contains("Joiner"), "{devices}");
 }
 
-/// Run as `vault` or `lv`, the links Homebrew and the release archives put in, hints and help name
+/// Run as `lv` or `vlt`, the links Homebrew and the release archives put in, hints and help name
 /// the command as typed. `--version` still says `latem-vault`, which latem and the tap look for.
 #[cfg(unix)]
 #[test]
@@ -2026,7 +2026,7 @@ fn hints_name_the_command_as_typed() {
     };
 
     // The short names: SHORT in src/name.rs.
-    for name in ["vault", "lv"] {
+    for name in ["lv", "vlt"] {
         let (ok, text) = run(name, &["list", "latem"]);
         assert!(!ok);
         assert!(

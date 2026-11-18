@@ -2001,3 +2001,58 @@ fn approve_goes_through_the_service() {
     let devices = admin.ok(&["devices"]);
     assert!(devices.contains("Joiner"), "{devices}");
 }
+
+/// Run as `lv` or `vlt`, the links Homebrew and the release archives put in, hints and help name
+/// the command as typed. `--version` still says `latem-vault`, which latem and the tap look for.
+#[cfg(unix)]
+#[test]
+fn hints_name_the_command_as_typed() {
+    let links = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let run = |name: &str, args: &[&str]| {
+        let link = links.path().join(name);
+        if !link.exists() {
+            std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_latem-vault"), &link).unwrap();
+        }
+        let output = Command::new(&link)
+            .args(args)
+            .env("LATEM_VAULT_HOME", home.path().join("none"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        (output.status.success(), text)
+    };
+
+    // The short names: SHORT in src/name.rs.
+    for name in ["lv", "vlt"] {
+        let (ok, text) = run(name, &["list", "latem"]);
+        assert!(!ok);
+        assert!(
+            text.starts_with(&format!("{name}: no vault in "))
+                && text.contains(&format!("run `{name} init` to make one, or `{name} join`")),
+            "{text}"
+        );
+        let (ok, text) = run(name, &["join", "--help"]);
+        assert!(ok, "{text}");
+        assert!(
+            text.contains(&format!("type into `{name} approve` there")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("Usage: {name} join")), "{text}");
+        let (ok, text) = run(name, &["--version"]);
+        assert!(ok && text.starts_with("latem-vault "), "{text}");
+    }
+
+    // Any other name, such as a link left as openvault, gets the binary's own.
+    let (ok, text) = run("openvault", &["list", "latem"]);
+    assert!(!ok);
+    assert!(
+        text.starts_with("latem-vault: no vault in ")
+            && text.contains("run `latem-vault init` to make one"),
+        "{text}"
+    );
+    let (_, text) = run("openvault", &["--help"]);
+    assert!(text.contains("Usage: latem-vault <COMMAND>"), "{text}");
+}

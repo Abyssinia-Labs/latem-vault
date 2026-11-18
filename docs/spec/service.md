@@ -23,7 +23,7 @@ All integers are big-endian.
 
 **install**
 - It refuses keys that need a passphrase, since nobody would be there to type it. It names two ways out: `openvault keys passphrase --remove` (keystore.md, changing the protection), or starting the service by hand.
-- The definition runs the binary that `install` was run from, by its absolute path. A binary in a cargo `target` directory changes with each build, so `install` warns about one.
+- The definition runs the binary that `install` was run from, by its absolute path. A binary in a cargo `target` directory changes with each build, so `install` warns about one. For a Homebrew install, that path is the formula's `opt` link (`<prefix>/opt/latem-vault/bin/latem-vault`), worked out from the keg's `<prefix>/Cellar/latem-vault/<version>/bin/latem-vault` when the link leads to it. The keg goes away with the next `brew upgrade`, and the link moves onto the new one. Until latem vault 0.6.0, definitions named the keg.
 - `OPENVAULT_HOME`, when it's set, goes into the definition.
 - It stops if a service is already running that the operating system didn't start, such as one in a terminal. That one has to be stopped first.
 - Running it again is safe, and it's how a new build takes over: it writes the definition again and restarts the service.

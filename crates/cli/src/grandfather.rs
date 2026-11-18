@@ -76,7 +76,7 @@ pub fn run(home: &Home, args: Args) -> Result<()> {
                 listen: Listen::all(args.port),
             })
             .await?;
-            println!(
+            crate::name::say!(
                 "Give the vault's devices this address with `latem-vault coordinator set`:\n  {}",
                 grandfather.address()
             );
@@ -112,7 +112,7 @@ pub fn show(home: &Home) -> Result<()> {
             println!(
                 "None: this device finds the vault's other devices on the local network only."
             );
-            println!(
+            crate::name::say!(
                 "To reach them away from home, run `latem-vault grandfather --vault {vault} \
                  --hostname <name>` on the vault's always-on machine, then `latem-vault coordinator \
                  set <the address it shows>` here."
@@ -150,7 +150,7 @@ pub fn unset(home: &Home) -> Result<()> {
 fn restart_note(home: &Home) {
     #[cfg(unix)]
     if latem_vault_service::client::is_running(&home.0.join(latem_vault_service::SOCKET)) {
-        println!(
+        crate::name::say!(
             "The service takes this up when it starts again: `latem-vault service install` \
              restarts it if it's installed."
         );

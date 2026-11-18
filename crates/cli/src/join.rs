@@ -36,7 +36,7 @@ pub fn join(home: &Home, backend: Backend, name: String) -> Result<()> {
 
     println!("Joining as {} ({}).", name.name, name.platform);
     println!();
-    println!(
+    crate::name::say!(
         "On a device that administers the vault, run `latem-vault approve` and enter this code:"
     );
     println!();
@@ -64,7 +64,7 @@ pub fn join(home: &Home, backend: Backend, name: String) -> Result<()> {
     println!();
     println!("Joined the vault {} as {}.", vault.vault_id(), name.name);
     println!();
-    println!("{}", crate::START_THE_SERVICE);
+    crate::name::say!("{}", crate::START_THE_SERVICE);
     Ok(())
 }
 

@@ -119,7 +119,7 @@ pub fn uninstall() -> Result<()> {
         Ok(()) => println!("Removed {}. The vault is untouched.", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => match app_state()? {
             _ if removed_old => {}
-            Some(_) => println!(
+            Some(_) => crate::name::say!(
                 "`latem-vault service install` didn't start the service here; the Mac app does. \
                  Turn it off in System Settings > General > Login Items."
             ),
@@ -142,14 +142,14 @@ pub fn status(home: &Home) -> Result<()> {
         (false, None) => println!("Installed    no"),
     }
     if let Some(old) = old_definition_path().ok().filter(|old| old.exists()) {
-        println!(
+        crate::name::say!(
             "Also installed {}, openvault's service from before 0.6. `latem-vault service \
              install` replaces it.",
             old.display()
         );
     }
     if installed && app.is_some() {
-        println!(
+        crate::name::say!(
             "Both this definition and the Mac app start the service, and only one service runs. \
              `latem-vault service uninstall` removes this one."
         );
@@ -183,13 +183,13 @@ pub fn status(home: &Home) -> Result<()> {
             if version != VERSION && by_app {
                 println!("The service runs the Mac app's build. Updating the app moves it on.");
             } else if version != VERSION {
-                println!(
+                crate::name::say!(
                     "The service runs another build. `latem-vault service install` moves it onto \
                      this one."
                 );
             }
         }
-        Some(_) => println!(
+        Some(_) => crate::name::say!(
             "Service      an older build, from before 0.2.2. `latem-vault service install` moves \
              it onto this one."
         ),
@@ -212,8 +212,8 @@ pub fn installed() -> bool {
 pub(crate) fn old_definition_blocks_move() -> Option<String> {
     let path = old_definition_path().ok()?;
     let contents = fs::read_to_string(&path).ok()?;
-    let exe = std::env::current_exe().and_then(fs::canonicalize).ok()?;
-    if runs(&contents, exe.to_str()?) {
+    let exe = this_binary().ok()?;
+    if runs(&contents, exe.to_str()?) || runs(&contents, utf8(&stable(&exe)).ok()?.as_str()) {
         return None;
     }
     Some(format!(
@@ -241,11 +241,47 @@ pub(crate) fn app_blocks_move() -> Option<String> {
     )
 }
 
+/// This binary's path, with every link resolved.
+fn this_binary() -> Result<PathBuf> {
+    std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .context("can't find this binary")
+}
+
+/// The path a definition should start for `exe`, a resolved path. For a Homebrew install that's
+/// the formula's `opt` link, not the versioned keg `exe` resolves into: `brew upgrade` moves
+/// `opt` onto the new keg and deletes the old one, which a definition naming the keg would go on
+/// starting. Only when `opt` leads to `exe` itself, so the service starts what was installed.
+fn stable(exe: &Path) -> PathBuf {
+    homebrew_opt(exe)
+        .filter(|opt| fs::canonicalize(opt).is_ok_and(|target| target == exe))
+        .unwrap_or_else(|| exe.to_owned())
+}
+
+/// `<prefix>/opt/<formula>/bin/<name>` for `<prefix>/Cellar/<formula>/<version>/bin/<name>`, the
+/// way Homebrew lays out a keg on macOS and on Linux. Worked out from the path alone.
+fn homebrew_opt(exe: &Path) -> Option<PathBuf> {
+    let name = exe.file_name()?;
+    let bin = exe.parent()?;
+    let keg = bin.parent()?;
+    let formula = keg.parent()?;
+    let cellar = formula.parent()?;
+    if bin.file_name()? != "bin" || cellar.file_name()? != "Cellar" {
+        return None;
+    }
+    Some(
+        cellar
+            .parent()?
+            .join("opt")
+            .join(formula.file_name()?)
+            .join("bin")
+            .join(name),
+    )
+}
+
 impl Definition {
     fn for_this_binary() -> Result<Self> {
-        let exe = std::env::current_exe()
-            .and_then(fs::canonicalize)
-            .context("can't find this binary")?;
+        let exe = stable(&this_binary()?);
         let home = match home::var_os(HOME_VAR, OLD_HOME_VAR) {
             Some(dir) => Some(std::path::absolute(PathBuf::from(dir))?),
             None => None,
@@ -774,6 +810,64 @@ use system::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_homebrew_keg_is_started_through_opt() {
+        for (keg, opt) in [
+            (
+                "/opt/homebrew/Cellar/latem-vault/0.6.0_1/bin/latem-vault",
+                "/opt/homebrew/opt/latem-vault/bin/latem-vault",
+            ),
+            (
+                "/usr/local/Cellar/latem-vault/0.7.0/bin/latem-vault",
+                "/usr/local/opt/latem-vault/bin/latem-vault",
+            ),
+            (
+                "/home/linuxbrew/.linuxbrew/Cellar/latem-vault/0.6.0/bin/latem-vault",
+                "/home/linuxbrew/.linuxbrew/opt/latem-vault/bin/latem-vault",
+            ),
+        ] {
+            assert_eq!(
+                homebrew_opt(Path::new(keg)).as_deref(),
+                Some(Path::new(opt))
+            );
+        }
+        for elsewhere in [
+            "/Users/me/.cargo/bin/latem-vault",
+            "/Users/me/.local/bin/latem-vault",
+            "/opt/homebrew/Cellar/latem-vault/0.6.0/libexec/latem-vault",
+            "/Cellar/x/bin/latem-vault",
+            "latem-vault",
+        ] {
+            assert_eq!(homebrew_opt(Path::new(elsewhere)), None, "{elsewhere}");
+        }
+    }
+
+    /// The definition names `opt` only when it leads to this very binary: a keg laid out on disk
+    /// as Homebrew does, then one whose `opt` has moved on to another version.
+    #[cfg(unix)]
+    #[test]
+    fn opt_is_named_only_when_it_leads_here() {
+        let prefix = tempfile::tempdir().unwrap();
+        let prefix = fs::canonicalize(prefix.path()).unwrap();
+        let keg = |version: &str| {
+            let bin = prefix.join("Cellar/latem-vault").join(version).join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            fs::write(bin.join("latem-vault"), "").unwrap();
+            bin.join("latem-vault")
+        };
+        let old = keg("0.6.0");
+        let new = keg("0.7.0");
+        fs::create_dir_all(prefix.join("opt")).unwrap();
+        let opt = prefix.join("opt/latem-vault");
+        std::os::unix::fs::symlink("../Cellar/latem-vault/0.6.0", &opt).unwrap();
+
+        let through_opt = prefix.join("opt/latem-vault/bin/latem-vault");
+        assert_eq!(stable(&old), through_opt);
+        assert_eq!(stable(&new), new);
+        fs::remove_file(&opt).unwrap();
+        assert_eq!(stable(&old), old);
+    }
 
     fn definition(exe: &str, home: Option<&str>) -> Definition {
         Definition {

@@ -63,6 +63,8 @@ pub fn join(home: &Home, backend: Backend, name: String) -> Result<()> {
     let vault = joined.context("run `openvault join` again for a new code")?;
     println!();
     println!("Joined the vault {} as {}.", vault.vault_id(), name.name);
+    println!();
+    println!("{}", crate::START_THE_SERVICE);
     Ok(())
 }
 

@@ -199,6 +199,7 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
                 .map(|collection| collection.name)
                 .collect(),
         ),
+        Request::Scopes => Response::Scopes(scopes(vault)?),
         Request::CreateCollection {
             name,
             recovery_phrase,
@@ -491,6 +492,27 @@ fn summaries(vault: &Vault<Keys>) -> Result<Vec<CollectionSummary>> {
         });
     }
     Ok(summaries)
+}
+
+/// This device's scope on each collection the log names, by name, or by id until a record has
+/// brought the name. They tell an empty `openvault collections` whether names haven't synced yet
+/// or this device may read nothing.
+fn scopes(vault: &Vault<Keys>) -> Result<Vec<(String, Scope)>> {
+    let Some(membership) = vault.membership() else {
+        return Ok(Vec::new());
+    };
+    let names = vault.collections()?;
+    let this = vault.device_id();
+    Ok(membership
+        .collections()
+        .map(|id| {
+            let name = names
+                .iter()
+                .find(|collection| collection.id == id)
+                .map_or_else(|| id.to_string(), |collection| collection.name.clone());
+            (name, membership.scope(this, id))
+        })
+        .collect())
 }
 
 /// Up to `max` log entries from seq `from`, as an app shows them.

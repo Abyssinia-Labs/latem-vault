@@ -389,11 +389,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         Command::Keys {
             action: Some(KeysAction::Passphrase { remove: true }),
         } => keys::remove_passphrase(&home)?,
-        Command::Collections { action: None } => {
-            for name in home.access()?.collections()? {
-                println!("{name}");
-            }
-        }
+        Command::Collections { action: None } => collections(&home)?,
         Command::Collections {
             action: Some(CollectionsAction::Create { name }),
         } => create_collection(&home, &name)?,
@@ -485,7 +481,8 @@ impl Home {
     fn require_vault(&self) -> Result<()> {
         if !self.vault().exists() {
             bail!(
-                "no vault in {}; run `openvault init` first",
+                "no vault in {}; run `openvault init` to make one, or `openvault join` to join one \
+                 from another device",
                 self.0.display()
             );
         }
@@ -975,6 +972,84 @@ fn revoke(home: &Home, query: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Lists the collections this device can read, one per line. With none, says on stderr why and
+/// what to do next, so stdout stays empty for scripts.
+fn collections(home: &Home) -> Result<()> {
+    let mut access = home.access()?;
+    let names = access.collections()?;
+    for name in &names {
+        println!("{name}");
+    }
+    if names.is_empty() {
+        eprintln!("{}", why_no_collections(&mut access)?);
+    }
+    Ok(())
+}
+
+/// Why `openvault collections` has nothing to list.
+fn why_no_collections(access: &mut Access) -> Result<String> {
+    let scopes = match access.call(Request::Scopes)? {
+        Response::Scopes(scopes) => scopes,
+        // A service older than 0.5.9 doesn't know the request.
+        Response::Error { message, .. } if message.contains("unknown request") => {
+            return Ok(
+                "No collections here yet. The running service is an older build of \
+                 openvault; `openvault service install` restarts it on this one."
+                    .to_owned(),
+            );
+        }
+        other => return Err(unexpected(&other)),
+    };
+    if scopes.is_empty() {
+        return Ok("No collections yet. `openvault collections create NAME` makes one.".to_owned());
+    }
+    let readable = scopes
+        .iter()
+        .filter(|(_, scope)| matches!(scope, Scope::Read | Scope::Write))
+        .count();
+    if readable == 0 {
+        let devices = access.devices()?;
+        let name = devices
+            .iter()
+            .find(|device| device.this)
+            .and_then(|device| device.name.as_ref())
+            .map_or("DEVICE", |(_, name)| name.as_str());
+        return Ok(format!(
+            "This device can't read any collection yet. On a device that administers the vault, \
+             run `openvault scope {name} COLLECTION read`."
+        ));
+    }
+    let may_read = format!(
+        "This device may read {}, but nothing has synced yet.",
+        counted(readable, "collection")
+    );
+    Ok(if access.is_service() {
+        let mut why = format!(
+            "{may_read} It syncs once another device that reads them is on this network with \
+             its service running."
+        );
+        if cfg!(target_os = "macos") {
+            why.push_str(
+                " If macOS asked whether openvault may find devices on your local network, \
+                 allow it in System Settings > Privacy & Security > Local Network.",
+            );
+        }
+        why
+    } else {
+        format!("{may_read} {START_THE_SERVICE}")
+    })
+}
+
+/// What a device that may read collections needs before anything syncs, which `join` and an
+/// empty `collections` say.
+const START_THE_SERVICE: &str = if cfg!(target_os = "macos") {
+    "Devices sync through the service: run `openvault service install` to start it at login. \
+     macOS then asks whether openvault may find devices on your local network. Allow it, or \
+     this Mac can't sync."
+} else {
+    "Devices sync through the service: run `openvault service install` to start it at login."
+};
 
 /// `1 secret`, `2 secrets`.
 fn counted(count: usize, noun: &str) -> String {

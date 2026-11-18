@@ -258,7 +258,44 @@ fn the_version_names_the_build() {
 fn commands_need_a_vault() {
     let device = Device::empty();
     assert!(device.fails(&["get", "latem/x"]).contains("openvault init"));
-    assert!(device.fails(&["collections"]).contains("openvault init"));
+    let error = device.fails(&["collections"]);
+    assert!(
+        error.contains("openvault init") && error.contains("`openvault join` to join one"),
+        "{error}"
+    );
+}
+
+/// Runs `openvault collections` where it has nothing to list: stdout stays empty for scripts,
+/// and stderr, returned, says why.
+fn no_collections(device: &Device) -> String {
+    let output = device.run(&["collections"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{stderr}");
+    stderr
+}
+
+#[test]
+fn collections_says_how_to_make_the_first() {
+    let device = Device::empty();
+    device.ok(&["init", "--keys", "software", "--name", "test"]);
+    assert_eq!(
+        no_collections(&device),
+        "No collections yet. `openvault collections create NAME` makes one.\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn collections_says_when_this_device_may_read_none() {
+    let admin = Device::new();
+    let joiner = Device::empty();
+    join_with(&admin, &joiner, &[]);
+    assert_eq!(
+        no_collections(&joiner),
+        "This device can't read any collection yet. On a device that administers the vault, \
+         run `openvault scope Desktop COLLECTION read`.\n"
+    );
 }
 
 #[test]
@@ -1311,6 +1348,17 @@ fn a_device_joins_with_a_code() {
         rest.iter().any(|line| line.starts_with("Joined the vault")),
         "{rest:?}"
     );
+    // The next step, since nothing syncs until the service runs.
+    let next = rest.last().unwrap();
+    assert!(
+        next.starts_with("Devices sync through the service: run `openvault service install`"),
+        "{rest:?}"
+    );
+    assert_eq!(
+        next.contains("find devices on your local network"),
+        cfg!(target_os = "macos"),
+        "{next}"
+    );
     assert!(!joiner.home.path().join("joining").exists());
 
     // Each device's log now lists both, with names that open on either.
@@ -1347,6 +1395,12 @@ fn eventually(device: &Device, args: &[&str], expected: &str) {
 /// Joins `joiner` to `admin`'s vault with read on latem, through the CLI.
 #[cfg(unix)]
 fn join(admin: &Device, joiner: &Device) {
+    join_with(admin, joiner, &["--read", "latem"]);
+}
+
+/// Joins `joiner` to `admin`'s vault as Desktop, approved with `scopes`.
+#[cfg(unix)]
+fn join_with(admin: &Device, joiner: &Device, scopes: &[&str]) {
     use std::io::{BufRead, BufReader};
 
     let _turn = JOINING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1370,7 +1424,7 @@ fn join(admin: &Device, joiner: &Device) {
         }
     };
     let answers = format!("{code}\ny\n{}\n", admin.phrase);
-    let output = admin.run_with_stdin(&["approve", "--read", "latem"], answers.as_bytes());
+    let output = admin.run_with_stdin(&[&["approve"], scopes].concat(), answers.as_bytes());
     assert!(
         output.status.success(),
         "{}",
@@ -1449,10 +1503,33 @@ fn services_sync_a_joined_device() {
     admin.set("latem/prod/SENTRY_DSN", "--secret", b"https://sentry");
     let joiner = Device::empty();
     join(&admin, &joiner);
-    assert_eq!(joiner.ok(&["collections"]), "", "nothing before sync");
+    // Nothing before sync, and without a service nothing syncs.
+    let why = no_collections(&joiner);
+    assert!(
+        why.starts_with(
+            "This device may read 1 collection, but nothing has synced yet. Devices sync \
+             through the service: run `openvault service install`"
+        ),
+        "{why}"
+    );
+
+    let joiner_service = Service::start(&joiner);
+    // With its service running, it waits for another device to sync with.
+    let why = no_collections(&joiner);
+    assert!(
+        why.starts_with(
+            "This device may read 1 collection, but nothing has synced yet. It syncs once \
+             another device that reads them is on this network with its service running."
+        ),
+        "{why}"
+    );
+    assert_eq!(
+        why.contains("Privacy & Security > Local Network"),
+        cfg!(target_os = "macos"),
+        "{why}"
+    );
 
     let admin_service = Service::start(&admin);
-    let joiner_service = Service::start(&joiner);
     // The services find each other with mDNS and sync.
     eventually(&joiner, &["get", "latem/prod/SENTRY_DSN"], "https://sentry");
     assert_eq!(joiner.ok(&["collections"]), "latem\n");

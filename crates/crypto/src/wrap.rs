@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 
 use crate::{Error, SymmetricKey};
 
-const INFO_LABEL: &[u8] = b"openvault v1 wrap\0";
+const INFO_LABEL: &[u8] = crate::frozen::WRAP_INFO;
 const KEM_P256: u16 = 0x0010;
 const KEM_X25519: u16 = 0x0020;
 /// A wrapped 32-byte key plus the 16-byte ChaCha20-Poly1305 tag.

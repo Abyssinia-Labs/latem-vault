@@ -12,6 +12,7 @@
 
 pub mod aead;
 pub mod chunk;
+pub mod frozen;
 pub mod hash;
 pub mod pake;
 pub mod passphrase;

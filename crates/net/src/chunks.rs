@@ -20,7 +20,8 @@ use crate::frame::{self, FrameError, Reason};
 use crate::sync::blocking;
 use crate::wire::Reader;
 
-pub const ALPN: &[u8] = b"openvault/chunks/1";
+/// Frozen in [`openvault_crypto::frozen`]: it keeps the name `openvault` through any rename.
+pub const ALPN: &[u8] = openvault_crypto::frozen::ALPN_CHUNKS;
 
 /// The most chunks one want asks for.
 pub const MAX_WANT: usize = 64;

@@ -102,7 +102,7 @@ impl AdminSigner {
 /// What an admin key signs to ask for Touch ID ahead of the signatures that need it. Every
 /// signature openvault checks covers a context label first (`openvault v1 sig ...`), so this one
 /// can't pass for any of them, and it's dropped as soon as it's made.
-const PRESENCE: &[u8] = b"openvault v1 admin presence";
+const PRESENCE: &[u8] = openvault_crypto::frozen::ADMIN_PRESENCE;
 
 /// A device's wrapping and signing keys in the Secure Enclave, plus its local key, which is
 /// kept in the key file wrapped to the Secure Enclave wrapping key.

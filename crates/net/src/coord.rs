@@ -18,7 +18,8 @@ use crate::frame::{self, FrameError, Reason};
 use crate::sync::{SyncError, SyncStore, blocking};
 use crate::wire::{self, HELLO, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST};
 
-pub const ALPN: &[u8] = b"openvault/coord/1";
+/// Frozen in [`openvault_crypto::frozen`]: it keeps the name `openvault` through any rename.
+pub const ALPN: &[u8] = openvault_crypto::frozen::ALPN_COORD;
 
 /// The port a grandfather's address means when it names none: TCP for the relay's HTTPS, UDP
 /// for the coordinator.

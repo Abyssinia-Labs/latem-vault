@@ -167,7 +167,7 @@ pub(crate) fn chunk_aad(
     epoch: u32,
 ) -> Vec<u8> {
     [
-        &b"openvault v1 chunk\0"[..],
+        openvault_crypto::frozen::CHUNK_AAD,
         vault.as_bytes(),
         collection.as_bytes(),
         &epoch.to_be_bytes(),

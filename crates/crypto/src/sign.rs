@@ -7,7 +7,7 @@
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use zeroize::Zeroizing;
 
-use crate::{Error, random_bytes};
+use crate::{Error, frozen, random_bytes};
 
 const ALG_ED25519: u8 = 0x01;
 const ALG_P256: u8 = 0x02;
@@ -24,10 +24,10 @@ pub enum SignatureContext {
 impl SignatureContext {
     fn label(self) -> &'static [u8] {
         match self {
-            Self::Record => b"openvault v1 sig record",
-            Self::LogEntry => b"openvault v1 sig log entry",
-            Self::JoinRequest => b"openvault v1 sig join request",
-            Self::KeyGrant => b"openvault v1 sig key grant",
+            Self::Record => frozen::SIG_RECORD,
+            Self::LogEntry => frozen::SIG_LOG_ENTRY,
+            Self::JoinRequest => frozen::SIG_JOIN_REQUEST,
+            Self::KeyGrant => frozen::SIG_KEY_GRANT,
         }
     }
 }

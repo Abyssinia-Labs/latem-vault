@@ -34,8 +34,9 @@ use tracing::{info, warn};
 
 pub use watch::{discovery_stops, discovery_watch};
 
-/// The mDNS service name: endpoints appear as `<endpoint id>._openvault._udp.local.`.
-pub const MDNS_SERVICE: &str = "openvault";
+/// The mDNS service name: endpoints appear as `<endpoint id>._openvault._udp.local.`. Frozen
+/// in [`openvault_crypto::frozen`]: it keeps the name `openvault` through any rename.
+pub const MDNS_SERVICE: &str = openvault_crypto::frozen::MDNS_SERVICE;
 
 /// Names another mDNS service for this process's endpoints, so that they find only endpoints
 /// started with the same name. Tests set it, so their devices never meet the real ones on the

@@ -21,25 +21,9 @@ pub fn keyed_hash(key: &[u8; 32], data: &[u8]) -> Hash {
     *blake3::keyed_hash(key, data).as_bytes()
 }
 
-/// Context strings for [`derive_key`]. Changing one changes every key derived from it.
-pub mod contexts {
-    pub const RECOVERY_ADMIN_SIGNING: &str = "openvault v1 recovery admin signing key";
-    pub const RECOVERY_WRAPPING: &str = "openvault v1 recovery wrapping key";
-    pub const RECORD_ID: &str = "openvault v1 record id";
-    pub const LOG_ENTRY_HASH: &str = "openvault v1 log entry hash";
-    pub const LOCAL_INDEX: &str = "openvault v1 local index key";
-    pub const LOCAL_CACHE: &str = "openvault v1 local cache key";
-    pub const TRANSPORT: &str = "openvault v1 transport key";
-    pub const PASSPHRASE: &str = "openvault v1 passphrase key";
-    pub const JOIN_CONFIRM_JOINER: &str = "openvault v1 join confirm joiner";
-    pub const JOIN_CONFIRM_ADMIN: &str = "openvault v1 join confirm admin";
-    pub const JOIN_SESSION: &str = "openvault v1 join session";
-    pub const GRANT_ID: &str = "openvault v1 grant id";
-    pub const SYNC_FINGERPRINT: &str = "openvault v1 sync fingerprint";
-    pub const CHUNK_KEY: &str = "openvault v1 chunk key";
-    pub const CHUNK_NONCE_KEY: &str = "openvault v1 chunk nonce key";
-    pub const CHUNK_ID: &str = "openvault v1 chunk id";
-}
+/// Context strings for [`derive_key`]. Changing one changes every key derived from it, so they
+/// are frozen in [`crate::frozen`].
+pub use crate::frozen::contexts;
 
 #[cfg(test)]
 mod tests {

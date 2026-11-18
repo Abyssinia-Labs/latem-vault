@@ -38,7 +38,7 @@ impl Pake {
         joiner_transport: &VerifyingKey,
     ) -> Result<(Self, [u8; MESSAGE_LEN]), Error> {
         check_code(code)?;
-        let password = Zeroizing::new([b"openvault v1 join code\0", code.as_bytes()].concat());
+        let password = Zeroizing::new([crate::frozen::JOIN_CODE, code.as_bytes()].concat());
         let password = Password::new(&*password);
         let id_a = Identity::new(admin_transport.as_bytes());
         let id_b = Identity::new(joiner_transport.as_bytes());

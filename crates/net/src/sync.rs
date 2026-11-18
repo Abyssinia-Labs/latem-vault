@@ -26,7 +26,8 @@ use crate::wire::{
     self, HELLO, ITEMS, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST, RECONCILE, ROOTS, Reader, WANT,
 };
 
-pub const ALPN: &[u8] = b"openvault/sync/1";
+/// Frozen in [`openvault_crypto::frozen`]: it keeps the name `openvault` through any rename.
+pub const ALPN: &[u8] = openvault_crypto::frozen::ALPN_SYNC;
 
 /// How long a session waits for a message before it closes (sync.md, lifetime).
 pub const IDLE: Duration = Duration::from_secs(60);

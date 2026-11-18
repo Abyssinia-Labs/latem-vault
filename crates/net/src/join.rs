@@ -24,7 +24,8 @@ use crate::EndpointKey;
 use crate::frame::{self, FrameError, Reason};
 use crate::wire::{self, ITEMS, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST};
 
-pub const ALPN: &[u8] = b"openvault/join/1";
+/// Frozen in [`openvault_crypto::frozen`]: it keeps the name `openvault` through any rename.
+pub const ALPN: &[u8] = openvault_crypto::frozen::ALPN_JOIN;
 
 const PAKE: u8 = 0x20;
 const CONFIRM: u8 = 0x21;

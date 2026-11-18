@@ -15,8 +15,8 @@ use zeroize::Zeroizing;
 
 use crate::{Backend, Error, Keys, Result};
 
-const MAGIC: &[u8] = b"openvault v1 keys\0";
-const ADMIN_MAGIC: &[u8] = b"openvault v1 admin key\0";
+const MAGIC: &[u8] = openvault_crypto::frozen::KEYS_MAGIC;
+const ADMIN_MAGIC: &[u8] = openvault_crypto::frozen::ADMIN_KEY_MAGIC;
 const KIND_SOFTWARE: u8 = 0x01;
 const KIND_SECURE_ENCLAVE: u8 = 0x02;
 const KIND_PASSPHRASE: u8 = 0x03;

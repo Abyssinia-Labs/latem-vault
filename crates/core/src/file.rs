@@ -159,7 +159,7 @@ pub(crate) fn size_of(manifest: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(manifest.get(1..9)?.try_into().ok()?))
 }
 
-/// `"openvault v1 chunk" ‖ 0x00 ‖ vault id ‖ collection id ‖ epoch`: binds a chunk to where it
+/// `frozen::CHUNK_AAD ‖ vault id ‖ collection id ‖ epoch`: binds a chunk to where it
 /// belongs, so it opens nowhere else.
 pub(crate) fn chunk_aad(
     vault: crate::VaultId,
@@ -167,7 +167,7 @@ pub(crate) fn chunk_aad(
     epoch: u32,
 ) -> Vec<u8> {
     [
-        openvault_crypto::frozen::CHUNK_AAD,
+        latem_vault_crypto::frozen::CHUNK_AAD,
         vault.as_bytes(),
         collection.as_bytes(),
         &epoch.to_be_bytes(),

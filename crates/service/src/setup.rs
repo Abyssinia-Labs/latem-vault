@@ -1,5 +1,5 @@
-//! Making a vault on this device, or joining one (join.md, commands): what `openvault init` and
-//! `openvault join` do, without the terminal, so the apps do the same. The CLI prints and asks;
+//! Making a vault on this device, or joining one (join.md, commands): what `latem-vault init` and
+//! `latem-vault join` do, without the terminal, so the apps do the same. The CLI prints and asks;
 //! the apps show it.
 //!
 //! The joiner runs its own endpoint, because it has no vault for a service to hold yet.
@@ -11,12 +11,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use openvault_core::membership::{AdminKey as _, DeviceName};
-use openvault_core::{DeviceId, Vault, transport_seed};
-use openvault_crypto::RecoveryKey;
-use openvault_keystore::{AdminKey, Backend, Keys};
-use openvault_net::join::{self, JoinError, JoinerSession};
-use openvault_net::{Node, Options};
+use latem_vault_core::membership::{AdminKey as _, DeviceName};
+use latem_vault_core::{DeviceId, Vault, transport_seed};
+use latem_vault_crypto::RecoveryKey;
+use latem_vault_keystore::{AdminKey, Backend, Keys};
+use latem_vault_net::join::{self, JoinError, JoinerSession};
+use latem_vault_net::{Node, Options};
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
@@ -225,7 +225,7 @@ async fn accept_join(
             }
         };
         progress(JoinProgress::CodeAccepted);
-        let request = openvault_core::join::JoinRequest::sign(
+        let request = latem_vault_core::join::JoinRequest::sign(
             session.session_id(),
             device,
             &keys,

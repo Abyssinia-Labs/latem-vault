@@ -48,7 +48,7 @@ impl PassphraseCost {
     }
 }
 
-/// `BLAKE3.derive_key("openvault v1 passphrase key", Argon2id(passphrase, salt, cost))`.
+/// `BLAKE3.derive_key(contexts::PASSPHRASE, Argon2id(passphrase, salt, cost))`.
 pub fn passphrase_key(
     passphrase: &[u8],
     salt: &[u8; SALT_LEN],
@@ -73,7 +73,7 @@ mod tests {
 
     use super::*;
 
-    /// RFC 9106 §5.3, which uses a secret and associated data that OpenVault doesn't.
+    /// RFC 9106 §5.3, which uses a secret and associated data that latem vault doesn't.
     #[test]
     fn argon2id_matches_rfc_9106() {
         let params = ParamsBuilder::new()

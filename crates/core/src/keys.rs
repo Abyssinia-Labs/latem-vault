@@ -1,5 +1,5 @@
-use openvault_crypto::hash::{contexts, derive_key};
-use openvault_crypto::{
+use latem_vault_crypto::hash::{contexts, derive_key};
+use latem_vault_crypto::{
     Signature, SignatureContext, SigningKey, SymmetricKey, UnwrapKey, VerifyingKey, WrapKey,
     WrappedKey,
 };

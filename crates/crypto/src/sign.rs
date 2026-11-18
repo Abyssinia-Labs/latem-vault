@@ -323,7 +323,7 @@ mod tests {
     fn signing_input_is_labelled() {
         assert_eq!(
             signing_input(SignatureContext::Record, b"x"),
-            b"openvault v1 sig record\0x".to_vec()
+            [frozen::SIG_RECORD, b"\0x"].concat()
         );
     }
 

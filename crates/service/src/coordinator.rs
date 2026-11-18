@@ -6,12 +6,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use openvault_core::Vault;
-use openvault_keystore::Keys;
-use openvault_net::Node;
-use openvault_net::coord::{self, Address};
-use openvault_net::frame::Reason;
-use openvault_net::sync::{Notice, SyncError};
+use latem_vault_core::Vault;
+use latem_vault_keystore::Keys;
+use latem_vault_net::Node;
+use latem_vault_net::coord::{self, Address};
+use latem_vault_net::frame::Reason;
+use latem_vault_net::sync::{Notice, SyncError};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};

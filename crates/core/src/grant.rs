@@ -1,8 +1,8 @@
 //! Grants: one collection key, for one epoch, wrapped to one recipient and signed by whoever
 //! wrapped it (sync.md, grants).
 
-use openvault_crypto::hash::{contexts, derive_key};
-use openvault_crypto::{Signature, SignatureContext, VerifyingKey, WrappedKey};
+use latem_vault_crypto::hash::{contexts, derive_key};
+use latem_vault_crypto::{Signature, SignatureContext, VerifyingKey, WrappedKey};
 
 use crate::membership::{Membership, Scope};
 use crate::{CollectionId, DeviceId, Error, Result, VaultId};
@@ -93,7 +93,7 @@ impl Grant {
         [&self.unsigned[..], self.signature.as_bytes()].concat()
     }
 
-    /// `BLAKE3.derive_key("openvault v1 grant id", unsigned part)`. Like a record id, it never
+    /// `BLAKE3.derive_key(contexts::GRANT_ID, unsigned part)`. Like a record id, it never
     /// covers the signature.
     pub fn id(&self) -> GrantId {
         *derive_key(contexts::GRANT_ID, &self.unsigned)

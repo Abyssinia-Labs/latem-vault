@@ -15,8 +15,8 @@ mod secure_enclave;
 
 use std::path::{Path, PathBuf};
 
-use openvault_core::{DeviceKeys, SoftwareKeys};
-use openvault_crypto::{
+use latem_vault_core::{DeviceKeys, SoftwareKeys};
+use latem_vault_crypto::{
     Signature, SignatureContext, SymmetricKey, VerifyingKey, WrapKey, WrappedKey,
 };
 
@@ -145,7 +145,11 @@ impl DeviceKeys for Keys {
         self.inner().wrap_key()
     }
 
-    fn unwrap(&self, context: &[u8], wrapped: &WrappedKey) -> openvault_core::Result<SymmetricKey> {
+    fn unwrap(
+        &self,
+        context: &[u8],
+        wrapped: &WrappedKey,
+    ) -> latem_vault_core::Result<SymmetricKey> {
         self.inner().unwrap(context, wrapped)
     }
 
@@ -153,7 +157,11 @@ impl DeviceKeys for Keys {
         self.inner().verifying_key()
     }
 
-    fn sign(&self, context: SignatureContext, message: &[u8]) -> openvault_core::Result<Signature> {
+    fn sign(
+        &self,
+        context: SignatureContext,
+        message: &[u8],
+    ) -> latem_vault_core::Result<Signature> {
         self.inner().sign(context, message)
     }
 
@@ -165,7 +173,7 @@ impl DeviceKeys for Keys {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Crypto(#[from] openvault_crypto::Error),
+    Crypto(#[from] latem_vault_crypto::Error),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("a key file already exists at {}", .0.display())]
@@ -193,7 +201,7 @@ pub enum Error {
     SecureEnclave(String),
 }
 
-impl From<Error> for openvault_core::Error {
+impl From<Error> for latem_vault_core::Error {
     fn from(error: Error) -> Self {
         Self::Keystore(error.to_string())
     }
@@ -207,8 +215,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    use openvault_core::{Kind, Vault};
-    use openvault_crypto::RecoveryKey;
+    use latem_vault_core::{Kind, Vault};
+    use latem_vault_crypto::RecoveryKey;
 
     use super::*;
 
@@ -285,7 +293,7 @@ mod tests {
 
         // A damaged blob doesn't restore.
         let mut damaged = raw.clone();
-        let blob_start = b"openvault v1 keys\0".len() + 1 + 2;
+        let blob_start = latem_vault_crypto::frozen::KEYS_MAGIC.len() + 1 + 2;
         damaged[blob_start + 40] ^= 1;
         fs::write(&path, &damaged).unwrap();
         assert!(Keys::load(&path).is_err());
@@ -481,7 +489,7 @@ mod tests {
         let path = dir.path().join("keys");
         create(&path, Backend::Passphrase);
         let good = fs::read(&path).unwrap();
-        let cost = b"openvault v1 keys\0".len() + 1;
+        let cost = latem_vault_crypto::frozen::KEYS_MAGIC.len() + 1;
         let salt = cost + 12;
 
         // The cost, the salt and the sealed keys are all covered by the tag.
@@ -536,7 +544,7 @@ mod tests {
 
     #[test]
     fn admin_key_file() {
-        use openvault_core::membership::AdminKey as _;
+        use latem_vault_core::membership::AdminKey as _;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("admin");
@@ -574,17 +582,17 @@ mod tests {
     }
 
     /// Asks for Touch ID or the password, once: when the key authenticates, and not for the three
-    /// signatures after it. So it runs only when asked: `cargo test -p openvault-keystore --
+    /// signatures after it. So it runs only when asked: `cargo test -p latem-vault-keystore --
     /// --ignored`.
     #[test]
     #[ignore = "asks for Touch ID"]
     fn admin_key_signs_after_touch_id() {
-        use openvault_core::membership::AdminKey as _;
+        use latem_vault_core::membership::AdminKey as _;
 
         let dir = tempfile::tempdir().unwrap();
         let key = AdminKey::create(&dir.path().join("admin"))
             .unwrap()
-            .with_reason("run the openvault admin key test (one prompt, then three signatures)");
+            .with_reason("run the latem-vault admin key test (one prompt, then three signatures)");
         key.authenticate().unwrap();
         for message in [&b"first"[..], b"second", b"third"] {
             let signature = key.sign(SignatureContext::LogEntry, message).unwrap();
@@ -600,7 +608,7 @@ mod tests {
         let path = dir.path().join("keys");
         Keys::create(&path, Backend::Software).unwrap();
         let good = fs::read(&path).unwrap();
-        let magic = b"openvault v1 keys\0".len();
+        let magic = latem_vault_crypto::frozen::KEYS_MAGIC.len();
 
         let mut cases: Vec<Vec<u8>> = vec![
             good[..good.len() - 1].to_vec(),

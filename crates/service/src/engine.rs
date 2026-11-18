@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use openvault_core::sets::SetId;
-use openvault_core::{DeviceId, Vault};
-use openvault_keystore::Keys;
-use openvault_net::sync::{self, Notice, Outcome, Report, Role, SyncError};
-use openvault_net::{EndpointAddr, EndpointId, EndpointKey, Node, RelayUrl};
+use latem_vault_core::sets::SetId;
+use latem_vault_core::{DeviceId, Vault};
+use latem_vault_keystore::Keys;
+use latem_vault_net::sync::{self, Notice, Outcome, Report, Role, SyncError};
+use latem_vault_net::{EndpointAddr, EndpointId, EndpointKey, Node, RelayUrl};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
@@ -132,7 +132,7 @@ impl Engine {
 
     /// Takes a connection a peer opened. If both opened one at the same time, the one opened by
     /// the device with the smaller endpoint id is kept (sync.md, who connects).
-    pub(crate) fn accept(self: &Arc<Self>, connection: openvault_net::Connection) {
+    pub(crate) fn accept(self: &Arc<Self>, connection: latem_vault_net::Connection) {
         let peer = *connection.remote_id().as_bytes();
         let mut state = self.state.lock().expect("poisoned");
         if let Some(existing) = state.sessions.get(&peer) {
@@ -440,11 +440,11 @@ fn counts(log_entries: usize, items: usize) -> Option<String> {
 mod tests {
     use std::path::Path;
 
-    use openvault_core::join::JoinRequest;
-    use openvault_core::membership::{DeviceName, Scope};
-    use openvault_core::{CollectionId, SoftwareKeys, transport_seed};
-    use openvault_crypto::RecoveryKey;
-    use openvault_net::Options;
+    use latem_vault_core::join::JoinRequest;
+    use latem_vault_core::membership::{DeviceName, Scope};
+    use latem_vault_core::{CollectionId, SoftwareKeys, transport_seed};
+    use latem_vault_crypto::RecoveryKey;
+    use latem_vault_net::Options;
 
     use super::*;
 

@@ -1,6 +1,6 @@
 [package]
-name = "openvault-keystore"
-description = "Where an OpenVault device keeps its keys: a key file, or the Secure Enclave."
+name = "latem-vault-keystore"
+description = "Where a latem vault device keeps its keys: a key file, or the Secure Enclave."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-openvault-core = { path = "../core" }
-openvault-crypto = { path = "../crypto" }
+latem-vault-core = { path = "../core" }
+latem-vault-crypto = { path = "../crypto" }
 thiserror = "2"
 zeroize = "1.9"
 

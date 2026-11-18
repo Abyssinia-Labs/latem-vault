@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use openvault_crypto::{ChunkKeys, chunk_id};
+use latem_vault_crypto::{ChunkKeys, chunk_id};
 use rusqlite::{OptionalExtension, Transaction, params};
 use zeroize::Zeroizing;
 
@@ -627,7 +627,7 @@ impl<K: DeviceKeys> Vault<K> {
         builder.create(dir)?;
         let temporary = dir.join(format!(
             ".{}.{}",
-            hex::encode(&openvault_crypto::random_bytes::<8>()[..]),
+            hex::encode(&latem_vault_crypto::random_bytes::<8>()[..]),
             "partial"
         ));
         let mut options = fs::OpenOptions::new();

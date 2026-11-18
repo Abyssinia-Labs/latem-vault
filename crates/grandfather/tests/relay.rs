@@ -7,16 +7,18 @@ use std::time::Duration;
 
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, Watcher as _};
+use latem_vault_core::join::JoinRequest;
+use latem_vault_core::membership::{DeviceName, Scope};
+use latem_vault_core::{
+    CollectionId, DeviceId, Kind, SoftwareKeys, Vault, VaultId, transport_seed,
+};
+use latem_vault_crypto::RecoveryKey;
+use latem_vault_grandfather::{Certificate, Config, Grandfather, Listen};
+use latem_vault_net::coord::{self, Address};
+use latem_vault_net::frame::Reason;
+use latem_vault_net::sync::{self, Role, SyncError};
+use latem_vault_net::{CaTlsConfig, EndpointAddr, Options, Relay, RelayUrl};
 use n0_future::StreamExt as _;
-use openvault_core::join::JoinRequest;
-use openvault_core::membership::{DeviceName, Scope};
-use openvault_core::{CollectionId, DeviceId, Kind, SoftwareKeys, Vault, VaultId, transport_seed};
-use openvault_crypto::RecoveryKey;
-use openvault_grandfather::{Certificate, Config, Grandfather, Listen};
-use openvault_net::coord::{self, Address};
-use openvault_net::frame::Reason;
-use openvault_net::sync::{self, Role, SyncError};
-use openvault_net::{CaTlsConfig, EndpointAddr, Options, Relay, RelayUrl};
 use tokio::sync::mpsc;
 
 type Store = Mutex<Vault<SoftwareKeys>>;
@@ -144,7 +146,7 @@ fn coordinator(grandfather: &Grandfather) -> Address {
 
 /// An endpoint with direct paths, as a device's service has, for talking to the coordinator.
 async fn direct(seed: &[u8; 32]) -> Endpoint {
-    openvault_net::builder(seed, &Options::default())
+    latem_vault_net::builder(seed, &Options::default())
         .unwrap()
         .bind()
         .await
@@ -158,7 +160,7 @@ async fn relay_only(seed: &[u8; 32], relay: &Relay) -> Endpoint {
         relay: Some(relay.clone()),
         ..Options::default()
     };
-    openvault_net::builder(seed, &options)
+    latem_vault_net::builder(seed, &options)
         .unwrap()
         .clear_ip_transports()
         .bind()

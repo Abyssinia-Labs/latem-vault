@@ -1,8 +1,8 @@
-//! `openvault keys` and `openvault keys passphrase [--remove]` (keystore.md, changing the
+//! `latem-vault keys` and `latem-vault keys passphrase [--remove]` (keystore.md, changing the
 //! protection).
 
 use anyhow::{Result, bail};
-use openvault_keystore::{Backend, Keys};
+use latem_vault_keystore::{Backend, Keys};
 use zeroize::Zeroizing;
 
 use crate::join::confirm;
@@ -13,7 +13,7 @@ use crate::{Home, has_terminal, prompt_passphrase, read_new_passphrase};
 /// Says how this device's keys are kept, without opening them.
 pub fn show(home: &Home) -> Result<()> {
     let path = home.keys();
-    let backend = openvault_keystore::backend_of(&path)?;
+    let backend = latem_vault_keystore::backend_of(&path)?;
     println!("{}", path.display());
     println!(
         "{}",
@@ -23,7 +23,7 @@ pub fn show(home: &Home) -> Result<()> {
                  nobody there.",
             Backend::Passphrase =>
                 "In a key file protected by a passphrase: a copy of the file needs the passphrase \
-                 too. A service the system starts can't type it, so `openvault service install` \
+                 too. A service the system starts can't type it, so `latem-vault service install` \
                  refuses these keys.",
             Backend::Software =>
                 "In a key file protected only by its permissions: whoever can read it as you, or \
@@ -37,9 +37,9 @@ pub fn show(home: &Home) -> Result<()> {
 /// Gives the key file a passphrase, or changes the one it has.
 pub fn set_passphrase(home: &Home) -> Result<()> {
     let path = home.keys();
-    let backend = openvault_keystore::backend_of(&path)?;
+    let backend = latem_vault_keystore::backend_of(&path)?;
     if backend == Backend::SecureEnclave {
-        return Err(openvault_keystore::Error::InSecureEnclave.into());
+        return Err(latem_vault_keystore::Error::InSecureEnclave.into());
     }
     require_terminal()?;
     let current = match backend {
@@ -59,7 +59,7 @@ pub fn set_passphrase(home: &Home) -> Result<()> {
         if login::installed() {
             println!(
                 "The service is installed to start at login, and can't type a passphrase, so it \
-                 won't start again by itself. `openvault service uninstall` takes it away."
+                 won't start again by itself. `latem-vault service uninstall` takes it away."
             );
         }
     }
@@ -69,8 +69,8 @@ pub fn set_passphrase(home: &Home) -> Result<()> {
 /// Takes the key file's passphrase away, after saying what that means and asking.
 pub fn remove_passphrase(home: &Home) -> Result<()> {
     let path = home.keys();
-    match openvault_keystore::backend_of(&path)? {
-        Backend::SecureEnclave => return Err(openvault_keystore::Error::InSecureEnclave.into()),
+    match latem_vault_keystore::backend_of(&path)? {
+        Backend::SecureEnclave => return Err(latem_vault_keystore::Error::InSecureEnclave.into()),
         Backend::Software => bail!("this device's key file has no passphrase"),
         Backend::Passphrase => {}
     }
@@ -78,7 +78,7 @@ pub fn remove_passphrase(home: &Home) -> Result<()> {
     eprintln!(
         "Without a passphrase, the key file is protected only by its permissions: whoever can \
          read it as you, or copies it, has this device's keys. In exchange, they open with nobody \
-         there, so `openvault service install` can start the service at login."
+         there, so `latem-vault service install` can start the service at login."
     );
     if !confirm("Remove the passphrase? [y/N] ")? {
         bail!("not removed");
@@ -86,7 +86,7 @@ pub fn remove_passphrase(home: &Home) -> Result<()> {
     let current = current_passphrase(home)?;
     Keys::change_passphrase(&path, Some(&current), None)?;
     println!(
-        "The passphrase is removed. The device's keys are the same, and `openvault service \
+        "The passphrase is removed. The device's keys are the same, and `latem-vault service \
          install` can now start the service at login."
     );
     Ok(())
@@ -106,7 +106,7 @@ fn current_passphrase(home: &Home) -> Result<Zeroizing<String>> {
         let passphrase = prompt_passphrase("Current passphrase for this device's keys (hidden): ")?;
         match Keys::load_with_passphrase(&home.keys(), &passphrase) {
             Ok(_) => return Ok(passphrase),
-            Err(openvault_keystore::Error::WrongPassphrase) if attempt < ATTEMPTS => {
+            Err(latem_vault_keystore::Error::WrongPassphrase) if attempt < ATTEMPTS => {
                 eprintln!("Wrong passphrase.");
             }
             Err(e) => return Err(e.into()),

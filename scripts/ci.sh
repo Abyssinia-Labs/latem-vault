@@ -19,7 +19,7 @@ macos() {
     cargo clippy --workspace --all-targets --locked -- -D warnings
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     cargo test --workspace --locked
-    cargo test --locked -p openvault-cli -p openvault-service --all-features
+    cargo test --locked -p latem-vault-cli -p latem-vault-service --all-features
     # The Mac app's bindings, used from Swift against a service.
     scripts/swift-bindings.sh
 }
@@ -37,13 +37,13 @@ linux() {
         "rust:$rust_version-slim" \
         sh -euc '
             rustup component add clippy
-            # openvault-ffi is for the Mac app, and the macOS checks test it. Linking its tests
+            # latem-vault-ffi is for the Mac app, and the macOS checks test it. Linking its tests
             # with UniFFI'"'"'s generator beside the others ran the container out of memory.
-            cargo clippy --workspace --exclude openvault-ffi --all-targets --locked -- -D warnings
-            cargo clippy --workspace --exclude openvault-ffi --all-targets --all-features --locked \
+            cargo clippy --workspace --exclude latem-vault-ffi --all-targets --locked -- -D warnings
+            cargo clippy --workspace --exclude latem-vault-ffi --all-targets --all-features --locked \
                 -- -D warnings
-            cargo test --workspace --exclude openvault-ffi --locked
-            cargo test --locked -p openvault-cli -p openvault-service --all-features
+            cargo test --workspace --exclude latem-vault-ffi --locked
+            cargo test --locked -p latem-vault-cli -p latem-vault-service --all-features
         '
 }
 

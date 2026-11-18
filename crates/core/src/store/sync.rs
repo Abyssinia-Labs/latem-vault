@@ -2,7 +2,7 @@
 //! shares with a peer and what is in them, and taking in other devices' log entries, records and
 //! grants.
 
-use openvault_crypto::SymmetricKey;
+use latem_vault_crypto::SymmetricKey;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::files::named_chunks;

@@ -2,7 +2,7 @@
 //!
 //! Suite: base mode, DHKEM(X25519, HKDF-SHA256) or DHKEM(P-256, HKDF-SHA256), HKDF-SHA256,
 //! ChaCha20-Poly1305. P-256 is for Secure Enclave and TPM keys; X25519 for keys kept in a file.
-//! The HPKE `info` is `"openvault v1 wrap" || 0x00 || context`, where the caller's context
+//! The HPKE `info` is `frozen::WRAP_INFO || context` (the label ends in 0x00), where the caller's context
 //! names what is being wrapped (vault, collection and epoch), so a wrapped key can't be
 //! replayed into another collection or epoch.
 //!

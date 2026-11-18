@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use openvault_net::{Event, Node, Options, discovery_stops, discovery_watch};
+use latem_vault_net::{Event, Node, Options, discovery_stops, discovery_watch};
 use tokio::sync::mpsc;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;

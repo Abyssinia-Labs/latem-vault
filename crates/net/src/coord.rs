@@ -1,5 +1,5 @@
 //! The device's side of the coordinator protocol (coordinator.md): on one stream of a connection
-//! with ALPN `openvault/coord/1`, a device and the grandfather's coordinator exchange hellos and
+//! with ALPN `frozen::ALPN_COORD`, a device and the grandfather's coordinator exchange hellos and
 //! bring their logs level, and the device closes the connection. It connects when its log grows,
 //! and now and then to hear of entries it doesn't have.
 
@@ -11,15 +11,15 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
-use openvault_crypto::hash::Hash;
+use latem_vault_crypto::hash::Hash;
 
 use crate::EndpointKey;
 use crate::frame::{self, FrameError, Reason};
 use crate::sync::{SyncError, SyncStore, blocking};
 use crate::wire::{self, HELLO, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST};
 
-/// Frozen in [`openvault_crypto::frozen`]: it keeps the name `openvault` through any rename.
-pub const ALPN: &[u8] = openvault_crypto::frozen::ALPN_COORD;
+/// Frozen in [`latem_vault_crypto::frozen`]: it never changes, whatever the product is called.
+pub const ALPN: &[u8] = latem_vault_crypto::frozen::ALPN_COORD;
 
 /// The port a grandfather's address means when it names none: TCP for the relay's HTTPS, UDP
 /// for the coordinator.
@@ -246,7 +246,7 @@ async fn drive<S: SyncStore>(
             }
         } else if seq == mine {
             if hash != my_hash {
-                return Err(SyncError::Store(openvault_core::Error::Fork));
+                return Err(SyncError::Store(latem_vault_core::Error::Fork));
             }
             if answered {
                 return Ok(());

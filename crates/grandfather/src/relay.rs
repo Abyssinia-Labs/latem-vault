@@ -12,7 +12,7 @@ use iroh_relay::server::{
     Access, AccessControl, AcmeConfig, CertConfig, ClientRequest, RelayConfig, Server,
     ServerConfig, TlsConfig, reloading_resolver,
 };
-use openvault_net::EndpointKey;
+use latem_vault_net::EndpointKey;
 use tracing::debug;
 
 /// How often certificate files are read again (coordinator.md, TLS).

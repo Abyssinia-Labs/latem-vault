@@ -10,15 +10,15 @@ use std::process::{self, ExitCode};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use openvault_core::file::{Content, Manifest};
-use openvault_core::membership::Scope;
-use openvault_core::names::{self, is_env_name};
-use openvault_core::{Kind, Placement};
-use openvault_service::api::{Item, Request, Response};
-use openvault_service::files::{
+use latem_vault_core::file::{Content, Manifest};
+use latem_vault_core::membership::Scope;
+use latem_vault_core::names::{self, is_env_name};
+use latem_vault_core::{Kind, Placement};
+use latem_vault_service::api::{Item, Request, Response};
+use latem_vault_service::files::{
     Caller, disk_encryption, seal_file, size_label, write_contents, write_file, write_out,
 };
-use openvault_service::handler::unexpected;
+use latem_vault_service::handler::unexpected;
 
 use crate::{Access, Home};
 
@@ -60,7 +60,7 @@ impl Access {
         }
         bail!(
             "{missing} {chunks} of {collection}/{name} aren't on this device; start the service \
-             (`openvault service`) to fetch them from your other devices"
+             (`latem-vault service`) to fetch them from your other devices"
         )
     }
 
@@ -211,7 +211,7 @@ pub fn import(
     }
     if written > 0 {
         println!(
-            "The originals are still in {}. Delete them once `openvault list {collection}` \
+            "The originals are still in {}. Delete them once `latem-vault list {collection}` \
              shows what you expect.",
             path.display()
         );
@@ -485,7 +485,7 @@ pub fn open(access: &mut Access, collection: &str, name: &str, manifest: &Manife
                         saved = seen;
                         failed = save(&path).err();
                         if let Some(e) = &failed {
-                            eprintln!("openvault: can't save {entry}: {e:#}");
+                            eprintln!("latem-vault: can't save {entry}: {e:#}");
                         }
                     }
                 }
@@ -594,11 +594,11 @@ pub fn file_var(name: &str) -> String {
 struct PrivateDir(PathBuf);
 
 impl PrivateDir {
-    /// `openvault-<purpose>-<random>` in the user's temporary directory.
+    /// `latem-vault-<purpose>-<random>` in the user's temporary directory.
     fn create(purpose: &str) -> Result<Self> {
         let name = format!(
-            "openvault-{purpose}-{}",
-            hex(&openvault_crypto::random_bytes::<8>()[..])
+            "latem-vault-{purpose}-{}",
+            hex(&latem_vault_crypto::random_bytes::<8>()[..])
         );
         let path = std::env::temp_dir().join(name);
         let mut builder = fs::DirBuilder::new();
@@ -624,7 +624,7 @@ impl PrivateDir {
 impl Drop for PrivateDir {
     fn drop(&mut self) {
         if let Err(e) = fs::remove_dir_all(&self.0) {
-            eprintln!("openvault: can't delete {}: {e}", self.0.display());
+            eprintln!("latem-vault: can't delete {}: {e}", self.0.display());
         }
     }
 }
@@ -680,7 +680,7 @@ fn wait(child: process::Command) -> Result<ExitCode> {
     let status = match status {
         Ok(status) => status,
         Err(error) => {
-            eprintln!("openvault: can't run {}: {error}", program.display());
+            eprintln!("latem-vault: can't run {}: {error}", program.display());
             return Ok(ExitCode::from(match error.kind() {
                 io::ErrorKind::NotFound => 127,
                 _ => 126,

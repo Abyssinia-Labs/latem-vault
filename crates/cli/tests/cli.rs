@@ -1,4 +1,4 @@
-//! Runs the `openvault` binary against a temporary `OPENVAULT_HOME`. Keys are software keys,
+//! Runs the `latem-vault` binary against a temporary `LATEM_VAULT_HOME`. Keys are software keys,
 //! so these tests run anywhere; the keystore crate tests the Secure Enclave and passphrases.
 
 use std::io::Write;
@@ -6,9 +6,9 @@ use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
 
-use openvault_core::Vault;
-use openvault_crypto::RecoveryKey;
-use openvault_keystore::Keys;
+use latem_vault_core::Vault;
+use latem_vault_crypto::RecoveryKey;
+use latem_vault_keystore::Keys;
 
 struct Device {
     home: tempfile::TempDir,
@@ -42,15 +42,15 @@ impl Device {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_openvault"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_latem-vault"));
         command
             .args(args)
-            .env("OPENVAULT_HOME", self.home.path())
+            .env("LATEM_VAULT_HOME", self.home.path())
             // An mDNS service name for this test process alone: its devices find only each
             // other, and no real device or app on the network sees them or their joiners
             // (service.md, finding devices).
             .env(
-                "OPENVAULT_MDNS_SERVICE",
+                "LATEM_VAULT_MDNS_SERVICE",
                 format!("ovt-{:x}", std::process::id()),
             )
             .stdin(Stdio::null());
@@ -137,9 +137,9 @@ fn phrase(stdout: &str) -> String {
 fn init_creates_a_private_vault_and_shows_the_phrase() {
     let device = Device::empty();
     let home = device.home.path().join("nested");
-    let output = Command::new(env!("CARGO_BIN_EXE_openvault"))
+    let output = Command::new(env!("CARGO_BIN_EXE_latem-vault"))
         .args(["init", "--keys", "software", "--name", "Build Mac"])
-        .env("OPENVAULT_HOME", &home)
+        .env("LATEM_VAULT_HOME", &home)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -163,9 +163,9 @@ fn init_creates_a_private_vault_and_shows_the_phrase() {
         assert_eq!(mode(&home.join("vault.db")), 0o600);
     }
 
-    let again = Command::new(env!("CARGO_BIN_EXE_openvault"))
+    let again = Command::new(env!("CARGO_BIN_EXE_latem-vault"))
         .args(["init", "--keys", "software"])
-        .env("OPENVAULT_HOME", &home)
+        .env("LATEM_VAULT_HOME", &home)
         .output()
         .unwrap();
     assert!(!again.status.success());
@@ -245,7 +245,7 @@ fn the_version_names_the_build() {
     let version = Device::empty().ok(&["--version"]);
     let build = version
         .trim()
-        .strip_prefix(concat!("openvault ", env!("CARGO_PKG_VERSION"), " ("))
+        .strip_prefix(concat!("latem-vault ", env!("CARGO_PKG_VERSION"), " ("))
         .and_then(|rest| rest.strip_suffix(')'))
         .unwrap_or_else(|| panic!("{version}"));
     assert!(
@@ -257,15 +257,19 @@ fn the_version_names_the_build() {
 #[test]
 fn commands_need_a_vault() {
     let device = Device::empty();
-    assert!(device.fails(&["get", "latem/x"]).contains("openvault init"));
+    assert!(
+        device
+            .fails(&["get", "latem/x"])
+            .contains("latem-vault init")
+    );
     let error = device.fails(&["collections"]);
     assert!(
-        error.contains("openvault init") && error.contains("`openvault join` to join one"),
+        error.contains("latem-vault init") && error.contains("`latem-vault join` to join one"),
         "{error}"
     );
 }
 
-/// Runs `openvault collections` where it has nothing to list: stdout stays empty for scripts,
+/// Runs `latem-vault collections` where it has nothing to list: stdout stays empty for scripts,
 /// and stderr, returned, says why.
 fn no_collections(device: &Device) -> String {
     let output = device.run(&["collections"]);
@@ -281,7 +285,7 @@ fn collections_says_how_to_make_the_first() {
     device.ok(&["init", "--keys", "software", "--name", "test"]);
     assert_eq!(
         no_collections(&device),
-        "No collections yet. `openvault collections create NAME` makes one.\n"
+        "No collections yet. `latem-vault collections create NAME` makes one.\n"
     );
 }
 
@@ -294,7 +298,7 @@ fn collections_says_when_this_device_may_read_none() {
     assert_eq!(
         no_collections(&joiner),
         "This device can't read any collection yet. On a device that administers the vault, \
-         run `openvault scope Desktop COLLECTION read`.\n"
+         run `latem-vault scope Desktop COLLECTION read`.\n"
     );
 }
 
@@ -412,7 +416,7 @@ fn run_puts_a_folder_in_the_environment() {
         "--env",
         "prod",
         "--",
-        "openvault-no-such-command",
+        "latem-vault-no-such-command",
     ]);
     assert_eq!(missing.status.code(), Some(127));
 }
@@ -627,7 +631,7 @@ fn import_env_writes_everything_or_nothing() {
     );
 }
 
-/// `openvault service` running in the background for a device. Stopped with SIGTERM when
+/// `latem-vault service` running in the background for a device. Stopped with SIGTERM when
 /// dropped, as Ctrl-C would.
 #[cfg(unix)]
 struct Service {
@@ -1171,7 +1175,7 @@ fn commands_go_through_the_service() {
 
     let devices = device.ok(&["devices"]);
     assert!(devices.contains("this device"), "{devices}");
-    assert!(!devices.contains("openvault service"), "{devices}");
+    assert!(!devices.contains("latem-vault service"), "{devices}");
 
     assert!(service.stop(), "the service didn't exit cleanly");
     assert!(!device.home.path().join("service.sock").exists());
@@ -1225,7 +1229,7 @@ fn devices_lists_this_device() {
         first.contains("file") && first.ends_with("this device"),
         "{devices}"
     );
-    assert!(devices.contains("Run `openvault service`"), "{devices}");
+    assert!(devices.contains("Run `latem-vault service`"), "{devices}");
 }
 
 /// Reaching devices away from home is behind the `coordinator` feature, which is off by default.
@@ -1245,7 +1249,7 @@ fn coordinator_is_set_per_device() {
     let device = Device::new();
     let none = device.ok(&["coordinator"]);
     assert!(none.starts_with("None:"), "{none}");
-    assert!(none.contains("openvault grandfather --vault "), "{none}");
+    assert!(none.contains("latem-vault grandfather --vault "), "{none}");
 
     let id = "ab".repeat(32);
     let error = device.fails(&["coordinator", "set", &format!("{id}@vault.example.com")]);
@@ -1273,7 +1277,7 @@ fn coordinator_is_set_per_device() {
 static JOINING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A child process that is killed if the test fails before it exits, so a waiting
-/// `openvault join` doesn't go on announcing itself.
+/// `latem-vault join` doesn't go on announcing itself.
 #[cfg(unix)]
 struct Child(std::process::Child);
 
@@ -1351,7 +1355,7 @@ fn a_device_joins_with_a_code() {
     // The next step, since nothing syncs until the service runs.
     let next = rest.last().unwrap();
     assert!(
-        next.starts_with("Devices sync through the service: run `openvault service install`"),
+        next.starts_with("Devices sync through the service: run `latem-vault service install`"),
         "{rest:?}"
     );
     assert_eq!(
@@ -1497,7 +1501,7 @@ fn scopes_change_with_an_admin_signature() {
 fn services_sync_a_joined_device() {
     use std::time::{Duration, Instant};
 
-    use openvault_service::api::{PeerState, Request, Response};
+    use latem_vault_service::api::{PeerState, Request, Response};
 
     let admin = Device::new();
     admin.set("latem/prod/SENTRY_DSN", "--secret", b"https://sentry");
@@ -1508,7 +1512,7 @@ fn services_sync_a_joined_device() {
     assert!(
         why.starts_with(
             "This device may read 1 collection, but nothing has synced yet. Devices sync \
-             through the service: run `openvault service install`"
+             through the service: run `latem-vault service install`"
         ),
         "{why}"
     );
@@ -1545,7 +1549,7 @@ fn services_sync_a_joined_device() {
     let started = Instant::now();
     loop {
         let Ok(Some(Response::Peers(peers))) =
-            openvault_service::client::call(&socket, &Request::Peers)
+            latem_vault_service::client::call(&socket, &Request::Peers)
         else {
             panic!("no peers: {}", admin_service.log());
         };
@@ -1729,9 +1733,9 @@ fn files_reach_the_other_devices() {
 fn apps_read_and_watch_through_the_service() {
     use std::time::{Duration, Instant};
 
-    use openvault_core::Kind;
-    use openvault_core::membership::Scope;
-    use openvault_service::api::{self, Event, Request, Response, Signer};
+    use latem_vault_core::Kind;
+    use latem_vault_core::membership::Scope;
+    use latem_vault_service::api::{self, Event, Request, Response, Signer};
 
     let device = Device::new();
     device.set("latem/prod/SENTRY_DSN", "--secret", b"https://sentry");
@@ -1739,7 +1743,7 @@ fn apps_read_and_watch_through_the_service() {
     let service = Service::start(&device);
     let socket = device.home.path().join("service.sock");
     let call = |request: Request| {
-        openvault_service::client::call(&socket, &request)
+        latem_vault_service::client::call(&socket, &request)
             .unwrap()
             .unwrap()
     };
@@ -1749,7 +1753,7 @@ fn apps_read_and_watch_through_the_service() {
     };
     assert!(!info.admin, "software keys have no admin key");
     let recovery = RecoveryKey::from_phrase(&device.phrase).unwrap();
-    let fingerprint = openvault_crypto::hash::hash(recovery.unwrap_key().wrap_key().as_bytes());
+    let fingerprint = latem_vault_crypto::hash::hash(recovery.unwrap_key().wrap_key().as_bytes());
     assert_eq!(info.recovery, fingerprint[..4]);
 
     let Response::CollectionSummaries(summaries) = call(Request::CollectionSummaries) else {
@@ -1846,15 +1850,15 @@ fn devices_join_through_the_service() {
     use std::io::{BufRead, BufReader};
     use std::time::{Duration, Instant};
 
-    use openvault_core::membership::Scope;
-    use openvault_service::api::{ErrorCode, Request, Response};
+    use latem_vault_core::membership::Scope;
+    use latem_vault_service::api::{ErrorCode, Request, Response};
 
     let _turn = JOINING.lock().unwrap_or_else(|e| e.into_inner());
     let admin = Device::new();
     let service = Service::start(&admin);
     let socket = admin.home.path().join("service.sock");
     let call = |request: Request| {
-        openvault_service::client::call(&socket, &request)
+        latem_vault_service::client::call(&socket, &request)
             .unwrap()
             .unwrap()
     };
@@ -1953,7 +1957,7 @@ fn devices_join_through_the_service() {
     assert!(service.stop(), "the service didn't exit cleanly");
 }
 
-/// `openvault approve` takes the service's way when one runs.
+/// `latem-vault approve` takes the service's way when one runs.
 #[cfg(unix)]
 #[test]
 fn approve_goes_through_the_service() {

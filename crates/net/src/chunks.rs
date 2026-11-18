@@ -1,4 +1,4 @@
-//! Chunk requests (files.md, sync): on a connection with ALPN `openvault/chunks/1`, a device asks
+//! Chunk requests (files.md, sync): on a connection with ALPN `frozen::ALPN_CHUNKS`, a device asks
 //! a peer that shares a collection for chunks its files name. Each request is one stream: the
 //! asker sends hello and a want, and the peer answers with each chunk it holds, one message each,
 //! then one missing message for the rest.
@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use openvault_core::file::ChunkId;
-use openvault_core::membership::Scope;
-use openvault_core::{CollectionId, DeviceId, DeviceKeys, Vault, VaultId};
-use openvault_crypto::chunk_id;
+use latem_vault_core::file::ChunkId;
+use latem_vault_core::membership::Scope;
+use latem_vault_core::{CollectionId, DeviceId, DeviceKeys, Vault, VaultId};
+use latem_vault_crypto::chunk_id;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -20,8 +20,8 @@ use crate::frame::{self, FrameError, Reason};
 use crate::sync::blocking;
 use crate::wire::Reader;
 
-/// Frozen in [`openvault_crypto::frozen`]: it keeps the name `openvault` through any rename.
-pub const ALPN: &[u8] = openvault_crypto::frozen::ALPN_CHUNKS;
+/// Frozen in [`latem_vault_crypto::frozen`]: it never changes, whatever the product is called.
+pub const ALPN: &[u8] = latem_vault_crypto::frozen::ALPN_CHUNKS;
 
 /// The most chunks one want asks for.
 pub const MAX_WANT: usize = 64;
@@ -49,7 +49,7 @@ pub trait ChunkStore: Send + Sync + 'static {
         &self,
         collection: CollectionId,
         id: &ChunkId,
-    ) -> openvault_core::Result<Option<Vec<u8>>>;
+    ) -> latem_vault_core::Result<Option<Vec<u8>>>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -262,7 +262,7 @@ impl<K: DeviceKeys + Send + 'static> ChunkStore for Mutex<Vault<K>> {
         &self,
         collection: CollectionId,
         id: &ChunkId,
-    ) -> openvault_core::Result<Option<Vec<u8>>> {
+    ) -> latem_vault_core::Result<Option<Vec<u8>>> {
         self.lock().expect("poisoned").sealed_chunk(collection, id)
     }
 }
@@ -303,9 +303,9 @@ fn parse_ids(body: &[u8]) -> Result<(CollectionId, Vec<ChunkId>), FrameError> {
 
 #[cfg(test)]
 mod tests {
-    use openvault_core::file::{CHUNK_SIZE, Content, Manifest};
-    use openvault_core::sets::{ItemId, SetId};
-    use openvault_core::{Kind, SoftwareKeys};
+    use latem_vault_core::file::{CHUNK_SIZE, Content, Manifest};
+    use latem_vault_core::sets::{ItemId, SetId};
+    use latem_vault_core::{Kind, SoftwareKeys};
 
     use super::*;
     use crate::Node;
@@ -432,7 +432,7 @@ mod tests {
 
         let stranger = SoftwareKeys::generate();
         let (stranger, _) = Node::start(
-            &openvault_core::transport_seed(&stranger),
+            &latem_vault_core::transport_seed(&stranger),
             crate::quiet_test_options(),
         )
         .await

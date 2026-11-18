@@ -1,6 +1,9 @@
-//! `openvault service install | uninstall | status`: having the operating system start the
+//! `latem-vault service install | uninstall | status`: having the operating system start the
 //! service at login (service.md, starting at login). A LaunchAgent on macOS and a systemd user
-//! unit on Linux, each running `openvault service` from this binary.
+//! unit on Linux, each running `latem-vault service` from this binary.
+//!
+//! Before 0.6 they had openvault's names ([`OLD_LABEL`], [`OLD_UNIT`]). `install` and
+//! `uninstall` remove that definition too, so two don't start two services for one vault.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -10,51 +13,64 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use openvault_keystore::Backend;
-use openvault_service::SOCKET;
-use openvault_service::api::{Request, Response};
+use latem_vault_keystore::Backend;
+use latem_vault_service::SOCKET;
+use latem_vault_service::api::{Request, Response};
+use latem_vault_service::home::{self, HOME_VAR, Location, OLD_HOME_VAR};
 
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+use crate::migrate::OLD_LABEL;
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+use crate::migrate::OLD_UNIT;
+use crate::migrate::{self, OLD_APP_LABEL};
 use crate::{Home, VERSION};
 
 /// The LaunchAgent's label, which also names its file.
-const LABEL: &str = "local.openvault.service";
+const LABEL: &str = "dev.latem.vault.service";
 /// The Mac app's own LaunchAgent, which starts the bundled binary instead (service.md, the Mac
-/// app).
-const APP_LABEL: &str = "com.abyssinialabs.openvault.service";
+/// app), once the app has latem vault's name (OV-12). Until then it's [`OLD_APP_LABEL`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const APP_LABEL: &str = "com.abyssinialabs.latemvault.service";
 /// How long `install` waits for the new service to answer.
 const STARTING: Duration = Duration::from_secs(10);
 
-/// What a definition runs: `openvault service` from `exe`, with `OPENVAULT_HOME` set to `home`
-/// when it was set for `install`.
+/// What a definition runs: `latem-vault service` from `exe`, with `LATEM_VAULT_HOME` set to
+/// `home` when it, or `OPENVAULT_HOME` before it, was set for `install`.
 struct Definition {
     exe: String,
     home: Option<String>,
 }
 
-pub fn install(home: &Home) -> Result<()> {
-    home.require_vault()?;
-    if openvault_keystore::backend_of(&home.keys())? == Backend::Passphrase {
-        bail!(
-            "this device's keys are protected by a passphrase, and a service the system starts \
-             has nobody to type it. Either remove the passphrase with `openvault keys passphrase \
-             --remove`, or start `openvault service` by hand after each restart"
-        );
-    }
+pub fn install() -> Result<()> {
     if app_state()?.is_some() {
         bail!(
-            "the OpenVault app starts the service on this Mac, with its own copy of openvault. \
-             To have this binary start it instead, turn OpenVault off in System Settings > \
-             General > Login Items first"
+            "the Mac app starts the service on this Mac, with its own copy of latem-vault. To \
+             have this binary start it instead, turn the app off in System Settings > General > \
+             Login Items first"
+        );
+    }
+    // Checked on the directory as it is, before anything is stopped or moved.
+    let current = Home(Location::from_env()?.current());
+    current.require_vault()?;
+    if latem_vault_keystore::backend_of(&current.keys())? == Backend::Passphrase {
+        bail!(
+            "this device's keys are protected by a passphrase, and a service the system starts \
+             has nobody to type it. Either remove the passphrase with `latem-vault keys \
+             passphrase --remove`, or start `latem-vault service` by hand after each restart"
         );
     }
     let definition = Definition::for_this_binary()?;
     if definition.exe.contains("/target/debug/") || definition.exe.contains("/target/release/") {
         eprintln!(
             "Warning: {} is in a cargo target directory, which each build replaces. \
-             `cargo install --path crates/cli` puts openvault somewhere that lasts.",
+             `cargo install --path crates/cli` puts latem-vault somewhere that lasts.",
             definition.exe
         );
     }
+
+    // openvault's service stops here, so the vault can move and only this one starts it.
+    remove_old()?;
+    let home = Home(migrate::locate()?);
 
     let socket = home.0.join(SOCKET);
     let running = system_state()?;
@@ -82,7 +98,9 @@ pub fn install(home: &Home) -> Result<()> {
     start(&path)?;
 
     match wait_for_new_service(&socket, old_pid) {
-        Some((version, pid)) => println!("The service is running: openvault {version}, pid {pid}."),
+        Some((version, pid)) => {
+            println!("The service is running: latem-vault {version}, pid {pid}.")
+        }
         None => println!(
             "The service didn't answer within {} seconds. {}",
             STARTING.as_secs(),
@@ -96,12 +114,14 @@ pub fn install(home: &Home) -> Result<()> {
 pub fn uninstall() -> Result<()> {
     let path = definition_path()?;
     stop()?;
+    let removed_old = remove_old()?;
     match fs::remove_file(&path) {
         Ok(()) => println!("Removed {}. The vault is untouched.", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => match app_state()? {
+            _ if removed_old => {}
             Some(_) => println!(
-                "`openvault service install` didn't start the service here; the OpenVault app \
-                 does. Turn it off in System Settings > General > Login Items."
+                "`latem-vault service install` didn't start the service here; the Mac app does. \
+                 Turn it off in System Settings > General > Login Items."
             ),
             None => println!("The service wasn't installed."),
         },
@@ -118,18 +138,25 @@ pub fn status(home: &Home) -> Result<()> {
     let installed = path.exists();
     match (installed, &app) {
         (true, _) => println!("Installed    {}", path.display()),
-        (false, Some(_)) => println!("Installed    by the OpenVault app ({APP_LABEL})"),
+        (false, Some((label, _))) => println!("Installed    by the Mac app ({label})"),
         (false, None) => println!("Installed    no"),
+    }
+    if let Some(old) = old_definition_path().ok().filter(|old| old.exists()) {
+        println!(
+            "Also installed {}, openvault's service from before 0.6. `latem-vault service \
+             install` replaces it.",
+            old.display()
+        );
     }
     if installed && app.is_some() {
         println!(
-            "Both this definition and the OpenVault app start the service, and only one service \
-             runs. `openvault service uninstall` removes this one."
+            "Both this definition and the Mac app start the service, and only one service runs. \
+             `latem-vault service uninstall` removes this one."
         );
     }
     let by_app = !installed && app.is_some();
     let state = match app {
-        Some(state) if by_app => state,
+        Some((_, state)) if by_app => state,
         _ => system_state()?,
     };
     let manager = if cfg!(target_os = "macos") {
@@ -150,22 +177,20 @@ pub fn status(home: &Home) -> Result<()> {
             pid,
             mdns_stops,
         }) => {
-            println!("Service      openvault {version}, pid {pid}");
-            println!("This binary  openvault {VERSION}");
+            println!("Service      latem-vault {version}, pid {pid}");
+            println!("This binary  latem-vault {VERSION}");
             println!("mDNS         stopped {mdns_stops} times since the service started");
             if version != VERSION && by_app {
-                println!(
-                    "The service runs the OpenVault app's build. Updating the app moves it on."
-                );
+                println!("The service runs the Mac app's build. Updating the app moves it on.");
             } else if version != VERSION {
                 println!(
-                    "The service runs another build. `openvault service install` moves it onto \
+                    "The service runs another build. `latem-vault service install` moves it onto \
                      this one."
                 );
             }
         }
         Some(_) => println!(
-            "Service      an older build, from before 0.2.2. `openvault service install` moves \
+            "Service      an older build, from before 0.2.2. `latem-vault service install` moves \
              it onto this one."
         ),
         None => println!("Service      not answering on {}", socket.display()),
@@ -173,10 +198,47 @@ pub fn status(home: &Home) -> Result<()> {
     Ok(())
 }
 
-/// Whether the service is installed to start at login, which `openvault keys passphrase` warns
-/// about.
+/// Whether the service is installed to start at login, under this name or openvault's, which
+/// `latem-vault keys passphrase` warns about.
 pub fn installed() -> bool {
-    definition_path().is_ok_and(|path| path.exists())
+    [definition_path(), old_definition_path()]
+        .into_iter()
+        .any(|path| path.is_ok_and(|path| path.exists()))
+}
+
+/// Why openvault's definition stops the vault moving: it would start a build that looks for
+/// the vault only in the old directory. Not when it starts this binary, which was put in the
+/// old one's place.
+pub(crate) fn old_definition_blocks_move() -> Option<String> {
+    let path = old_definition_path().ok()?;
+    let contents = fs::read_to_string(&path).ok()?;
+    let exe = std::env::current_exe().and_then(fs::canonicalize).ok()?;
+    if runs(&contents, exe.to_str()?) {
+        return None;
+    }
+    Some(format!(
+        "{} starts openvault's service at login, which looks for the vault only there. Run \
+         `latem-vault service install`: it replaces that service and moves the vault",
+        path.display()
+    ))
+}
+
+/// Why the Mac app stops the vault moving: its agent runs the app's build of the service, which
+/// may look for the vault only in the old directory. Not when that agent started this process,
+/// or when `HOME` isn't this account's, so not the directory the app uses.
+pub(crate) fn app_blocks_move() -> Option<String> {
+    if !cfg!(target_os = "macos")
+        || !migrate::home_is_the_accounts()
+        || std::env::var("XPC_SERVICE_NAME").is_ok_and(|name| name == OLD_APP_LABEL)
+    {
+        return None;
+    }
+    agent_state(OLD_APP_LABEL)?;
+    Some(
+        "the Mac app starts the service on this Mac. Its service moves the vault when it starts \
+         with an app built from latem vault 0.6 or later"
+            .to_owned(),
+    )
 }
 
 impl Definition {
@@ -184,7 +246,7 @@ impl Definition {
         let exe = std::env::current_exe()
             .and_then(fs::canonicalize)
             .context("can't find this binary")?;
-        let home = match std::env::var_os("OPENVAULT_HOME") {
+        let home = match home::var_os(HOME_VAR, OLD_HOME_VAR) {
             Some(dir) => Some(std::path::absolute(PathBuf::from(dir))?),
             None => None,
         };
@@ -207,7 +269,7 @@ fn plist(definition: &Definition, log: &str) -> String {
     let mut environment = String::new();
     if let Some(home) = &definition.home {
         environment = format!(
-            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>OPENVAULT_HOME</key>\n\
+            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>LATEM_VAULT_HOME</key>\n\
              \t\t<string>{}</string>\n\t</dict>\n",
             xml(home)
         );
@@ -216,8 +278,8 @@ fn plist(definition: &Definition, log: &str) -> String {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<!-- Written by `openvault service install`: runs `openvault service` at login, and again
-     whenever it stops. `openvault service uninstall` removes it. -->
+<!-- Written by `latem-vault service install`: runs `latem-vault service` at login, and again
+     whenever it stops. `latem-vault service uninstall` removes it. -->
 <dict>
 	<key>Label</key>
 	<string>{LABEL}</string>
@@ -248,9 +310,9 @@ fn plist(definition: &Definition, log: &str) -> String {
 /// The systemd user unit (service.md, starting at login).
 fn unit(definition: &Definition) -> String {
     let mut unit = format!(
-        "# Written by `openvault service install`. `openvault service uninstall` removes it.\n\
+        "# Written by `latem-vault service install`. `latem-vault service uninstall` removes it.\n\
          [Unit]\n\
-         Description=OpenVault service: holds the vault open and syncs it with the other devices\n\
+         Description=latem vault service: holds the vault open and syncs it with the other devices\n\
          Wants=network-online.target\n\
          After=network-online.target\n\
          \n\
@@ -263,7 +325,7 @@ fn unit(definition: &Definition) -> String {
         let _ = writeln!(
             unit,
             "Environment={}",
-            systemd_quote(&format!("OPENVAULT_HOME={home}"))
+            systemd_quote(&format!("LATEM_VAULT_HOME={home}"))
         );
     }
     unit.push_str("Restart=on-failure\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n");
@@ -332,7 +394,7 @@ fn systemd_state(show: &str) -> SystemState {
 
 /// Asks the service on `socket` for its status. `None` if nothing answers there.
 fn call_status(socket: &Path) -> Option<Response> {
-    openvault_service::client::call(socket, &Request::Status)
+    latem_vault_service::client::call(socket, &Request::Status)
         .ok()
         .flatten()
 }
@@ -371,58 +433,77 @@ mod system {
         format!("gui/{}", unsafe { libc::geteuid() })
     }
 
-    fn target() -> String {
-        format!("{}/{LABEL}", domain())
+    fn target(label: &str) -> String {
+        format!("{}/{label}", domain())
     }
 
-    pub fn definition_path() -> Result<PathBuf> {
+    fn definition_of(label: &str) -> Result<PathBuf> {
         let home = std::env::home_dir().context("can't find your home directory")?;
         Ok(home
             .join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist")))
+            .join(format!("{label}.plist")))
+    }
+
+    pub fn definition_path() -> Result<PathBuf> {
+        definition_of(LABEL)
+    }
+
+    pub fn old_definition_path() -> Result<PathBuf> {
+        definition_of(OLD_LABEL)
     }
 
     fn log_path() -> Result<PathBuf> {
         let home = std::env::home_dir().context("can't find your home directory")?;
-        Ok(home.join("Library/Logs/openvault-service.log"))
+        Ok(home.join("Library/Logs/latem-vault-service.log"))
     }
 
     pub fn render(definition: &Definition) -> Result<String> {
         Ok(plist(definition, &utf8(&log_path()?)?))
     }
 
-    pub fn system_state() -> Result<SystemState> {
-        let output = run("launchctl", &["print", &target()])?;
-        if !output.status.success() {
-            return Ok(SystemState::default());
-        }
-        Ok(launchd_state(&String::from_utf8_lossy(&output.stdout)))
+    /// Whether a definition runs `exe`.
+    pub fn runs(definition: &str, exe: &str) -> bool {
+        definition.contains(&format!("<string>{}</string>", xml(exe)))
     }
 
-    /// The Mac app's agent, when launchd has it loaded: the app registered it, and it's on in
-    /// Login Items.
-    pub fn app_state() -> Result<Option<SystemState>> {
-        let output = run(
-            "launchctl",
-            &["print", &format!("{}/{APP_LABEL}", domain())],
-        )?;
-        Ok(output
+    /// What launchd says about the agent `label`, if it has it loaded.
+    pub fn agent_state(label: &str) -> Option<SystemState> {
+        let output = run("launchctl", &["print", &target(label)]).ok()?;
+        output
             .status
             .success()
-            .then(|| launchd_state(&String::from_utf8_lossy(&output.stdout))))
+            .then(|| launchd_state(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    pub fn system_state() -> Result<SystemState> {
+        Ok(agent_state(LABEL).unwrap_or_default())
+    }
+
+    /// The Mac app's agent and its state, when launchd has it loaded: the app registered it,
+    /// and it's on in Login Items.
+    pub fn app_state() -> Result<Option<(&'static str, SystemState)>> {
+        Ok([APP_LABEL, OLD_APP_LABEL]
+            .into_iter()
+            .find_map(|label| Some((label, agent_state(label)?))))
+    }
+
+    /// Unloads the agent `label`, and waits for launchd to let go of it.
+    fn unload(label: &str) -> Result<()> {
+        // Not loaded is fine: there's nothing to unload.
+        run("launchctl", &["bootout", &target(label)])?;
+        // bootout returns before launchd lets go of the job, and a bootstrap until then fails
+        // with error 5, so wait for it to go.
+        let deadline = Instant::now() + STARTING;
+        while agent_state(label).is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(250));
+        }
+        Ok(())
     }
 
     /// Loads the agent afresh, so it runs the definition just written.
     pub fn start(path: &Path) -> Result<()> {
         let path = utf8(path)?;
-        // Not loaded is fine: there's nothing to unload.
-        run("launchctl", &["bootout", &target()])?;
-        // bootout returns before launchd lets go of the job, and a bootstrap until then fails
-        // with error 5, so wait for it to go.
-        let deadline = Instant::now() + STARTING;
-        while system_state()?.loaded && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(250));
-        }
+        unload(LABEL)?;
         let mut failed = String::new();
         for _ in 0..3 {
             let output = run("launchctl", &["bootstrap", &domain(), &path])?;
@@ -433,7 +514,7 @@ mod system {
             // macOS can load a new file in LaunchAgents by itself, which also makes bootstrap
             // fail with error 5. It's loaded then, and a restart runs the new definition.
             if system_state()?.loaded {
-                let output = run("launchctl", &["kickstart", "-k", &target()])?;
+                let output = run("launchctl", &["kickstart", "-k", &target(LABEL)])?;
                 if output.status.success() {
                     return Ok(());
                 }
@@ -448,8 +529,25 @@ mod system {
     }
 
     pub fn stop() -> Result<()> {
-        run("launchctl", &["bootout", &target()])?;
+        run("launchctl", &["bootout", &target(LABEL)])?;
         Ok(())
+    }
+
+    /// Stops and removes openvault's agent, if it's here. Whether it was.
+    pub fn remove_old() -> Result<bool> {
+        let path = old_definition_path()?;
+        let loaded = agent_state(OLD_LABEL).is_some();
+        if !loaded && !path.exists() {
+            return Ok(false);
+        }
+        unload(OLD_LABEL)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("can't remove {}", path.display())),
+        }
+        println!("Stopped and removed openvault's service ({OLD_LABEL}).");
+        Ok(true)
     }
 
     pub fn where_it_logs() -> String {
@@ -461,10 +559,10 @@ mod system {
 
     pub fn after_install() -> Result<()> {
         println!(
-            "macOS may show \"Background Items Added\", and ask whether openvault may find \
+            "macOS may show \"Background Items Added\", and ask whether latem-vault may find \
              devices on your local network. Allow it, or this Mac can't sync. With the firewall \
-             on, it also asks whether openvault may accept incoming connections. A new build of \
-             openvault asks again."
+             on, it also asks whether latem-vault may accept incoming connections. A new build \
+             of latem-vault asks again."
         );
         Ok(())
     }
@@ -475,20 +573,36 @@ mod system {
     use super::*;
 
     /// The systemd user unit.
-    const UNIT: &str = "openvault.service";
+    const UNIT: &str = "latem-vault.service";
 
-    pub fn definition_path() -> Result<PathBuf> {
+    fn definition_of(unit: &str) -> Result<PathBuf> {
         let config = match std::env::var_os("XDG_CONFIG_HOME") {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
             _ => std::env::home_dir()
                 .context("can't find your home directory")?
                 .join(".config"),
         };
-        Ok(config.join("systemd/user").join(UNIT))
+        Ok(config.join("systemd/user").join(unit))
+    }
+
+    pub fn definition_path() -> Result<PathBuf> {
+        definition_of(UNIT)
+    }
+
+    pub fn old_definition_path() -> Result<PathBuf> {
+        definition_of(OLD_UNIT)
     }
 
     pub fn render(definition: &Definition) -> Result<String> {
         Ok(unit(definition))
+    }
+
+    /// Whether a definition runs `exe`.
+    pub fn runs(definition: &str, exe: &str) -> bool {
+        definition.contains(&format!(
+            "ExecStart={} service\n",
+            systemd_quote(exe).replace('$', "$$")
+        ))
     }
 
     pub fn systemctl(args: &[&str]) -> Result<()> {
@@ -499,20 +613,20 @@ mod system {
         let message = stderr(&output);
         if message.contains("Failed to connect to bus") || message.contains("No medium found") {
             bail!(
-                "there's no systemd user instance here, as in some WSL setups. Start `openvault \
-                 service` another way"
+                "there's no systemd user instance here, as in some WSL setups. Start \
+                 `latem-vault service` another way"
             );
         }
         bail!("systemctl --user {} failed: {message}", args.join(" "))
     }
 
-    pub fn system_state() -> Result<SystemState> {
+    fn unit_state(unit: &str) -> Result<SystemState> {
         let output = run(
             "systemctl",
             &[
                 "--user",
                 "show",
-                UNIT,
+                unit,
                 "-p",
                 "LoadState",
                 "-p",
@@ -525,6 +639,10 @@ mod system {
             return Ok(SystemState::default());
         }
         Ok(systemd_state(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    pub fn system_state() -> Result<SystemState> {
+        unit_state(UNIT)
     }
 
     pub fn start(_: &Path) -> Result<()> {
@@ -540,13 +658,38 @@ mod system {
         Ok(())
     }
 
+    /// Stops and removes openvault's unit, if it's here. Whether it was.
+    pub fn remove_old() -> Result<bool> {
+        let path = old_definition_path()?;
+        let loaded = unit_state(OLD_UNIT)?.loaded;
+        if !loaded && !path.exists() {
+            return Ok(false);
+        }
+        if loaded {
+            systemctl(&["disable", "--now", OLD_UNIT])?;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("can't remove {}", path.display())),
+        }
+        systemctl(&["daemon-reload"])?;
+        println!("Stopped and removed openvault's service ({OLD_UNIT}).");
+        Ok(true)
+    }
+
     /// There's no Mac app here.
-    pub fn app_state() -> Result<Option<SystemState>> {
+    pub fn agent_state(_: &str) -> Option<SystemState> {
+        None
+    }
+
+    /// There's no Mac app here.
+    pub fn app_state() -> Result<Option<(&'static str, SystemState)>> {
         Ok(None)
     }
 
     pub fn where_it_logs() -> String {
-        "Its log: `journalctl --user -u openvault`.".to_owned()
+        "Its log: `journalctl --user -u latem-vault`.".to_owned()
     }
 
     pub fn after_install() -> Result<()> {
@@ -576,8 +719,16 @@ mod system {
         unsupported()
     }
 
+    pub fn old_definition_path() -> Result<PathBuf> {
+        unsupported()
+    }
+
     pub fn render(_: &Definition) -> Result<String> {
         unsupported()
+    }
+
+    pub fn runs(_: &str, _: &str) -> bool {
+        false
     }
 
     pub fn system_state() -> Result<SystemState> {
@@ -592,7 +743,15 @@ mod system {
         unsupported()
     }
 
-    pub fn app_state() -> Result<Option<SystemState>> {
+    pub fn remove_old() -> Result<bool> {
+        Ok(false)
+    }
+
+    pub fn agent_state(_: &str) -> Option<SystemState> {
+        None
+    }
+
+    pub fn app_state() -> Result<Option<(&'static str, SystemState)>> {
         Ok(None)
     }
 
@@ -608,7 +767,8 @@ mod system {
 #[cfg(target_os = "linux")]
 use system::systemctl;
 use system::{
-    after_install, app_state, definition_path, render, start, stop, system_state, where_it_logs,
+    after_install, agent_state, app_state, definition_path, old_definition_path, remove_old,
+    render, runs, start, stop, system_state, where_it_logs,
 };
 
 #[cfg(test)]
@@ -625,45 +785,43 @@ mod tests {
     #[test]
     fn the_plist_runs_this_binary() {
         let plist = plist(
-            &definition("/Users/me/.cargo/bin/openvault", None),
-            "/Users/me/Library/Logs/openvault-service.log",
+            &definition("/Users/me/.cargo/bin/latem-vault", None),
+            "/Users/me/Library/Logs/latem-vault-service.log",
         );
-        assert!(plist.contains("<string>local.openvault.service</string>"));
+        assert!(plist.contains("<string>dev.latem.vault.service</string>"));
         assert!(plist.contains(
-            "\t\t<string>/Users/me/.cargo/bin/openvault</string>\n\t\t<string>service</string>"
+            "\t\t<string>/Users/me/.cargo/bin/latem-vault</string>\n\t\t<string>service</string>"
         ));
         assert!(plist.contains("<key>KeepAlive</key>\n\t<true/>"));
         assert!(plist.contains("<integer>30</integer>"));
-        assert!(!plist.contains("OPENVAULT_HOME"));
+        assert!(!plist.contains("LATEM_VAULT_HOME"));
         assert_eq!(
             plist
-                .matches("/Users/me/Library/Logs/openvault-service.log")
+                .matches("/Users/me/Library/Logs/latem-vault-service.log")
                 .count(),
             2
         );
     }
 
     #[test]
-    fn the_plist_escapes_paths_and_carries_openvault_home() {
+    fn the_plist_escapes_paths_and_carries_the_vault_home() {
         let plist = plist(
             &definition(
-                "/Users/me/A & B <x>/openvault",
+                "/Users/me/A & B <x>/latem-vault",
                 Some("/Users/me/vault & co"),
             ),
             "/tmp/log",
         );
-        assert!(plist.contains("<string>/Users/me/A &amp; B &lt;x&gt;/openvault</string>"));
-        assert!(
-            plist.contains(
-                "<key>OPENVAULT_HOME</key>\n\t\t<string>/Users/me/vault &amp; co</string>"
-            )
-        );
+        assert!(plist.contains("<string>/Users/me/A &amp; B &lt;x&gt;/latem-vault</string>"));
+        assert!(plist.contains(
+            "<key>LATEM_VAULT_HOME</key>\n\t\t<string>/Users/me/vault &amp; co</string>"
+        ));
     }
 
     #[test]
     fn the_unit_runs_this_binary() {
-        let unit = unit(&definition("/home/me/.cargo/bin/openvault", None));
-        assert!(unit.contains("ExecStart=\"/home/me/.cargo/bin/openvault\" service\n"));
+        let unit = unit(&definition("/home/me/.cargo/bin/latem-vault", None));
+        assert!(unit.contains("ExecStart=\"/home/me/.cargo/bin/latem-vault\" service\n"));
         assert!(unit.contains("Restart=on-failure\nRestartSec=30\n"));
         assert!(unit.contains("After=network-online.target\n"));
         assert!(unit.contains("[Install]\nWantedBy=default.target\n"));
@@ -671,25 +829,34 @@ mod tests {
     }
 
     #[test]
-    fn the_unit_quotes_paths_and_carries_openvault_home() {
+    fn the_unit_quotes_paths_and_carries_the_vault_home() {
         let unit = unit(&definition(
-            "/home/me/my \"tools\" 100%/$bin\\openvault",
+            "/home/me/my \"tools\" 100%/$bin\\latem-vault",
             Some("/home/me/vault 50%"),
         ));
         assert!(unit.contains(
-            "ExecStart=\"/home/me/my \\\"tools\\\" 100%%/$$bin\\\\openvault\" service\n"
+            "ExecStart=\"/home/me/my \\\"tools\\\" 100%%/$$bin\\\\latem-vault\" service\n"
         ));
-        assert!(unit.contains("Environment=\"OPENVAULT_HOME=/home/me/vault 50%%\"\n"));
+        assert!(unit.contains("Environment=\"LATEM_VAULT_HOME=/home/me/vault 50%%\"\n"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_definition_names_the_binary_it_runs() {
+        let exe = "/Users/me/A & B \"100%\"/$bin/latem-vault";
+        let written = render(&definition(exe, None)).unwrap();
+        assert!(runs(&written, exe));
+        assert!(!runs(&written, "/Users/me/A & B \"100%\"/$bin/openvault"));
     }
 
     #[test]
     fn launchd_state_reads_the_top_level() {
-        let print = "gui/501/local.openvault.service = {\n\
+        let print = "gui/501/dev.latem.vault.service = {\n\
                      \tactive count = 2\n\
-                     \tpath = /Users/me/Library/LaunchAgents/local.openvault.service.plist\n\
+                     \tpath = /Users/me/Library/LaunchAgents/dev.latem.vault.service.plist\n\
                      \tstate = running\n\
                      \n\
-                     \tprogram = /Users/me/.cargo/bin/openvault\n\
+                     \tprogram = /Users/me/.cargo/bin/latem-vault\n\
                      \tpid = 53589\n\
                      \tendpoints = {\n\
                      \t\tstate = active\n\
@@ -704,7 +871,7 @@ mod tests {
                 pid: Some(53589),
             }
         );
-        let waiting = "gui/501/local.openvault.service = {\n\tstate = waiting\n}\n";
+        let waiting = "gui/501/dev.latem.vault.service = {\n\tstate = waiting\n}\n";
         assert_eq!(
             launchd_state(waiting),
             SystemState {

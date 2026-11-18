@@ -3,14 +3,14 @@
 
 use std::path::Path;
 
-use openvault_core::membership;
-use openvault_crypto::{Signature, SignatureContext, VerifyingKey};
+use latem_vault_core::membership;
+use latem_vault_crypto::{Signature, SignatureContext, VerifyingKey};
 
 use crate::{Backend, Error, Result, file};
 
 /// What the dialog says when the caller hasn't said what is being signed.
 #[cfg(target_os = "macos")]
-const DEFAULT_REASON: &str = "change who is in your OpenVault vault";
+const DEFAULT_REASON: &str = "change who is in your vault";
 
 /// An admin key, loaded from its file. It signs as a [`membership::AdminKey`]. Every signature
 /// one `AdminKey` makes shares one Touch ID prompt, so one approval should use one value.
@@ -106,10 +106,14 @@ impl membership::AdminKey for AdminKey {
         self.verifying_key.clone()
     }
 
-    fn sign(&self, context: SignatureContext, message: &[u8]) -> openvault_core::Result<Signature> {
+    fn sign(
+        &self,
+        context: SignatureContext,
+        message: &[u8],
+    ) -> latem_vault_core::Result<Signature> {
         #[cfg(target_os = "macos")]
         {
-            let input = openvault_crypto::sign::signing_input(context, message);
+            let input = latem_vault_crypto::sign::signing_input(context, message);
             Ok(self.signer()?.sign(&input)?)
         }
         #[cfg(not(target_os = "macos"))]

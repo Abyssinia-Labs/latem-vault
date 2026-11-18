@@ -2016,6 +2016,145 @@ dependencies = [
 ]
 
 [[package]]
+name = "latem-vault-cli"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "latem-vault-core",
+ "latem-vault-crypto",
+ "latem-vault-grandfather",
+ "latem-vault-keystore",
+ "latem-vault-net",
+ "latem-vault-service",
+ "libc",
+ "rpassword",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "latem-vault-core"
+version = "0.6.0"
+dependencies = [
+ "hex",
+ "latem-vault-crypto",
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "latem-vault-crypto"
+version = "0.6.0"
+dependencies = [
+ "argon2",
+ "bip39",
+ "blake3",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "hex",
+ "hkdf",
+ "hpke",
+ "p256",
+ "sha2",
+ "spake2",
+ "subtle",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "latem-vault-ffi"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "latem-vault-core",
+ "latem-vault-crypto",
+ "latem-vault-keystore",
+ "latem-vault-service",
+ "thiserror 2.0.21",
+ "tokio",
+ "uniffi",
+ "zeroize",
+]
+
+[[package]]
+name = "latem-vault-grandfather"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "iroh-relay",
+ "latem-vault-core",
+ "latem-vault-crypto",
+ "latem-vault-net",
+ "n0-future",
+ "rcgen",
+ "rusqlite",
+ "rustls",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "latem-vault-keystore"
+version = "0.6.0"
+dependencies = [
+ "core-foundation",
+ "latem-vault-core",
+ "latem-vault-crypto",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "security-framework",
+ "security-framework-sys",
+ "tempfile",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "latem-vault-net"
+version = "0.6.0"
+dependencies = [
+ "iroh",
+ "iroh-mdns-address-lookup",
+ "latem-vault-core",
+ "latem-vault-crypto",
+ "n0-future",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "latem-vault-service"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "latem-vault-core",
+ "latem-vault-crypto",
+ "latem-vault-keystore",
+ "latem-vault-net",
+ "libc",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2660,145 +2799,6 @@ name = "openssl-probe"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
-
-[[package]]
-name = "openvault-cli"
-version = "0.5.9"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "openvault-core",
- "openvault-crypto",
- "openvault-grandfather",
- "openvault-keystore",
- "openvault-net",
- "openvault-service",
- "rpassword",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zeroize",
-]
-
-[[package]]
-name = "openvault-core"
-version = "0.5.9"
-dependencies = [
- "hex",
- "openvault-crypto",
- "rusqlite",
- "tempfile",
- "thiserror 2.0.21",
- "zeroize",
-]
-
-[[package]]
-name = "openvault-crypto"
-version = "0.5.9"
-dependencies = [
- "argon2",
- "bip39",
- "blake3",
- "chacha20poly1305",
- "ed25519-dalek",
- "getrandom 0.4.3",
- "hex",
- "hkdf",
- "hpke",
- "p256",
- "sha2",
- "spake2",
- "subtle",
- "thiserror 2.0.21",
- "zeroize",
-]
-
-[[package]]
-name = "openvault-ffi"
-version = "0.5.9"
-dependencies = [
- "anyhow",
- "openvault-core",
- "openvault-crypto",
- "openvault-keystore",
- "openvault-service",
- "thiserror 2.0.21",
- "tokio",
- "uniffi",
- "zeroize",
-]
-
-[[package]]
-name = "openvault-grandfather"
-version = "0.5.9"
-dependencies = [
- "anyhow",
- "iroh",
- "iroh-relay",
- "n0-future",
- "openvault-core",
- "openvault-crypto",
- "openvault-net",
- "rcgen",
- "rusqlite",
- "rustls",
- "tempfile",
- "tokio",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "openvault-keystore"
-version = "0.5.9"
-dependencies = [
- "core-foundation",
- "objc2",
- "objc2-foundation",
- "objc2-local-authentication",
- "openvault-core",
- "openvault-crypto",
- "security-framework",
- "security-framework-sys",
- "tempfile",
- "thiserror 2.0.21",
- "zeroize",
-]
-
-[[package]]
-name = "openvault-net"
-version = "0.5.9"
-dependencies = [
- "iroh",
- "iroh-mdns-address-lookup",
- "n0-future",
- "openvault-core",
- "openvault-crypto",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "openvault-service"
-version = "0.5.9"
-dependencies = [
- "anyhow",
- "libc",
- "openvault-core",
- "openvault-crypto",
- "openvault-keystore",
- "openvault-net",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "zeroize",
-]
 
 [[package]]
 name = "p256"

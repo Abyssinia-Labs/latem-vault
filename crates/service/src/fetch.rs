@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use openvault_core::file::{ChunkId, Content, Manifest};
-use openvault_core::membership::Scope;
-use openvault_core::{CollectionId, DeviceId, Kind, Placement, Vault};
-use openvault_keystore::Keys;
-use openvault_net::chunks::{self, MAX_WANT};
-use openvault_net::{EndpointAddr, EndpointId, EndpointKey, Node, RelayUrl};
+use latem_vault_core::file::{ChunkId, Content, Manifest};
+use latem_vault_core::membership::Scope;
+use latem_vault_core::{CollectionId, DeviceId, Kind, Placement, Vault};
+use latem_vault_keystore::Keys;
+use latem_vault_net::chunks::{self, MAX_WANT};
+use latem_vault_net::{EndpointAddr, EndpointId, EndpointKey, Node, RelayUrl};
 use tokio::sync::broadcast;
 use tokio::task::block_in_place;
 use tokio::time::timeout;

@@ -1,5 +1,5 @@
 [package]
-name = "openvault-grandfather"
+name = "latem-vault-grandfather"
 description = "The grandfather: a vault's relay and coordinator, on its always-on machine."
 version.workspace = true
 edition.workspace = true
@@ -11,9 +11,9 @@ publish.workspace = true
 anyhow = "1.0.104"
 iroh = { version = "1.4.1", default-features = false, features = ["tls-ring"] }
 iroh-relay = { version = "1.4.1", default-features = false, features = ["server", "tls-ring"] }
-openvault-core = { path = "../core" }
-openvault-crypto = { path = "../crypto" }
-openvault-net = { path = "../net" }
+latem-vault-core = { path = "../core" }
+latem-vault-crypto = { path = "../crypto" }
+latem-vault-net = { path = "../net" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

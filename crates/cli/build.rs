@@ -6,7 +6,7 @@ use std::process::Command;
 
 fn main() {
     let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=OPENVAULT_COMMIT={commit}");
+    println!("cargo:rustc-env=LATEM_VAULT_COMMIT={commit}");
 
     // Run again when HEAD moves: switching branches rewrites HEAD, and a commit rewrites the
     // branch it names, or packed-refs once refs are packed.

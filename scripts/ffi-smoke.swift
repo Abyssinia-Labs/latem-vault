@@ -1,5 +1,5 @@
 // Uses the Swift bindings against a running service, as the Mac app will (scripts/swift-bindings.sh).
-// Arguments: the openvault directory, its recovery phrase, and the version the library should be.
+// Arguments: the vault directory, its recovery phrase, and the version the library should be.
 import Foundation
 
 let arguments = CommandLine.arguments
@@ -39,7 +39,7 @@ check(vault.recovery.count == 9 && !vault.admin, "vault \(vault)")
 do {
     try client.createCollection(name: "smoke", recoveryPhrase: nil)
     check(false, "a collection was created without a signature")
-} catch OpenVaultError.RecoveryPhraseNeeded {
+} catch VaultError.RecoveryPhraseNeeded {
     try client.createCollection(name: "smoke", recoveryPhrase: phrase)
 }
 
@@ -93,7 +93,7 @@ check(try client.get(collection: "smoke", name: "docs/notes.bin") == nil, "get g
 do {
     _ = try client.writeFile(collection: "smoke", name: "prod/TOKEN", path: original.path)
     check(false, "a file took a secret's name")
-} catch OpenVaultError.Failed {}
+} catch VaultError.Failed {}
 check(try client.collections()[0].files == 1, "the collection's file count")
 check(try client.placement(collection: "smoke", set: .onDemand) == .onDemand, "on demand")
 check(try client.placement(collection: "smoke", set: .keep) == .keep, "keep")
@@ -101,4 +101,4 @@ _ = diskNotEncrypted()
 
 watch.stop()
 check(listener.ended.wait(timeout: .now() + 10) == .success, "the watch didn't end")
-print("openvault-ffi \(version()) works from Swift: \(entries.count) entries, a file, \(log.count) log entries")
+print("latem-vault-ffi \(version()) works from Swift: \(entries.count) entries, a file, \(log.count) log entries")

@@ -2,7 +2,7 @@
 //!
 //! The endpoint uses no DNS or pkarr publishing and no port mapping, and no relay unless the
 //! device has a coordinator configured, whose grandfather's relay is then the only one it uses
-//! (coordinator.md). It finds other OpenVault endpoints with mDNS under its own service name;
+//! (coordinator.md). It finds other latem vault endpoints with mDNS under its own service name;
 //! which of them are members is for the membership log to say. When mDNS stops, the node starts
 //! it again ([`discovery_watch`]).
 
@@ -34,19 +34,22 @@ use tracing::{info, warn};
 
 pub use watch::{discovery_stops, discovery_watch};
 
-/// The mDNS service name: endpoints appear as `<endpoint id>._openvault._udp.local.`. Frozen
-/// in [`openvault_crypto::frozen`]: it keeps the name `openvault` through any rename.
-pub const MDNS_SERVICE: &str = openvault_crypto::frozen::MDNS_SERVICE;
+/// The mDNS service name: endpoints appear as `<endpoint id>._<MDNS_SERVICE>._udp.local.`. Frozen
+/// in [`latem_vault_crypto::frozen`]: it never changes, whatever the product is called.
+pub const MDNS_SERVICE: &str = latem_vault_crypto::frozen::MDNS_SERVICE;
 
 /// Names another mDNS service for this process's endpoints, so that they find only endpoints
 /// started with the same name. Tests set it, so their devices never meet the real ones on the
 /// network, nor a real app see their joiners (service.md, finding devices).
-pub const MDNS_SERVICE_VAR: &str = "OPENVAULT_MDNS_SERVICE";
+pub const MDNS_SERVICE_VAR: &str = "LATEM_VAULT_MDNS_SERVICE";
+/// [`MDNS_SERVICE_VAR`] before 0.6, still read for one release.
+pub const OLD_MDNS_SERVICE_VAR: &str = "OPENVAULT_MDNS_SERVICE";
 
 /// The mDNS service name endpoints use: [`MDNS_SERVICE_VAR`]'s, if it's set, else
-/// [`MDNS_SERVICE`].
+/// [`OLD_MDNS_SERVICE_VAR`]'s, else [`MDNS_SERVICE`].
 pub fn mdns_service() -> String {
     std::env::var(MDNS_SERVICE_VAR)
+        .or_else(|_| std::env::var(OLD_MDNS_SERVICE_VAR))
         .ok()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| MDNS_SERVICE.to_owned())
@@ -75,7 +78,7 @@ const RESTART_SETTLED: Duration = Duration::from_secs(10 * 60);
 /// An endpoint id: the Ed25519 public key of a device's transport key.
 pub type EndpointKey = [u8; 32];
 
-/// A change in which OpenVault endpoints mDNS can see.
+/// A change in which latem vault endpoints mDNS can see.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     Visible(EndpointKey),
@@ -213,7 +216,7 @@ impl Node {
         *self.endpoint.id().as_bytes()
     }
 
-    /// The OpenVault endpoints mDNS can see now, members or not.
+    /// The latem vault endpoints mDNS can see now, members or not.
     pub fn visible(&self) -> BTreeSet<EndpointKey> {
         self.visible
             .lock()
@@ -494,7 +497,7 @@ mod tests {
 
     #[test]
     fn service_names_follow_dns_sd() {
-        for good in ["openvault", "ovt-1a2b3c4d", "a", "abcdefghijklmno"] {
+        for good in [MDNS_SERVICE, "ovt-1a2b3c4d", "a", "abcdefghijklmno"] {
             assert!(valid_service(good), "{good}");
         }
         for bad in [

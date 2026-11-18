@@ -30,7 +30,7 @@ const STOPPED: &str = "actor ";
 static STOPS: LazyLock<watch::Sender<u64>> = LazyLock::new(|| watch::channel(0).0);
 
 /// A tracing layer that tells this process's [`Node`](crate::Node)s when mDNS discovery stops,
-/// so they can start it again. A process that keeps a node for long, as `openvault service`
+/// so they can start it again. A process that keeps a node for long, as `latem-vault service`
 /// does, adds it to its subscriber. It has a filter of its own, so it sees the guardian's
 /// warnings whatever the other layers leave out, and asks for nothing else.
 pub fn discovery_watch<S>() -> impl Layer<S>

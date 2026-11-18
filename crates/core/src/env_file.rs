@@ -1,4 +1,4 @@
-//! The `NAME=value` files `openvault import-env` and the Mac app's import read.
+//! The `NAME=value` files `latem-vault import-env` and the Mac app's import read.
 //!
 //! The format is latem's `secrets.env` (latem `internal/secrets/file.go`), so each value comes
 //! across byte for byte as latem reads it today:

@@ -12,28 +12,28 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use openvault_core::file::Manifest;
-use openvault_core::membership::{DeviceName, Scope as CoreScope};
-use openvault_core::{DeviceId, Kind as CoreKind, Placement as CorePlacement, env_file};
-use openvault_crypto::pake;
-use openvault_keystore::{Backend, Keys};
-use openvault_service::api::{self, ErrorCode, Request, Response};
-use openvault_service::{client, files, setup};
+use latem_vault_core::file::Manifest;
+use latem_vault_core::membership::{DeviceName, Scope as CoreScope};
+use latem_vault_core::{DeviceId, Kind as CoreKind, Placement as CorePlacement, env_file};
+use latem_vault_crypto::pake;
+use latem_vault_keystore::{Backend, Keys};
+use latem_vault_service::api::{self, ErrorCode, Request, Response};
+use latem_vault_service::{client, files, home, setup};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
-/// This library's version, as `openvault --version` prints its number.
+/// This library's version, as `latem-vault --version` prints its number.
 #[uniffi::export]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum OpenVaultError {
+pub enum VaultError {
     /// No service answers on the socket.
-    #[error("the OpenVault service isn't running")]
+    #[error("the latem vault service isn't running")]
     NotRunning,
     /// Signing needs the recovery phrase: ask for it and call again with it.
     #[error("{message}")]
@@ -45,7 +45,7 @@ pub enum OpenVaultError {
     Failed { message: String },
 }
 
-impl From<io::Error> for OpenVaultError {
+impl From<io::Error> for VaultError {
     fn from(error: io::Error) -> Self {
         Self::Failed {
             message: error.to_string(),
@@ -303,10 +303,10 @@ pub struct EnvLine {
     pub line: u32,
 }
 
-/// Reads a `.env` file as `openvault import-env` does, and so as latem does. If any line can't
+/// Reads a `.env` file as `latem-vault import-env` does, and so as latem does. If any line can't
 /// be read, nothing is returned, and the error names the line but never shows it.
 #[uniffi::export]
-pub fn parse_env(file: Vec<u8>) -> Result<Vec<EnvLine>, OpenVaultError> {
+pub fn parse_env(file: Vec<u8>) -> Result<Vec<EnvLine>, VaultError> {
     let file = Zeroizing::new(file);
     if file.len() > env_file::MAX_LEN {
         return Err(failed(format!(
@@ -334,7 +334,7 @@ pub enum KeyStorage {
     Passphrase,
 }
 
-/// What an openvault directory holds, read from its files without the service.
+/// What a vault directory holds, read from its files without the service.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct DeviceHome {
     pub path: String,
@@ -346,17 +346,17 @@ pub struct DeviceHome {
     pub joining: bool,
 }
 
-/// The openvault directory `home`, or `OPENVAULT_HOME` or `~/.openvault` without one: whether it
+/// The vault directory `home`, or `LATEM_VAULT_HOME` or `~/.latem-vault` without one: whether it
 /// holds a vault, and how its keys are kept. An app checks this before starting the service,
 /// which can't run without a vault or ask for a passphrase.
 #[uniffi::export]
-pub fn device_home(home: Option<String>) -> Result<DeviceHome, OpenVaultError> {
+pub fn device_home(home: Option<String>) -> Result<DeviceHome, VaultError> {
     let home = locate(home)?;
-    let keys = home.join(openvault_service::KEYS);
+    let keys = home.join(latem_vault_service::KEYS);
     let keys = match keys.exists() {
         false => None,
         true => Some(
-            match openvault_keystore::backend_of(&keys).map_err(|e| failed(e.to_string()))? {
+            match latem_vault_keystore::backend_of(&keys).map_err(|e| failed(e.to_string()))? {
                 Backend::SecureEnclave => KeyStorage::SecureEnclave,
                 Backend::Software => KeyStorage::Software,
                 Backend::Passphrase => KeyStorage::Passphrase,
@@ -368,7 +368,7 @@ pub fn device_home(home: Option<String>) -> Result<DeviceHome, OpenVaultError> {
             .to_str()
             .ok_or_else(|| failed(format!("{} isn't UTF-8", home.display())))?
             .to_owned(),
-        vault: home.join(openvault_service::VAULT).exists(),
+        vault: home.join(latem_vault_service::VAULT).exists(),
         keys,
         joining: setup::join_in_progress(&home),
     })
@@ -377,7 +377,7 @@ pub fn device_home(home: Option<String>) -> Result<DeviceHome, OpenVaultError> {
 /// This computer's host name without `.local`, as a new device's name in the log.
 #[uniffi::export]
 pub fn default_device_name() -> String {
-    openvault_service::default_device_name()
+    latem_vault_service::default_device_name()
 }
 
 /// Whether this Mac has a Secure Enclave for a new device's keys, which `init` and `join` then
@@ -400,7 +400,7 @@ pub struct NewVault {
     pub admin: bool,
 }
 
-/// Makes a vault in `home` with this device as its first member, as `openvault init` does
+/// Makes a vault in `home` with this device as its first member, as `latem-vault init` does
 /// (service.md, without the service). With the Secure Enclave the device gets an admin key too.
 /// `passphrase` is for [`KeyStorage::Passphrase`]. No service runs yet; start one after.
 #[uniffi::export]
@@ -409,11 +409,11 @@ pub fn create_vault(
     keys: KeyStorage,
     name: String,
     passphrase: Option<String>,
-) -> Result<NewVault, OpenVaultError> {
+) -> Result<NewVault, VaultError> {
     let home = locate(home)?;
     let passphrase = passphrase.map(Zeroizing::new);
     if let Some(passphrase) = &passphrase {
-        openvault_keystore::check_passphrase(passphrase).map_err(|e| failed(e.to_string()))?;
+        latem_vault_keystore::check_passphrase(passphrase).map_err(|e| failed(e.to_string()))?;
     }
     DeviceName {
         platform: std::env::consts::OS.into(),
@@ -428,7 +428,7 @@ pub fn create_vault(
         &name,
     )
     .map_err(|e| failed(format!("{e:#}")))?;
-    let recovery = openvault_crypto::hash::hash(created.vault.recovery_key().as_bytes());
+    let recovery = latem_vault_crypto::hash::hash(created.vault.recovery_key().as_bytes());
     Ok(NewVault {
         vault: created.vault.vault_id().to_string(),
         device: created.vault.device_id().to_string(),
@@ -485,7 +485,7 @@ impl Joining {
     }
 }
 
-/// Starts joining a vault from `home`, as `openvault join` does: makes this device's keys with
+/// Starts joining a vault from `home`, as `latem-vault join` does: makes this device's keys with
 /// `keys`, or loads those of a join in progress, and announces it on the local network with a
 /// 6-digit code for an admin to type. It returns at once; the join runs on its own thread, on an
 /// endpoint of its own, for up to 10 minutes. Once `listener` hears it ended without an error,
@@ -497,7 +497,7 @@ pub fn join_vault(
     name: String,
     passphrase: Option<String>,
     listener: Arc<dyn JoinListener>,
-) -> Result<Arc<Joining>, OpenVaultError> {
+) -> Result<Arc<Joining>, VaultError> {
     let home = locate(home)?;
     let name = DeviceName {
         platform: std::env::consts::OS.into(),
@@ -510,7 +510,7 @@ pub fn join_vault(
         backend(keys),
         || match &passphrase {
             Some(passphrase) => {
-                openvault_keystore::check_passphrase(passphrase)?;
+                latem_vault_keystore::check_passphrase(passphrase)?;
                 Ok(passphrase.clone())
             }
             None => anyhow::bail!("keys behind a passphrase need one"),
@@ -534,7 +534,7 @@ pub fn join_vault(
         stop: Mutex::new(Some(stop)),
     });
     std::thread::Builder::new()
-        .name("openvault join".into())
+        .name("latem-vault join".into())
         .spawn(move || {
             let progress = |progress| {
                 listener.on_progress(match progress {
@@ -560,7 +560,7 @@ pub fn join_vault(
 /// Forgets a join begun in `home` and not finished, so this device can make a vault, or join
 /// with other keys.
 #[uniffi::export]
-pub fn forget_join(home: Option<String>) -> Result<(), OpenVaultError> {
+pub fn forget_join(home: Option<String>) -> Result<(), VaultError> {
     setup::forget_join(&locate(home)?).map_err(|e| failed(format!("{e:#}")))
 }
 
@@ -580,20 +580,19 @@ fn fingerprint(bytes: &[u8]) -> String {
     )
 }
 
-/// `home`, or `OPENVAULT_HOME`, or `~/.openvault`, as the CLI finds it.
-fn locate(home: Option<String>) -> Result<PathBuf, OpenVaultError> {
-    Ok(match home.map(PathBuf::from) {
-        Some(home) => home,
-        None => match std::env::var_os("OPENVAULT_HOME") {
-            Some(home) => PathBuf::from(home),
-            None => std::env::home_dir()
-                .ok_or_else(|| failed("can't find the home directory"))?
-                .join(".openvault"),
-        },
+/// `home`, or the directory the CLI uses: `LATEM_VAULT_HOME`, or `~/.latem-vault`. Until the CLI
+/// or the service has moved it there, the vault may still be in the directory it had before
+/// 0.6, and this finds it there ([`home::Location::current`]).
+fn locate(home: Option<String>) -> Result<PathBuf, VaultError> {
+    Ok(match home {
+        Some(home) => PathBuf::from(home),
+        None => home::Location::from_env()
+            .map_err(|e| failed(e.to_string()))?
+            .current(),
     })
 }
 
-/// The service of the vault in one openvault directory.
+/// The service of the vault in one vault directory.
 #[derive(uniffi::Object)]
 pub struct Client {
     socket: PathBuf,
@@ -601,11 +600,11 @@ pub struct Client {
 
 #[uniffi::export]
 impl Client {
-    /// The client for the vault in `home`, or in `OPENVAULT_HOME` or `~/.openvault` without one.
+    /// The client for the vault in `home`, or in `LATEM_VAULT_HOME` or `~/.latem-vault` without one.
     #[uniffi::constructor]
-    pub fn new(home: Option<String>) -> Result<Arc<Self>, OpenVaultError> {
+    pub fn new(home: Option<String>) -> Result<Arc<Self>, VaultError> {
         Ok(Arc::new(Self {
-            socket: locate(home)?.join(openvault_service::SOCKET),
+            socket: locate(home)?.join(latem_vault_service::SOCKET),
         }))
     }
 
@@ -613,7 +612,7 @@ impl Client {
         client::is_running(&self.socket)
     }
 
-    pub fn status(&self) -> Result<Status, OpenVaultError> {
+    pub fn status(&self) -> Result<Status, VaultError> {
         match self.call(&Request::Status)? {
             Response::Status {
                 version,
@@ -628,7 +627,7 @@ impl Client {
         }
     }
 
-    pub fn vault(&self) -> Result<VaultInfo, OpenVaultError> {
+    pub fn vault(&self) -> Result<VaultInfo, VaultError> {
         match self.call(&Request::Vault)? {
             Response::Vault(info) => Ok(VaultInfo {
                 vault: info.vault.to_string(),
@@ -641,7 +640,7 @@ impl Client {
         }
     }
 
-    pub fn collections(&self) -> Result<Vec<CollectionSummary>, OpenVaultError> {
+    pub fn collections(&self) -> Result<Vec<CollectionSummary>, VaultError> {
         match self.call(&Request::CollectionSummaries)? {
             Response::CollectionSummaries(summaries) => Ok(summaries
                 .into_iter()
@@ -669,7 +668,7 @@ impl Client {
         &self,
         name: String,
         recovery_phrase: Option<String>,
-    ) -> Result<(), OpenVaultError> {
+    ) -> Result<(), VaultError> {
         done(self.call(&Request::CreateCollection {
             name,
             recovery_phrase: recovery_phrase.map(Into::into),
@@ -679,7 +678,7 @@ impl Client {
     /// A collection's current entries, with variables' values but never secrets'. Files come with
     /// their sizes and how many of their chunks aren't here, from the listing, which only a
     /// collection with files asks for.
-    pub fn entries(&self, collection: String) -> Result<Vec<Entry>, OpenVaultError> {
+    pub fn entries(&self, collection: String) -> Result<Vec<Entry>, VaultError> {
         let details = match self.call(&Request::EntryDetails {
             collection: collection.clone(),
         })? {
@@ -718,7 +717,7 @@ impl Client {
 
     /// A secret's or variable's value, or `None` if it doesn't exist or is a file, whose bytes
     /// `export_file` writes out instead.
-    pub fn get(&self, collection: String, name: String) -> Result<Option<Value>, OpenVaultError> {
+    pub fn get(&self, collection: String, name: String) -> Result<Option<Value>, VaultError> {
         match self.call(&Request::Get { collection, name })? {
             Response::Entry(value) => {
                 Ok(value
@@ -733,7 +732,7 @@ impl Client {
     }
 
     /// Writes every entry in one transaction. Files are written with `write_file`.
-    pub fn set(&self, collection: String, entries: Vec<NewEntry>) -> Result<(), OpenVaultError> {
+    pub fn set(&self, collection: String, entries: Vec<NewEntry>) -> Result<(), VaultError> {
         if entries.iter().any(|entry| entry.kind == Kind::File) {
             return Err(failed("files are written with write_file"));
         }
@@ -752,7 +751,7 @@ impl Client {
     }
 
     /// Returns whether there was one to delete.
-    pub fn delete(&self, collection: String, name: String) -> Result<bool, OpenVaultError> {
+    pub fn delete(&self, collection: String, name: String) -> Result<bool, VaultError> {
         match self.call(&Request::Delete { collection, name })? {
             Response::Deleted(existed) => Ok(existed),
             other => Err(unexpected(other)),
@@ -762,7 +761,7 @@ impl Client {
     /// Gets the chunks of a file that aren't on this device from the devices that read its
     /// collection, and returns how many none of them had: 0 once it can be read (files.md,
     /// asking). It answers when it's done, which for a large file takes the transfer's time.
-    pub fn fetch(&self, collection: String, name: String) -> Result<u64, OpenVaultError> {
+    pub fn fetch(&self, collection: String, name: String) -> Result<u64, VaultError> {
         match self.call(&Request::Fetch { collection, name })? {
             Response::Fetched { missing } => Ok(missing),
             other => Err(unexpected(other)),
@@ -777,7 +776,7 @@ impl Client {
         collection: String,
         name: String,
         path: String,
-    ) -> Result<(), OpenVaultError> {
+    ) -> Result<(), VaultError> {
         let manifest = self.manifest(&collection, &name)?;
         let mut calls = Calls(self);
         files::write_out(
@@ -798,7 +797,7 @@ impl Client {
         collection: String,
         name: String,
         path: String,
-    ) -> Result<bool, OpenVaultError> {
+    ) -> Result<bool, VaultError> {
         files::write_file(&mut Calls(self), &collection, &name, Path::new(&path))
             .map(|written| written.is_some())
             .map_err(from_anyhow)
@@ -810,7 +809,7 @@ impl Client {
         &self,
         collection: String,
         set: Option<Placement>,
-    ) -> Result<Placement, OpenVaultError> {
+    ) -> Result<Placement, VaultError> {
         match self.call(&Request::Placement {
             collection,
             set: set.map(Into::into),
@@ -820,7 +819,7 @@ impl Client {
         }
     }
 
-    pub fn devices(&self) -> Result<Vec<Device>, OpenVaultError> {
+    pub fn devices(&self) -> Result<Vec<Device>, VaultError> {
         match self.call(&Request::Devices)? {
             Response::Devices(devices) => Ok(devices
                 .into_iter()
@@ -841,7 +840,7 @@ impl Client {
         }
     }
 
-    pub fn peers(&self) -> Result<Vec<Peer>, OpenVaultError> {
+    pub fn peers(&self) -> Result<Vec<Peer>, VaultError> {
         match self.call(&Request::Peers)? {
             Response::Peers(peers) => Ok(peers
                 .into_iter()
@@ -863,7 +862,7 @@ impl Client {
     }
 
     /// Up to `max` log entries from seq `from`, at most 256.
-    pub fn log(&self, from: u64, max: u16) -> Result<Vec<LogLine>, OpenVaultError> {
+    pub fn log(&self, from: u64, max: u16) -> Result<Vec<LogLine>, VaultError> {
         match self.call(&Request::Log { from, max })? {
             Response::Log(lines) => lines.into_iter().map(log_line).collect(),
             other => Err(unexpected(other)),
@@ -871,7 +870,7 @@ impl Client {
     }
 
     /// What a device can read and wrote last, to show before revoking it.
-    pub fn review(&self, device: String) -> Result<Review, OpenVaultError> {
+    pub fn review(&self, device: String) -> Result<Review, VaultError> {
         let device = device_id(&device)?;
         match self.call(&Request::Review { device })? {
             Response::Review(review) => Ok(Review {
@@ -911,7 +910,7 @@ impl Client {
         &self,
         device: String,
         recovery_phrase: Option<String>,
-    ) -> Result<Revoked, OpenVaultError> {
+    ) -> Result<Revoked, VaultError> {
         let device = device_id(&device)?;
         match self.call(&Request::Revoke {
             device,
@@ -928,7 +927,7 @@ impl Client {
         device: String,
         changes: Vec<ScopeChange>,
         recovery_phrase: Option<String>,
-    ) -> Result<ScopesSet, OpenVaultError> {
+    ) -> Result<ScopesSet, VaultError> {
         let device = device_id(&device)?;
         match self.call(&Request::SetScopes {
             device,
@@ -949,7 +948,7 @@ impl Client {
     }
 
     /// The devices waiting to join on this network, as their announcements say.
-    pub fn joiners(&self) -> Result<Vec<Joiner>, OpenVaultError> {
+    pub fn joiners(&self) -> Result<Vec<Joiner>, VaultError> {
         match self.call(&Request::Joiners)? {
             Response::Joiners(joiners) => Ok(joiners
                 .into_iter()
@@ -964,11 +963,7 @@ impl Client {
     }
 
     /// Checks the code a joiner shows; on a match, what it asks to join as.
-    pub fn check_code(
-        &self,
-        endpoint: Vec<u8>,
-        code: String,
-    ) -> Result<JoinRequest, OpenVaultError> {
+    pub fn check_code(&self, endpoint: Vec<u8>, code: String) -> Result<JoinRequest, VaultError> {
         let joiner = endpoint
             .try_into()
             .map_err(|_| failed("an endpoint id is 32 bytes"))?;
@@ -992,7 +987,7 @@ impl Client {
         session: u32,
         scopes: Vec<ScopeChange>,
         recovery_phrase: Option<String>,
-    ) -> Result<(), OpenVaultError> {
+    ) -> Result<(), VaultError> {
         done(self.call(&Request::Approve {
             session,
             scopes: scope_list(scopes),
@@ -1000,16 +995,16 @@ impl Client {
         })?)
     }
 
-    pub fn refuse(&self, session: u32) -> Result<(), OpenVaultError> {
+    pub fn refuse(&self, session: u32) -> Result<(), VaultError> {
         done(self.call(&Request::Refuse { session })?)
     }
 
     /// Calls `listener` on each event until [`Watch::stop`], or until the service stops.
-    pub fn watch(&self, listener: Arc<dyn WatchListener>) -> Result<Arc<Watch>, OpenVaultError> {
+    pub fn watch(&self, listener: Arc<dyn WatchListener>) -> Result<Arc<Watch>, VaultError> {
         let mut stream = match UnixStream::connect(&self.socket) {
             Ok(stream) => stream,
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
-                return Err(OpenVaultError::NotRunning);
+                return Err(VaultError::NotRunning);
             }
             Err(e) => return Err(e.into()),
         };
@@ -1020,7 +1015,7 @@ impl Client {
         }
         let reading = stream.try_clone()?;
         std::thread::Builder::new()
-            .name("openvault watch".into())
+            .name("latem-vault watch".into())
             .spawn(move || listen(reading, listener))?;
         Ok(Arc::new(Watch { stream }))
     }
@@ -1047,7 +1042,7 @@ impl Drop for Watch {
 
 impl Client {
     /// A file's manifest: what it holds, or the chunks it's in.
-    fn manifest(&self, collection: &str, name: &str) -> Result<Manifest, OpenVaultError> {
+    fn manifest(&self, collection: &str, name: &str) -> Result<Manifest, VaultError> {
         match self.call(&Request::Get {
             collection: collection.into(),
             name: name.into(),
@@ -1060,15 +1055,15 @@ impl Client {
         }
     }
 
-    fn call(&self, request: &Request) -> Result<Response, OpenVaultError> {
+    fn call(&self, request: &Request) -> Result<Response, VaultError> {
         match client::call(&self.socket, request)? {
             Some(Response::Error { code, message }) => Err(match code {
-                ErrorCode::RecoveryPhraseNeeded => OpenVaultError::RecoveryPhraseNeeded { message },
-                ErrorCode::WrongCode => OpenVaultError::WrongCode { message },
-                ErrorCode::Other => OpenVaultError::Failed { message },
+                ErrorCode::RecoveryPhraseNeeded => VaultError::RecoveryPhraseNeeded { message },
+                ErrorCode::WrongCode => VaultError::WrongCode { message },
+                ErrorCode::Other => VaultError::Failed { message },
             }),
             Some(response) => Ok(response),
-            None => Err(OpenVaultError::NotRunning),
+            None => Err(VaultError::NotRunning),
         }
     }
 }
@@ -1089,7 +1084,7 @@ fn listen(mut stream: UnixStream, listener: Arc<dyn WatchListener>) {
                 return;
             }
             // Stopped here, or the service went away: both end the watch quietly.
-            Err(OpenVaultError::Failed { .. }) => {
+            Err(VaultError::Failed { .. }) => {
                 listener.on_end(None);
                 return;
             }
@@ -1101,12 +1096,12 @@ fn listen(mut stream: UnixStream, listener: Arc<dyn WatchListener>) {
     }
 }
 
-fn read(stream: &mut UnixStream) -> Result<Response, OpenVaultError> {
+fn read(stream: &mut UnixStream) -> Result<Response, VaultError> {
     let (kind, body) = api::read_message(stream).map_err(|e| failed(e.to_string()))?;
     Response::decode(kind, &body).map_err(|e| failed(e.to_string()))
 }
 
-fn log_line(line: api::LogLine) -> Result<LogLine, OpenVaultError> {
+fn log_line(line: api::LogLine) -> Result<LogLine, VaultError> {
     let none = DeviceId::from_bytes([0; 16]);
     Ok(LogLine {
         seq: line.seq,
@@ -1140,12 +1135,12 @@ fn scope_list(changes: Vec<ScopeChange>) -> Vec<(String, CoreScope)> {
         .collect()
 }
 
-fn device_id(id: &str) -> Result<DeviceId, OpenVaultError> {
+fn device_id(id: &str) -> Result<DeviceId, VaultError> {
     id.parse()
         .map_err(|_| failed(format!("{id} isn't a device id")))
 }
 
-/// The client as the shared file code calls it (`openvault_service::files`).
+/// The client as the shared file code calls it (`latem_vault_service::files`).
 struct Calls<'a>(&'a Client);
 
 impl files::Caller for Calls<'_> {
@@ -1155,8 +1150,8 @@ impl files::Caller for Calls<'_> {
 }
 
 /// Back from the shared file code: the service's own error if that's what it was.
-fn from_anyhow(error: anyhow::Error) -> OpenVaultError {
-    match error.downcast::<OpenVaultError>() {
+fn from_anyhow(error: anyhow::Error) -> VaultError {
+    match error.downcast::<VaultError>() {
         Ok(error) => error,
         Err(error) => failed(format!("{error:#}")),
     }
@@ -1170,21 +1165,21 @@ pub fn disk_not_encrypted() -> Option<String> {
     files::disk_encryption().err()
 }
 
-fn done(response: Response) -> Result<(), OpenVaultError> {
+fn done(response: Response) -> Result<(), VaultError> {
     match response {
         Response::Done => Ok(()),
         other => Err(unexpected(other)),
     }
 }
 
-fn unexpected(response: Response) -> OpenVaultError {
+fn unexpected(response: Response) -> VaultError {
     failed(format!(
         "unexpected response from the service: {response:?}"
     ))
 }
 
-fn failed(message: impl Into<String>) -> OpenVaultError {
-    OpenVaultError::Failed {
+fn failed(message: impl Into<String>) -> VaultError {
+    VaultError::Failed {
         message: message.into(),
     }
 }
@@ -1309,7 +1304,8 @@ mod tests {
 
     #[test]
     fn an_empty_home_has_no_vault_or_keys() {
-        let home = std::env::temp_dir().join(format!("openvault-ffi-home-{}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("latem-vault-ffi-home-{}", std::process::id()));
         let found = device_home(Some(home.to_string_lossy().into_owned())).unwrap();
         assert_eq!((found.vault, found.keys), (false, None));
         assert_eq!(found.path, home.to_string_lossy());
@@ -1337,7 +1333,7 @@ mod tests {
                 "x".into(),
                 Some("short".into())
             ),
-            Err(OpenVaultError::Failed { .. })
+            Err(VaultError::Failed { .. })
         ));
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -1406,20 +1402,20 @@ mod tests {
 
     fn temp_home(name: &str) -> PathBuf {
         let home =
-            std::env::temp_dir().join(format!("openvault-ffi-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("latem-vault-ffi-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         home
     }
 
     #[test]
     fn a_missing_service_is_not_running() {
-        let home = std::env::temp_dir().join(format!("openvault-ffi-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("latem-vault-ffi-{}", std::process::id()));
         let client = Client::new(Some(home.to_string_lossy().into_owned())).unwrap();
         assert!(!client.is_running());
-        assert!(matches!(client.vault(), Err(OpenVaultError::NotRunning)));
+        assert!(matches!(client.vault(), Err(VaultError::NotRunning)));
         assert!(matches!(
             client.check_code(vec![0; 31], "123456".into()),
-            Err(OpenVaultError::Failed { .. })
+            Err(VaultError::Failed { .. })
         ));
     }
 }

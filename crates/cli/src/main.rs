@@ -1,9 +1,10 @@
-//! The `openvault` command (design §14).
+//! The `latem-vault` command (design §14).
 //!
-//! Everything for this device lives in one directory, `~/.openvault` unless `OPENVAULT_HOME`
+//! Everything for this device lives in one directory, `~/.latem-vault` unless `LATEM_VAULT_HOME`
 //! names another: the key file (`keys`), the vault database (`vault.db`) and, while
-//! `openvault service` runs, its socket (`service.sock`). Commands go through the service when
-//! it runs, and open the vault themselves otherwise.
+//! `latem-vault service` runs, its socket (`service.sock`). Commands go through the service when
+//! it runs, and open the vault themselves otherwise. Before 0.6 the directory was `~/.openvault`,
+//! which the first run moves (migrate.rs).
 
 mod files;
 #[cfg(feature = "coordinator")]
@@ -13,6 +14,7 @@ mod keys;
 mod log;
 #[cfg(unix)]
 mod login;
+mod migrate;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -23,29 +25,29 @@ use std::process::{self, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use openvault_core::file::Manifest;
-use openvault_core::membership::Scope;
-use openvault_core::names::is_env_name;
-use openvault_core::record::MAX_VALUE_LEN;
-use openvault_core::{Kind, Placement, Vault, env_file, names};
-use openvault_keystore::{Backend, Keys};
-use openvault_service::api::{DeviceSummary, ErrorCode, Item, Listed, Request, Response, Value};
-use openvault_service::files::size_label;
-use openvault_service::handler::{self, unexpected};
-use openvault_service::{ADMIN_KEY, KEYS, SOCKET, VAULT, default_device_name, setup};
+use latem_vault_core::file::Manifest;
+use latem_vault_core::membership::Scope;
+use latem_vault_core::names::is_env_name;
+use latem_vault_core::record::MAX_VALUE_LEN;
+use latem_vault_core::{Kind, Placement, Vault, env_file, names};
+use latem_vault_keystore::{Backend, Keys};
+use latem_vault_service::api::{DeviceSummary, ErrorCode, Item, Listed, Request, Response, Value};
+use latem_vault_service::files::size_label;
+use latem_vault_service::handler::{self, unexpected};
+use latem_vault_service::{ADMIN_KEY, KEYS, SOCKET, VAULT, default_device_name, setup};
 use zeroize::Zeroizing;
 
 /// This build: its version, and the commit it was built from (README, versions).
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
-    env!("OPENVAULT_COMMIT"),
+    env!("LATEM_VAULT_COMMIT"),
     ")"
 );
 
 #[derive(Parser)]
 #[command(
-    name = "openvault",
+    name = "latem-vault",
     version = VERSION,
     about = "Secrets and variables, encrypted on your own devices."
 )]
@@ -120,7 +122,7 @@ enum Command {
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<OsString>,
     },
-    /// Join a vault on another device: shows a code to type into `openvault approve` there.
+    /// Join a vault on another device: shows a code to type into `latem-vault approve` there.
     Join {
         /// This device's name in the vault [default: this computer's host name]
         #[arg(long)]
@@ -184,7 +186,7 @@ enum Command {
         action: Option<CoordinatorAction>,
     },
     /// Run this vault's relay and coordinator on its always-on machine, so its devices reach each
-    /// other away from home. Prints the address to give them with `openvault coordinator set`.
+    /// other away from home. Prints the address to give them with `latem-vault coordinator set`.
     /// Runs until Ctrl-C.
     #[cfg(feature = "coordinator")]
     Grandfather(grandfather::Args),
@@ -278,7 +280,7 @@ enum ServiceAction {
 #[cfg(feature = "coordinator")]
 #[derive(Subcommand)]
 enum CoordinatorAction {
-    /// Use the grandfather at this address, as `openvault grandfather` prints it: its relay, and
+    /// Use the grandfather at this address, as `latem-vault grandfather` prints it: its relay, and
     /// its coordinator
     Set { address: String },
     /// Stop using a grandfather: find other devices on the local network only
@@ -322,13 +324,39 @@ fn main() -> ExitCode {
     match dispatch(cli.command) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("openvault: {error:#}");
+            eprintln!("latem-vault: {error:#}");
             ExitCode::FAILURE
         }
     }
 }
 
 fn dispatch(command: Command) -> Result<ExitCode> {
+    match &command {
+        // They look for the vault themselves: install moves it once openvault's service stops.
+        #[cfg(unix)]
+        Command::Service {
+            action: Some(ServiceAction::Install),
+            ..
+        } => {
+            login::install()?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        #[cfg(unix)]
+        Command::Service {
+            action: Some(ServiceAction::Uninstall),
+            ..
+        } => {
+            login::uninstall()?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        // The service's log starts before the vault is looked for, so it says where it is.
+        #[cfg(unix)]
+        Command::Service {
+            action: None,
+            log: Some(file),
+        } => log_to(file)?,
+        _ => {}
+    }
     let home = Home::locate()?;
     match command {
         Command::Init { keys, name } => {
@@ -365,7 +393,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 ScopeArg::Write => Scope::Write,
             },
         )?,
-        Command::Service { action: None, log } => service(&home, log.as_deref())?,
+        Command::Service { action: None, .. } => service(&home)?,
         Command::Service {
             action: Some(action),
             ..
@@ -457,13 +485,9 @@ fn backend(keys: Option<KeysArg>) -> Backend {
 struct Home(PathBuf);
 
 impl Home {
+    /// The vault directory, moved from where it was before 0.6 first if it can be.
     fn locate() -> Result<Self> {
-        if let Some(dir) = std::env::var_os("OPENVAULT_HOME") {
-            return Ok(Self(dir.into()));
-        }
-        let home =
-            std::env::home_dir().context("can't find your home directory; set OPENVAULT_HOME")?;
-        Ok(Self(home.join(".openvault")))
+        migrate::locate().map(Self)
     }
 
     fn keys(&self) -> PathBuf {
@@ -481,7 +505,7 @@ impl Home {
     fn require_vault(&self) -> Result<()> {
         if !self.vault().exists() {
             bail!(
-                "no vault in {}; run `openvault init` to make one, or `openvault join` to join one \
+                "no vault in {}; run `latem-vault init` to make one, or `latem-vault join` to join one \
                  from another device",
                 self.0.display()
             );
@@ -495,7 +519,7 @@ impl Home {
         #[cfg(unix)]
         {
             let socket = self.0.join(SOCKET);
-            if openvault_service::client::is_running(&socket) {
+            if latem_vault_service::client::is_running(&socket) {
                 return Ok(Access::Service(socket));
             }
         }
@@ -522,7 +546,7 @@ impl Access {
     fn call(&mut self, request: Request) -> Result<Response> {
         Ok(match self {
             #[cfg(unix)]
-            Self::Service(socket) => openvault_service::client::call(socket, &request)
+            Self::Service(socket) => latem_vault_service::client::call(socket, &request)
                 .context("can't reach the service")?
                 .context("the service stopped")?,
             Self::Local { vault, admin_key } => handler::handle(
@@ -618,7 +642,7 @@ impl Access {
 fn load_keys(path: &Path) -> Result<Keys> {
     const ATTEMPTS: usize = 3;
     match Keys::load(path) {
-        Err(openvault_keystore::Error::NeedsPassphrase) => {}
+        Err(latem_vault_keystore::Error::NeedsPassphrase) => {}
         keys => return Ok(keys?),
     }
     if !has_terminal() {
@@ -630,7 +654,7 @@ fn load_keys(path: &Path) -> Result<Keys> {
     for attempt in 1..=ATTEMPTS {
         let passphrase = prompt_passphrase("Passphrase for this device's keys (hidden): ")?;
         match Keys::load_with_passphrase(path, &passphrase) {
-            Err(openvault_keystore::Error::WrongPassphrase) if attempt < ATTEMPTS => {
+            Err(latem_vault_keystore::Error::WrongPassphrase) if attempt < ATTEMPTS => {
                 eprintln!("Wrong passphrase.");
             }
             keys => return Ok(keys?),
@@ -647,7 +671,7 @@ fn read_new_passphrase() -> Result<Zeroizing<String>> {
         );
     }
     let passphrase = prompt_passphrase("New passphrase for this device's keys (hidden): ")?;
-    openvault_keystore::check_passphrase(&passphrase)?;
+    latem_vault_keystore::check_passphrase(&passphrase)?;
     let again = prompt_passphrase("The same passphrase again (hidden): ")?;
     if *again != *passphrase {
         bail!("the passphrases don't match");
@@ -829,7 +853,7 @@ fn devices(home: &Home) -> Result<()> {
     }
     if !access.is_service() {
         println!();
-        println!("Run `openvault service` to see which of them are on this network.");
+        println!("Run `latem-vault service` to see which of them are on this network.");
     }
     Ok(())
 }
@@ -987,22 +1011,24 @@ fn collections(home: &Home) -> Result<()> {
     Ok(())
 }
 
-/// Why `openvault collections` has nothing to list.
+/// Why `latem-vault collections` has nothing to list.
 fn why_no_collections(access: &mut Access) -> Result<String> {
     let scopes = match access.call(Request::Scopes)? {
         Response::Scopes(scopes) => scopes,
         // A service older than 0.5.9 doesn't know the request.
         Response::Error { message, .. } if message.contains("unknown request") => {
             return Ok(
-                "No collections here yet. The running service is an older build of \
-                 openvault; `openvault service install` restarts it on this one."
+                "No collections here yet. The running service is an older build. \
+                 `latem-vault service install` restarts it on this one."
                     .to_owned(),
             );
         }
         other => return Err(unexpected(&other)),
     };
     if scopes.is_empty() {
-        return Ok("No collections yet. `openvault collections create NAME` makes one.".to_owned());
+        return Ok(
+            "No collections yet. `latem-vault collections create NAME` makes one.".to_owned(),
+        );
     }
     let readable = scopes
         .iter()
@@ -1017,7 +1043,7 @@ fn why_no_collections(access: &mut Access) -> Result<String> {
             .map_or("DEVICE", |(_, name)| name.as_str());
         return Ok(format!(
             "This device can't read any collection yet. On a device that administers the vault, \
-             run `openvault scope {name} COLLECTION read`."
+             run `latem-vault scope {name} COLLECTION read`."
         ));
     }
     let may_read = format!(
@@ -1031,7 +1057,7 @@ fn why_no_collections(access: &mut Access) -> Result<String> {
         );
         if cfg!(target_os = "macos") {
             why.push_str(
-                " If macOS asked whether openvault may find devices on your local network, \
+                " If macOS asked whether latem-vault may find devices on your local network, \
                  allow it in System Settings > Privacy & Security > Local Network.",
             );
         }
@@ -1044,11 +1070,11 @@ fn why_no_collections(access: &mut Access) -> Result<String> {
 /// What a device that may read collections needs before anything syncs, which `join` and an
 /// empty `collections` say.
 const START_THE_SERVICE: &str = if cfg!(target_os = "macos") {
-    "Devices sync through the service: run `openvault service install` to start it at login. \
-     macOS then asks whether openvault may find devices on your local network. Allow it, or \
+    "Devices sync through the service: run `latem-vault service install` to start it at login. \
+     macOS then asks whether latem-vault may find devices on your local network. Allow it, or \
      this Mac can't sync."
 } else {
-    "Devices sync through the service: run `openvault service install` to start it at login."
+    "Devices sync through the service: run `latem-vault service install` to start it at login."
 };
 
 /// `1 secret`, `2 secrets`.
@@ -1159,7 +1185,7 @@ fn find_device<'a>(devices: &'a [DeviceSummary], query: &str) -> Result<&'a Devi
     };
     match found.as_slice() {
         [device] => Ok(device),
-        [] => bail!("no device is called {query}; `openvault devices` lists them"),
+        [] => bail!("no device is called {query}; `latem-vault devices` lists them"),
         several => {
             let ids: Vec<String> = several
                 .iter()
@@ -1176,10 +1202,7 @@ fn find_device<'a>(devices: &'a [DeviceSummary], query: &str) -> Result<&'a Devi
 
 /// Runs the service in the foreground until Ctrl-C (service.md).
 #[cfg(unix)]
-fn service(home: &Home, log: Option<&Path>) -> Result<()> {
-    if let Some(file) = log {
-        log_to(file)?;
-    }
+fn service(home: &Home) -> Result<()> {
     home.require_vault()?;
     let keys = load_keys(&home.keys())?;
     log::to_stderr(
@@ -1188,7 +1211,7 @@ fn service(home: &Home, log: Option<&Path>) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(openvault_service::run(&home.0, keys, VERSION))
+        .block_on(latem_vault_service::run(&home.0, keys, VERSION))
 }
 
 /// Points stdout and stderr at the end of `file`, so whatever the service prints goes there,
@@ -1219,15 +1242,15 @@ fn log_to(file: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn service(_: &Home, _: Option<&Path>) -> Result<()> {
-    bail!("`openvault service` doesn't run on Windows yet")
+fn service(_: &Home) -> Result<()> {
+    bail!("`latem-vault service` doesn't run on Windows yet")
 }
 
 /// Starting the service at login (service.md, starting at login).
 #[cfg(unix)]
 fn service_action(home: &Home, action: ServiceAction) -> Result<()> {
     match action {
-        ServiceAction::Install => login::install(home),
+        ServiceAction::Install => login::install(),
         ServiceAction::Uninstall => login::uninstall(),
         ServiceAction::Status => login::status(home),
     }
@@ -1235,7 +1258,7 @@ fn service_action(home: &Home, action: ServiceAction) -> Result<()> {
 
 #[cfg(not(unix))]
 fn service_action(_: &Home, _: ServiceAction) -> Result<()> {
-    bail!("`openvault service` doesn't run on Windows yet")
+    bail!("`latem-vault service` doesn't run on Windows yet")
 }
 
 fn set(home: &Home, entry: &str, kind: Kind) -> Result<()> {
@@ -1261,7 +1284,7 @@ fn open(home: &Home, entry: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("{collection}/{name} doesn't exist"))?;
     if entry.kind != Kind::File {
         bail!(
-            "{collection}/{name} is a {}; open opens files. `openvault get` shows it",
+            "{collection}/{name} is a {}; open opens files. `latem-vault get` shows it",
             kind_label(entry.kind)
         );
     }
@@ -1283,7 +1306,7 @@ fn get(home: &Home, entry: &str, output: Option<&Path>) -> Result<()> {
         return files::get(&mut access, collection, name, &manifest, output);
     }
     if let Some(path) = output {
-        return openvault_service::files::write_out(path, false, now_secs(), |file| {
+        return latem_vault_service::files::write_out(path, false, now_secs(), |file| {
             Ok(file.write_all(&entry.value)?)
         });
     }
@@ -1538,7 +1561,7 @@ fn exec(mut child: process::Command, program: &OsStr) -> Result<ExitCode> {
     use std::os::unix::process::CommandExt;
 
     let error = child.exec();
-    eprintln!("openvault: can't run {}: {error}", program.display());
+    eprintln!("latem-vault: can't run {}: {error}", program.display());
     // The shell's codes for a command that wasn't found or couldn't be run.
     Ok(ExitCode::from(match error.kind() {
         io::ErrorKind::NotFound => 127,
@@ -1588,7 +1611,7 @@ fn split_entry(entry: &str) -> Result<(&str, &str)> {
 }
 
 /// Reads a value from stdin, either typed at a prompt (hidden for secrets) or piped. One
-/// trailing newline is dropped, so `echo value | openvault set …` stores `value`.
+/// trailing newline is dropped, so `echo value | latem-vault set …` stores `value`.
 fn read_value(kind: Kind) -> Result<Zeroizing<Vec<u8>>> {
     let stdin = io::stdin();
     let mut value = if stdin.is_terminal() {
@@ -1622,8 +1645,8 @@ fn read_value(kind: Kind) -> Result<Zeroizing<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use openvault_core::DeviceId;
-    use openvault_service::api::DeviceSummary;
+    use latem_vault_core::DeviceId;
+    use latem_vault_service::api::DeviceSummary;
 
     use super::find_device;
 

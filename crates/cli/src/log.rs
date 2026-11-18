@@ -1,4 +1,4 @@
-//! The log of the commands that run for long, `openvault service` and `openvault grandfather`.
+//! The log of the commands that run for long, `latem-vault service` and `latem-vault grandfather`.
 
 use std::fmt;
 use std::io;
@@ -12,7 +12,7 @@ use tracing_subscriber::layer::{Context, Filter};
 const RELAY_HTTP: &str = "iroh_relay::server::http_server";
 const CONNECTION_FAILED: &str = "failed to handle connection";
 
-/// Sends the log to stderr, filtered by `OPENVAULT_LOG` or else by `default` and without the
+/// Sends the log to stderr, filtered by `LATEM_VAULT_LOG` or else by `default` and without the
 /// relay's connection errors.
 pub(crate) fn to_stderr(default: &str) {
     use tracing_subscriber::filter::FilterExt as _;
@@ -20,7 +20,12 @@ pub(crate) fn to_stderr(default: &str) {
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::{EnvFilter, Layer, fmt};
 
-    let (filter, quiet) = match EnvFilter::try_from_env("OPENVAULT_LOG") {
+    // OPENVAULT_LOG is the name before 0.6, still read for one release.
+    let variable = match std::env::var_os("LATEM_VAULT_LOG") {
+        None if std::env::var_os("OPENVAULT_LOG").is_some() => "OPENVAULT_LOG",
+        _ => "LATEM_VAULT_LOG",
+    };
+    let (filter, quiet) = match EnvFilter::try_from_env(variable) {
         Ok(filter) => (filter, false),
         Err(_) => (EnvFilter::new(default), true),
     };
@@ -31,15 +36,15 @@ pub(crate) fn to_stderr(default: &str) {
                 .with_target(false)
                 .with_filter(filter.and(QuietConnectionErrors { quiet })),
         )
-        // Starts mDNS again when it stops, whatever OPENVAULT_LOG leaves out (service.md).
-        .with(openvault_net::discovery_watch())
+        // Starts mDNS again when it stops, whatever LATEM_VAULT_LOG leaves out (service.md).
+        .with(latem_vault_net::discovery_watch())
         .init();
 }
 
 /// Leaves out iroh-relay's error for each HTTPS connection that failed, when `quiet`. On a
 /// grandfather's public port they come from scanners and from handshakes that end early, Let's
 /// Encrypt's among them: dozens an hour, and none from the relay itself (coordinator.md, relay).
-/// `OPENVAULT_LOG` shows them again.
+/// `LATEM_VAULT_LOG` shows them again.
 struct QuietConnectionErrors {
     quiet: bool,
 }
@@ -105,13 +110,13 @@ mod tests {
         let filter = EnvFilter::new("info,iroh_relay=warn").and(QuietConnectionErrors { quiet });
         let subscriber = tracing_subscriber::registry()
             .with(Count(count.clone()).with_filter(filter))
-            .with(openvault_net::discovery_watch());
+            .with(latem_vault_net::discovery_watch());
         tracing::subscriber::with_default(subscriber, || {
             for _ in 0..2 {
                 tracing::error!(target: RELAY_HTTP, error = "tls handshake eof", "{CONNECTION_FAILED}");
-                tracing::info!(target: "openvault", "the log is at entry 24");
+                tracing::info!(target: "latem_vault", "the log is at entry 24");
                 tracing::error!(target: RELAY_HTTP, "failed to accept connection: too many open files");
-                tracing::error!(target: "openvault", "{CONNECTION_FAILED}");
+                tracing::error!(target: "latem_vault", "{CONNECTION_FAILED}");
             }
         });
         count.load(Ordering::Relaxed)

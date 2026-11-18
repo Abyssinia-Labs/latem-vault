@@ -1,4 +1,4 @@
-//! Sync sessions (sync.md): on one stream of a connection with ALPN `openvault/sync/1`, two
+//! Sync sessions (sync.md): on one stream of a connection with ALPN `frozen::ALPN_SYNC`, two
 //! members exchange hellos, bring their logs level, then reconcile every set they share.
 //!
 //! A session runs until 60 seconds pass without a message. While it runs, the device tells it of
@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
-use openvault_core::membership::LogEntry;
-use openvault_core::sets::{Fingerprint, ItemId, SetId, Summary};
-use openvault_core::{DeviceId, DeviceKeys, Received, Vault, VaultId};
-use openvault_crypto::hash::Hash;
+use latem_vault_core::membership::LogEntry;
+use latem_vault_core::sets::{Fingerprint, ItemId, SetId, Summary};
+use latem_vault_core::{DeviceId, DeviceKeys, Received, Vault, VaultId};
+use latem_vault_crypto::hash::Hash;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, warn};
@@ -26,8 +26,8 @@ use crate::wire::{
     self, HELLO, ITEMS, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST, RECONCILE, ROOTS, Reader, WANT,
 };
 
-/// Frozen in [`openvault_crypto::frozen`]: it keeps the name `openvault` through any rename.
-pub const ALPN: &[u8] = openvault_crypto::frozen::ALPN_SYNC;
+/// Frozen in [`latem_vault_crypto::frozen`]: it never changes, whatever the product is called.
+pub const ALPN: &[u8] = latem_vault_crypto::frozen::ALPN_SYNC;
 
 /// How long a session waits for a message before it closes (sync.md, lifetime).
 pub const IDLE: Duration = Duration::from_secs(60);
@@ -52,21 +52,21 @@ const DUPLICATE: u32 = 1;
 /// session makes them from blocking sections.
 pub trait SyncStore: Send + Sync + 'static {
     /// The vault id and this device's log head.
-    fn hello(&self) -> openvault_core::Result<(VaultId, u64, Hash)>;
-    fn log_from(&self, from: u64, max: u16) -> openvault_core::Result<Vec<LogEntry>>;
-    fn append_log(&self, entries: &[LogEntry]) -> openvault_core::Result<usize>;
+    fn hello(&self) -> latem_vault_core::Result<(VaultId, u64, Hash)>;
+    fn log_from(&self, from: u64, max: u16) -> latem_vault_core::Result<Vec<LogEntry>>;
+    fn append_log(&self, entries: &[LogEntry]) -> latem_vault_core::Result<usize>;
     /// The member, not revoked, whose transport key is `endpoint`.
     fn member(&self, endpoint: &EndpointKey) -> Option<DeviceId>;
     fn shared_sets(&self, peer: DeviceId) -> Vec<SetId>;
-    fn summary(&self, set: SetId) -> openvault_core::Result<Summary>;
+    fn summary(&self, set: SetId) -> latem_vault_core::Result<Summary>;
     fn ids(
         &self,
         set: SetId,
         lower: &ItemId,
         upper: Option<&ItemId>,
-    ) -> openvault_core::Result<Vec<ItemId>>;
-    fn items(&self, set: SetId, ids: &[ItemId]) -> openvault_core::Result<Vec<Vec<u8>>>;
-    fn receive(&self, set: SetId, item: &[u8]) -> openvault_core::Result<Received>;
+    ) -> latem_vault_core::Result<Vec<ItemId>>;
+    fn items(&self, set: SetId, ids: &[ItemId]) -> latem_vault_core::Result<Vec<Vec<u8>>>;
+    fn receive(&self, set: SetId, item: &[u8]) -> latem_vault_core::Result<Received>;
 }
 
 /// What the device tells a running session.
@@ -125,7 +125,7 @@ pub enum SyncError {
     #[error("the peer already has a session with this device")]
     Duplicate,
     #[error(transparent)]
-    Store(#[from] openvault_core::Error),
+    Store(#[from] latem_vault_core::Error),
 }
 
 impl SyncError {
@@ -134,7 +134,7 @@ impl SyncError {
         match self {
             Self::Refused(reason) => Some(*reason),
             Self::Frame(FrameError::Bad(_)) => Some(Reason::BadMessage),
-            Self::Store(openvault_core::Error::Fork) => Some(Reason::Fork),
+            Self::Store(latem_vault_core::Error::Fork) => Some(Reason::Fork),
             _ => None,
         }
     }
@@ -449,7 +449,7 @@ impl<S: SyncStore> Session<S> {
             return Ok(());
         }
         if peer_head.1 != hash {
-            return Err(SyncError::Store(openvault_core::Error::Fork));
+            return Err(SyncError::Store(latem_vault_core::Error::Fork));
         }
         if self.peer.is_none() {
             let endpoint = self.peer_endpoint;
@@ -651,21 +651,21 @@ impl<S: SyncStore> Session<S> {
 /// A vault behind a mutex is a sync store. `hello` also picks up writes by other processes
 /// (service.md, the store).
 impl<K: DeviceKeys + Send + 'static> SyncStore for Mutex<Vault<K>> {
-    fn hello(&self) -> openvault_core::Result<(VaultId, u64, Hash)> {
+    fn hello(&self) -> latem_vault_core::Result<(VaultId, u64, Hash)> {
         let mut vault = self.lock().expect("poisoned");
         vault.refresh()?;
         let (seq, hash) = vault
             .membership()
-            .ok_or(openvault_core::Error::NoLog)?
+            .ok_or(latem_vault_core::Error::NoLog)?
             .head();
         Ok((vault.vault_id(), seq, hash))
     }
 
-    fn log_from(&self, from: u64, max: u16) -> openvault_core::Result<Vec<LogEntry>> {
+    fn log_from(&self, from: u64, max: u16) -> latem_vault_core::Result<Vec<LogEntry>> {
         self.lock().expect("poisoned").log_from(from, max)
     }
 
-    fn append_log(&self, entries: &[LogEntry]) -> openvault_core::Result<usize> {
+    fn append_log(&self, entries: &[LogEntry]) -> latem_vault_core::Result<usize> {
         self.lock().expect("poisoned").append_log(entries)
     }
 
@@ -677,7 +677,7 @@ impl<K: DeviceKeys + Send + 'static> SyncStore for Mutex<Vault<K>> {
         self.lock().expect("poisoned").shared_sets(peer)
     }
 
-    fn summary(&self, set: SetId) -> openvault_core::Result<Summary> {
+    fn summary(&self, set: SetId) -> latem_vault_core::Result<Summary> {
         self.lock().expect("poisoned").set_summary(set)
     }
 
@@ -686,15 +686,15 @@ impl<K: DeviceKeys + Send + 'static> SyncStore for Mutex<Vault<K>> {
         set: SetId,
         lower: &ItemId,
         upper: Option<&ItemId>,
-    ) -> openvault_core::Result<Vec<ItemId>> {
+    ) -> latem_vault_core::Result<Vec<ItemId>> {
         self.lock().expect("poisoned").set_ids(set, lower, upper)
     }
 
-    fn items(&self, set: SetId, ids: &[ItemId]) -> openvault_core::Result<Vec<Vec<u8>>> {
+    fn items(&self, set: SetId, ids: &[ItemId]) -> latem_vault_core::Result<Vec<Vec<u8>>> {
         self.lock().expect("poisoned").set_items(set, ids)
     }
 
-    fn receive(&self, set: SetId, item: &[u8]) -> openvault_core::Result<Received> {
+    fn receive(&self, set: SetId, item: &[u8]) -> latem_vault_core::Result<Received> {
         self.lock().expect("poisoned").receive(set, item)
     }
 }
@@ -865,11 +865,11 @@ mod tests {
                 crate::chunks::ALPN
             ),
             (
-                "5",
-                &b"openvault/sync/1"[..],
-                &b"openvault/join/1"[..],
-                &b"openvault/coord/1"[..],
-                &b"openvault/chunks/1"[..]
+                "6",
+                latem_vault_crypto::frozen::ALPN_SYNC,
+                latem_vault_crypto::frozen::ALPN_JOIN,
+                latem_vault_crypto::frozen::ALPN_COORD,
+                latem_vault_crypto::frozen::ALPN_CHUNKS
             )
         );
     }
@@ -940,10 +940,10 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod session_tests {
-    use openvault_core::join::JoinRequest;
-    use openvault_core::membership::{DeviceName, Scope};
-    use openvault_core::{CollectionId, Kind, SoftwareKeys, transport_seed};
-    use openvault_crypto::RecoveryKey;
+    use latem_vault_core::join::JoinRequest;
+    use latem_vault_core::membership::{DeviceName, Scope};
+    use latem_vault_core::{CollectionId, Kind, SoftwareKeys, transport_seed};
+    use latem_vault_crypto::RecoveryKey;
 
     use super::*;
     use crate::{Node, Options};
@@ -1563,15 +1563,15 @@ pub(crate) mod session_tests {
     );
 
     impl SyncStore for Holding {
-        fn hello(&self) -> openvault_core::Result<(VaultId, u64, Hash)> {
+        fn hello(&self) -> latem_vault_core::Result<(VaultId, u64, Hash)> {
             self.store.hello()
         }
 
-        fn log_from(&self, from: u64, max: u16) -> openvault_core::Result<Vec<LogEntry>> {
+        fn log_from(&self, from: u64, max: u16) -> latem_vault_core::Result<Vec<LogEntry>> {
             self.store.log_from(from, max)
         }
 
-        fn append_log(&self, entries: &[LogEntry]) -> openvault_core::Result<usize> {
+        fn append_log(&self, entries: &[LogEntry]) -> latem_vault_core::Result<usize> {
             self.store.append_log(entries)
         }
 
@@ -1583,7 +1583,7 @@ pub(crate) mod session_tests {
             self.store.shared_sets(peer)
         }
 
-        fn summary(&self, set: SetId) -> openvault_core::Result<Summary> {
+        fn summary(&self, set: SetId) -> latem_vault_core::Result<Summary> {
             self.store.summary(set)
         }
 
@@ -1592,7 +1592,7 @@ pub(crate) mod session_tests {
             set: SetId,
             lower: &ItemId,
             upper: Option<&ItemId>,
-        ) -> openvault_core::Result<Vec<ItemId>> {
+        ) -> latem_vault_core::Result<Vec<ItemId>> {
             let hold = self.hold.lock().unwrap().take();
             if let Some((waiting, release)) = hold {
                 let _ = waiting.send(());
@@ -1601,11 +1601,11 @@ pub(crate) mod session_tests {
             self.store.ids(set, lower, upper)
         }
 
-        fn items(&self, set: SetId, ids: &[ItemId]) -> openvault_core::Result<Vec<Vec<u8>>> {
+        fn items(&self, set: SetId, ids: &[ItemId]) -> latem_vault_core::Result<Vec<Vec<u8>>> {
             self.store.items(set, ids)
         }
 
-        fn receive(&self, set: SetId, item: &[u8]) -> openvault_core::Result<Received> {
+        fn receive(&self, set: SetId, item: &[u8]) -> latem_vault_core::Result<Received> {
             self.store.receive(set, item)
         }
     }

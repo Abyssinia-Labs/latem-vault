@@ -11,7 +11,7 @@ macro_rules! id_type {
 
         impl $name {
             pub fn random() -> Self {
-                Self(*openvault_crypto::random_bytes())
+                Self(*latem_vault_crypto::random_bytes())
             }
 
             pub const fn from_bytes(bytes: [u8; 16]) -> Self {

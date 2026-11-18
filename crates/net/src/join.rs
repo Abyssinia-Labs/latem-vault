@@ -1,5 +1,5 @@
 //! Joining a vault (join.md): the PAKE, the request, and handing over the log and grants, on one
-//! stream of a connection with ALPN `openvault/join/1`.
+//! stream of a connection with ALPN `frozen::ALPN_JOIN`.
 //!
 //! The admin connects to the joiner and opens the stream. Either side's code can be wrong, so
 //! each side checks the other's confirmation before going on, and the admin sends its own only
@@ -9,23 +9,23 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId};
-use openvault_core::VaultId;
-use openvault_core::grant::Grant;
-use openvault_core::join::JoinRequest;
-use openvault_core::membership::{DeviceName, LogEntry};
-use openvault_crypto::VerifyingKey;
-use openvault_crypto::hash::Hash;
-use openvault_crypto::pake::{self, JoinKeys, Pake, Side};
+use latem_vault_core::VaultId;
+use latem_vault_core::grant::Grant;
+use latem_vault_core::join::JoinRequest;
+use latem_vault_core::membership::{DeviceName, LogEntry};
+use latem_vault_crypto::VerifyingKey;
+use latem_vault_crypto::hash::Hash;
+use latem_vault_crypto::pake::{self, JoinKeys, Pake, Side};
 use tokio::time::{Instant, timeout, timeout_at};
 
-use openvault_core::sets::SetId;
+use latem_vault_core::sets::SetId;
 
 use crate::EndpointKey;
 use crate::frame::{self, FrameError, Reason};
 use crate::wire::{self, ITEMS, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST};
 
-/// Frozen in [`openvault_crypto::frozen`]: it keeps the name `openvault` through any rename.
-pub const ALPN: &[u8] = openvault_crypto::frozen::ALPN_JOIN;
+/// Frozen in [`latem_vault_crypto::frozen`]: it never changes, whatever the product is called.
+pub const ALPN: &[u8] = latem_vault_crypto::frozen::ALPN_JOIN;
 
 const PAKE: u8 = 0x20;
 const CONFIRM: u8 = 0x21;
@@ -51,7 +51,7 @@ pub enum JoinError {
     #[error("can't connect: {0}")]
     Connect(String),
     #[error(transparent)]
-    Core(#[from] openvault_core::Error),
+    Core(#[from] latem_vault_core::Error),
 }
 
 /// What a joining device announces on mDNS (join.md, finding the device). Nothing in it is
@@ -97,7 +97,7 @@ impl AdminSession {
         let admin_transport = transport_key(endpoint.id().as_bytes());
         let joiner_transport = transport_key(&joiner);
         let (pake, message) = Pake::start(Side::Admin, code, &admin_transport, &joiner_transport)
-            .map_err(openvault_core::Error::from)?;
+            .map_err(latem_vault_core::Error::from)?;
         let (mut send, mut recv) = timeout(STEP, connection.open_bi())
             .await
             .map_err(|_| JoinError::Timeout)?
@@ -217,7 +217,7 @@ impl JoinerSession {
             .map_err(|_| JoinError::Timeout)?
             .map_err(|e| JoinError::Connect(e.to_string()))?;
         let (pake, message) = Pake::start(Side::Joiner, code, &admin_transport, &joiner_transport)
-            .map_err(openvault_core::Error::from)?;
+            .map_err(latem_vault_core::Error::from)?;
         frame::write(&mut send, PAKE, &message).await?;
         let keys = finish_pake(pake, &mut recv).await?;
         frame::write(&mut send, CONFIRM, &keys.joiner_confirm[..]).await?;
@@ -308,7 +308,7 @@ impl JoinerSession {
         let grants = items
             .into_iter()
             .map(Grant::from_bytes)
-            .collect::<openvault_core::Result<_>>()?;
+            .collect::<latem_vault_core::Result<_>>()?;
         Ok((log, grants))
     }
 
@@ -331,7 +331,9 @@ impl JoinerSession {
 async fn finish_pake(pake: Pake, recv: &mut RecvStream) -> Result<JoinKeys, JoinError> {
     let (kind, message) = step(recv).await?;
     expect(kind, PAKE)?;
-    Ok(pake.finish(&message).map_err(openvault_core::Error::from)?)
+    Ok(pake
+        .finish(&message)
+        .map_err(latem_vault_core::Error::from)?)
 }
 
 /// Reads the next message, within [`STEP`].
@@ -352,9 +354,9 @@ fn expect(kind: u8, expected: u8) -> Result<(), JoinError> {
 
 #[cfg(test)]
 mod tests {
-    use openvault_core::membership::Scope;
-    use openvault_core::{DeviceId, Kind, SoftwareKeys, Vault, transport_seed};
-    use openvault_crypto::RecoveryKey;
+    use latem_vault_core::membership::Scope;
+    use latem_vault_core::{DeviceId, Kind, SoftwareKeys, Vault, transport_seed};
+    use latem_vault_crypto::RecoveryKey;
 
     use super::*;
     use crate::{Node, Options};

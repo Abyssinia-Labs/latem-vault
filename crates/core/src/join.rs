@@ -1,7 +1,7 @@
 //! The joiner's request (join.md, messages): its device id, public keys, platform and name,
 //! signed by its signing key over the session id, which shows it holds that key in this session.
 
-use openvault_crypto::{Signature, SignatureContext, SigningKey, VerifyingKey, WrapKey};
+use latem_vault_crypto::{Signature, SignatureContext, SigningKey, VerifyingKey, WrapKey};
 
 use crate::membership::DeviceName;
 use crate::{DeviceId, DeviceKeys, Error, Result, transport_seed};

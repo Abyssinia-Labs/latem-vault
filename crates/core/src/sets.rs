@@ -2,7 +2,7 @@
 //! ids. Each is summarized by its item count and the sum of its ids, which a store keeps up to
 //! date as items arrive, so a set's root costs one row to read.
 
-use openvault_crypto::hash::{contexts, derive_key};
+use latem_vault_crypto::hash::{contexts, derive_key};
 
 use crate::CollectionId;
 
@@ -78,7 +78,7 @@ impl Summary {
         self.count += 1;
     }
 
-    /// `first 16 bytes of BLAKE3.derive_key("openvault v1 sync fingerprint", sum ‖ count)`.
+    /// `first 16 bytes of BLAKE3.derive_key(contexts::SYNC_FINGERPRINT, sum ‖ count)`.
     pub fn fingerprint(&self) -> Fingerprint {
         let key = derive_key(
             contexts::SYNC_FINGERPRINT,

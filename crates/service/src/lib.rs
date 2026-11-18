@@ -1,4 +1,4 @@
-//! The OpenVault service (`docs/spec/service.md`): the one process on a device that holds the
+//! The latem vault service (`docs/spec/service.md`): the one process on a device that holds the
 //! vault open. It runs the device's iroh endpoint and answers the CLI on a local socket.
 //!
 //! [`handler`] is what each request does. The service runs it for requests on its socket, and
@@ -15,6 +15,7 @@ mod engine;
 mod fetch;
 pub mod files;
 pub mod handler;
+pub mod home;
 #[cfg(unix)]
 mod server;
 pub mod setup;
@@ -27,10 +28,10 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::Context as _;
-use openvault_core::membership;
-use openvault_net::coord::Address;
+use latem_vault_core::membership;
+use latem_vault_net::coord::Address;
 
-/// The files in the openvault directory.
+/// The files in the vault directory.
 pub const VAULT: &str = "vault.db";
 pub const KEYS: &str = "keys";
 pub const ADMIN_KEY: &str = "admin";
@@ -39,7 +40,7 @@ pub const LOCK: &str = "service.lock";
 /// The grandfather's address, if this device uses a coordinator (coordinator.md, devices).
 pub const COORDINATOR: &str = "coordinator";
 
-/// The grandfather configured in the openvault directory `dir`, if any.
+/// The grandfather configured in the vault directory `dir`, if any.
 pub fn configured_coordinator(dir: &Path) -> anyhow::Result<Option<Address>> {
     let path = dir.join(COORDINATOR);
     match fs::read_to_string(&path) {

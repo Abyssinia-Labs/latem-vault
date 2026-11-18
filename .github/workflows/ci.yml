@@ -1,0 +1,62 @@
+# The checks scripts/ci.sh runs, on GitHub's runners.
+#
+# Pull requests get the fast ones only: rustfmt, clippy and the tests on Linux. The macOS side
+# (clippy and the tests on a Mac, and the Swift bindings run against a service) is slow, and
+# runs on each push to main, where the merge builds it anyway. So check a change on a Mac with
+# `scripts/ci.sh macos` before merging it, and say in the pull request that you did.
+#
+# release.yml calls this file too, so a tag is checked on both platforms before it is built.
+#
+# Actions are pinned by commit, with the release they are in a comment beside them.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to a pull request replaces its last run; main and tags run every time.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The Rust the Mac runs, so a lint that a newer clippy adds fails nowhere until both move
+  # together. Change it with the Mac's.
+  RUST_TOOLCHAIN: "1.99.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy and tests
+        run: scripts/ci.sh linux-here
+
+  macos:
+    # Never on a pull request: see the top of this file.
+    if: github.event_name != 'pull_request'
+    # macOS 26, the oldest the Mac app runs on: the Swift bindings are built for it.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: rustfmt, clippy, tests, Swift bindings
+        run: scripts/ci.sh macos

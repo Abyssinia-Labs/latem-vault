@@ -11,8 +11,12 @@ Milestones M1, one device, and M2, devices on the same network, are done: device
 ## Try it
 
 ```sh
-cargo install --locked --path crates/cli         # the dependency versions in Cargo.lock
+brew install abyssinia-labs/tap/latem-vault      # macOS and Linux, arm64 and x86-64
+```
 
+Each [release](https://github.com/Abyssinia-Labs/latem-vault/releases) also has the binaries as archives, with a checksums file signed by [latem-vault.pub](latem-vault.pub) ([docs/release.md](docs/release.md)). To build from this checkout instead, `cargo install --locked --path crates/cli`.
+
+```sh
 latem-vault init                                   # shows the recovery phrase once; asks for a passphrase without a Secure Enclave
 latem-vault collections create latem               # Touch ID; the recovery phrase without a Secure Enclave
 latem-vault set latem/prod/SENTRY_DSN --secret     # value from stdin; hidden when typed
@@ -98,13 +102,15 @@ Any other command moves it too, while no service runs for it. The move is one re
 
 ## Development
 
-There's no hosted CI while the repository is private. Before anything lands on `main`, run:
+Before anything lands on `main`, run:
 
 ```sh
 scripts/ci.sh
 ```
 
 It runs rustfmt, then clippy and the tests on this Mac and in a Linux container, which needs Docker. `scripts/ci.sh macos` or `scripts/ci.sh linux` runs one side only.
+
+GitHub Actions runs the same checks ([ci.yml](.github/workflows/ci.yml)). A pull request gets the Linux side only, which is quick. The macOS side is slow, and runs on each push to `main`, so run `scripts/ci.sh macos` before merging and say so in the pull request.
 
 ### Versions
 
@@ -114,7 +120,7 @@ Until 1.0, versions are `0.MINOR.PATCH`:
 - **MINOR** goes up when the store version or a protocol changes, in the same commit, or when the command or its directory is renamed. An older build refuses a newer store, and can't speak a newer protocol, so devices on the same minor version can share a vault. Two tests fail until both are changed together. 0.2 is M2: store version 6, `openvault/sync/1` and `openvault/join/1`. 0.3 adds M3's `openvault/coord/1`. 0.4 is store version 7, with files, and 0.5 adds `openvault/chunks/1`. 0.6 changes no store or protocol: it renames OpenVault to latem vault, with the `latem-vault` command and `~/.latem-vault`.
 - **PATCH** goes up for any other release.
 
-Each release is tagged on `main`, as `v0.2.0`.
+Each release is a tag on `main`, as `v0.6.0`, and pushing the tag is what publishes it: [release.yml](.github/workflows/release.yml) refuses a tag that isn't on `main` or that differs from the version in `Cargo.toml`, then builds, signs and publishes the release, and the Homebrew tap picks it up within the hour. [docs/release.md](docs/release.md) has the steps. Releases before 0.6.0 weren't tagged, apart from `v0.2.0` and `v0.2.1`.
 
 ## License
 

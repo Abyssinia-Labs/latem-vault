@@ -30,6 +30,9 @@ needs_multicast="
     endpoints_find_each_other
     endpoints_under_other_service_names_stay_apart
     discovery_starts_again_after_it_stops
+    join::tests::a_device_joins
+    join::tests::a_wrong_code_fails_on_both_sides
+    entries_one_session_takes_reach_the_devices_other_sessions
 "
 
 macos() {

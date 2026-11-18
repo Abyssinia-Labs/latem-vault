@@ -210,7 +210,7 @@ pub fn import(
         println!("Skipped {}: {why}", path.display());
     }
     if written > 0 {
-        println!(
+        crate::name::say!(
             "The originals are still in {}. Delete them once `latem-vault list {collection}` \
              shows what you expect.",
             path.display()
@@ -485,7 +485,7 @@ pub fn open(access: &mut Access, collection: &str, name: &str, manifest: &Manife
                         saved = seen;
                         failed = save(&path).err();
                         if let Some(e) = &failed {
-                            eprintln!("latem-vault: can't save {entry}: {e:#}");
+                            eprintln!("{}: can't save {entry}: {e:#}", crate::name::typed());
                         }
                     }
                 }
@@ -624,7 +624,11 @@ impl PrivateDir {
 impl Drop for PrivateDir {
     fn drop(&mut self) {
         if let Err(e) = fs::remove_dir_all(&self.0) {
-            eprintln!("latem-vault: can't delete {}: {e}", self.0.display());
+            eprintln!(
+                "{}: can't delete {}: {e}",
+                crate::name::typed(),
+                self.0.display()
+            );
         }
     }
 }
@@ -680,7 +684,11 @@ fn wait(child: process::Command) -> Result<ExitCode> {
     let status = match status {
         Ok(status) => status,
         Err(error) => {
-            eprintln!("latem-vault: can't run {}: {error}", program.display());
+            eprintln!(
+                "{}: can't run {}: {error}",
+                crate::name::typed(),
+                program.display()
+            );
             return Ok(ExitCode::from(match error.kind() {
                 io::ErrorKind::NotFound => 127,
                 _ => 126,

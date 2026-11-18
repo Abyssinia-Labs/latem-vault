@@ -5,7 +5,7 @@ The pipeline is [`.github/workflows/release.yml`](../.github/workflows/release.y
 ## What a release is
 
 ```
-latem-vault_<version>_<os>_<arch>.tar.gz      the binary at the archive root, the licences and the README
+latem-vault_<version>_<os>_<arch>.tar.gz      the binary at the archive root, vault and lv as relative links to it, the licences and the README
 latem-vault_<version>_checksums.txt           the sha256 of each archive
 latem-vault_<version>_checksums.txt.minisig   a minisign signature over the checksums
 ```

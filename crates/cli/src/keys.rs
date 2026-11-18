@@ -15,7 +15,7 @@ pub fn show(home: &Home) -> Result<()> {
     let path = home.keys();
     let backend = latem_vault_keystore::backend_of(&path)?;
     println!("{}", path.display());
-    println!(
+    crate::name::say!(
         "{}",
         match backend {
             Backend::SecureEnclave =>
@@ -57,7 +57,7 @@ pub fn set_passphrase(home: &Home) -> Result<()> {
         );
         #[cfg(unix)]
         if login::installed() {
-            println!(
+            crate::name::say!(
                 "The service is installed to start at login, and can't type a passphrase, so it \
                  won't start again by itself. `latem-vault service uninstall` takes it away."
             );
@@ -75,7 +75,7 @@ pub fn remove_passphrase(home: &Home) -> Result<()> {
         Backend::Passphrase => {}
     }
     require_terminal()?;
-    eprintln!(
+    crate::name::esay!(
         "Without a passphrase, the key file is protected only by its permissions: whoever can \
          read it as you, or copies it, has this device's keys. In exchange, they open with nobody \
          there, so `latem-vault service install` can start the service at login."
@@ -85,7 +85,7 @@ pub fn remove_passphrase(home: &Home) -> Result<()> {
     }
     let current = current_passphrase(home)?;
     Keys::change_passphrase(&path, Some(&current), None)?;
-    println!(
+    crate::name::say!(
         "The passphrase is removed. The device's keys are the same, and `latem-vault service \
          install` can now start the service at login."
     );

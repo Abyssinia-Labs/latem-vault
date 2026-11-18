@@ -15,6 +15,7 @@ mod log;
 #[cfg(unix)]
 mod login;
 mod migrate;
+mod name;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use latem_vault_core::file::Manifest;
 use latem_vault_core::membership::Scope;
 use latem_vault_core::names::is_env_name;
@@ -320,11 +321,12 @@ enum KeysArg {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let matches = name::command(Cli::command()).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     match dispatch(cli.command) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("latem-vault: {error:#}");
+            eprintln!("{}: {}", name::typed(), name::hint(&format!("{error:#}")));
             ExitCode::FAILURE
         }
     }
@@ -853,7 +855,7 @@ fn devices(home: &Home) -> Result<()> {
     }
     if !access.is_service() {
         println!();
-        println!("Run `latem-vault service` to see which of them are on this network.");
+        name::say!("Run `latem-vault service` to see which of them are on this network.");
     }
     Ok(())
 }
@@ -1006,7 +1008,7 @@ fn collections(home: &Home) -> Result<()> {
         println!("{name}");
     }
     if names.is_empty() {
-        eprintln!("{}", why_no_collections(&mut access)?);
+        name::esay!("{}", why_no_collections(&mut access)?);
     }
     Ok(())
 }
@@ -1561,7 +1563,11 @@ fn exec(mut child: process::Command, program: &OsStr) -> Result<ExitCode> {
     use std::os::unix::process::CommandExt;
 
     let error = child.exec();
-    eprintln!("latem-vault: can't run {}: {error}", program.display());
+    eprintln!(
+        "{}: can't run {}: {error}",
+        name::typed(),
+        program.display()
+    );
     // The shell's codes for a command that wasn't found or couldn't be run.
     Ok(ExitCode::from(match error.kind() {
         io::ErrorKind::NotFound => 127,

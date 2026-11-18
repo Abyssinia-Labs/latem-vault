@@ -44,7 +44,7 @@ pub(crate) fn locate() -> Result<PathBuf> {
                     Ok(new)
                 }
                 Err(why) => {
-                    eprintln!(
+                    crate::name::esay!(
                         "The vault stays in {} for now, not {}: {why}.",
                         shown(&old),
                         shown(&new)
@@ -74,7 +74,7 @@ fn blocker() -> Option<String> {
 /// runs, so none starts in between.
 fn move_dir(old: &Path, new: &Path) -> Result<(), String> {
     let running = || {
-        "a service is running for it. Stop it, then run any latem-vault command to move it"
+        "a service is running for it. Stop it, then run any `latem-vault` command to move it"
             .to_owned()
     };
     let lock = File::options()
@@ -134,7 +134,7 @@ fn old_latem() -> Option<String> {
                 return Some(format!(
                     "{} is latem {version}, which looks for the vault only in the old directory. \
                      Update it to {LATEM} or later with `latem update`, then run any \
-                     latem-vault command",
+                     `latem-vault` command",
                     shown(&latem)
                 ));
             }
@@ -142,7 +142,7 @@ fn old_latem() -> Option<String> {
                 return Some(format!(
                     "`{} --version` didn't say which latem it is, and a latem older than \
                      {LATEM} looks for the vault only in the old directory. Update it with \
-                     `latem update`, then run any latem-vault command",
+                     `latem update`, then run any `latem-vault` command",
                     shown(&latem)
                 ));
             }

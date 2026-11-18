@@ -4,7 +4,8 @@
 # What a release is. The names are a contract with the Homebrew tap's bin/bump-latem-vault,
 # which looks for exactly these:
 #
-#   latem-vault_<version>_<os>_<arch>.tar.gz    the binary at the archive root, the licences, README
+#   latem-vault_<version>_<os>_<arch>.tar.gz    the binary at the archive root, `vault` and `lv`
+#                                               as relative links to it, the licences, README
 #   latem-vault_<version>_checksums.txt         sha256 of every archive above
 #   latem-vault_<version>_checksums.txt.minisig its minisign signature, by latem-vault.pub's key
 #
@@ -141,9 +142,25 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp "target/$TARGET/release/latem-vault" dist/
-          tar -czf "dist/$ARCHIVE" -C dist latem-vault -C "$GITHUB_WORKSPACE" \
+          # The short names, as latem has ltm: relative links, so they run the latem-vault
+          # beside them wherever the archive is unpacked.
+          ln -s latem-vault dist/vault
+          ln -s latem-vault dist/lv
+          tar -czf "dist/$ARCHIVE" -C dist latem-vault vault lv -C "$GITHUB_WORKSPACE" \
             LICENSE-APACHE LICENSE-MIT README.md
-          rm dist/latem-vault
+          rm dist/latem-vault dist/vault dist/lv
+          # Unpacked, each name runs the binary, and its hints name it.
+          unpacked=$(mktemp -d)
+          tar -xzf "dist/$ARCHIVE" -C "$unpacked"
+          for name in vault lv; do
+            test "$(readlink "$unpacked/$name")" = latem-vault
+            "$unpacked/$name" --version
+            case "$("$unpacked/$name" --help)" in
+              *"Usage: $name "*) ;;
+              *) echo "::error::$name --help doesn't name $name in its usage" >&2; exit 1 ;;
+            esac
+          done
+          rm -rf "$unpacked"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: archive-${{ matrix.os }}-${{ matrix.arch }}

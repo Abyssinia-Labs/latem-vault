@@ -119,7 +119,7 @@ pub fn uninstall() -> Result<()> {
         Ok(()) => println!("Removed {}. The vault is untouched.", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => match app_state()? {
             _ if removed_old => {}
-            Some(_) => println!(
+            Some(_) => crate::name::say!(
                 "`latem-vault service install` didn't start the service here; the Mac app does. \
                  Turn it off in System Settings > General > Login Items."
             ),
@@ -142,14 +142,14 @@ pub fn status(home: &Home) -> Result<()> {
         (false, None) => println!("Installed    no"),
     }
     if let Some(old) = old_definition_path().ok().filter(|old| old.exists()) {
-        println!(
+        crate::name::say!(
             "Also installed {}, openvault's service from before 0.6. `latem-vault service \
              install` replaces it.",
             old.display()
         );
     }
     if installed && app.is_some() {
-        println!(
+        crate::name::say!(
             "Both this definition and the Mac app start the service, and only one service runs. \
              `latem-vault service uninstall` removes this one."
         );
@@ -183,13 +183,13 @@ pub fn status(home: &Home) -> Result<()> {
             if version != VERSION && by_app {
                 println!("The service runs the Mac app's build. Updating the app moves it on.");
             } else if version != VERSION {
-                println!(
+                crate::name::say!(
                     "The service runs another build. `latem-vault service install` moves it onto \
                      this one."
                 );
             }
         }
-        Some(_) => println!(
+        Some(_) => crate::name::say!(
             "Service      an older build, from before 0.2.2. `latem-vault service install` moves \
              it onto this one."
         ),

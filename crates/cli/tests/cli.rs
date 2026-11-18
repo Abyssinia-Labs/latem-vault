@@ -2025,6 +2025,7 @@ fn hints_name_the_command_as_typed() {
         (output.status.success(), text)
     };
 
+    // The short names: SHORT in src/name.rs.
     for name in ["vault", "lv"] {
         let (ok, text) = run(name, &["list", "latem"]);
         assert!(!ok);

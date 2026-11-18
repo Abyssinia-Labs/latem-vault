@@ -143,16 +143,22 @@ jobs:
           mkdir -p dist
           cp "target/$TARGET/release/latem-vault" dist/
           # The short names, as latem has ltm: relative links, so they run the latem-vault
-          # beside them wherever the archive is unpacked.
-          ln -s latem-vault dist/vault
-          ln -s latem-vault dist/lv
-          tar -czf "dist/$ARCHIVE" -C dist latem-vault vault lv -C "$GITHUB_WORKSPACE" \
+          # beside them wherever the archive is unpacked. The same list as SHORT in
+          # crates/cli/src/name.rs.
+          short_names="vault lv"
+          for name in $short_names; do
+            ln -s latem-vault "dist/$name"
+          done
+          # shellcheck disable=SC2086 # one word per name
+          tar -czf "dist/$ARCHIVE" -C dist latem-vault $short_names -C "$GITHUB_WORKSPACE" \
             LICENSE-APACHE LICENSE-MIT README.md
-          rm dist/latem-vault dist/vault dist/lv
+          for name in latem-vault $short_names; do
+            rm "dist/$name"
+          done
           # Unpacked, each name runs the binary, and its hints name it.
           unpacked=$(mktemp -d)
           tar -xzf "dist/$ARCHIVE" -C "$unpacked"
-          for name in vault lv; do
+          for name in $short_names; do
             test "$(readlink "$unpacked/$name")" = latem-vault
             "$unpacked/$name" --version
             case "$("$unpacked/$name" --help)" in

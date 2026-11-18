@@ -16,7 +16,8 @@ use std::sync::OnceLock;
 /// The binary's own name.
 pub const FULL: &str = "latem-vault";
 
-/// The short names, as latem has `ltm`.
+/// The short names, as latem has `ltm`. The same list is in release.yml's archive step, the
+/// test that runs them (tests/cli.rs) and the README, and the tap's formula links them.
 const SHORT: [&str; 2] = ["vault", "lv"];
 
 /// The name to put in hints for a program run as `argv0`.
@@ -115,16 +116,23 @@ mod tests {
 
     #[test]
     fn the_short_names_are_kept() {
-        assert_eq!(chosen(Some(OsStr::new("vault"))), "vault");
-        assert_eq!(chosen(Some(OsStr::new("lv"))), "lv");
-        assert_eq!(chosen(Some(OsStr::new("/opt/homebrew/bin/vault"))), "vault");
-        assert_eq!(chosen(Some(OsStr::new("../bin/lv"))), "lv");
-        assert_eq!(
-            chosen(Some(OsStr::new(r"C:\tools\lv.exe"))),
-            if cfg!(windows) { "lv" } else { FULL }
-        );
-        assert_eq!(chosen(Some(OsStr::new("lv.exe"))), "lv");
-        assert_eq!(chosen(Some(OsStr::new("/home/me/bin/vault/"))), "vault");
+        for short in SHORT {
+            for typed in [
+                short.to_owned(),
+                format!("/opt/homebrew/bin/{short}"),
+                format!("../bin/{short}"),
+                format!("/home/me/bin/{short}/"),
+                format!("{short}.exe"),
+            ] {
+                assert_eq!(chosen(Some(OsStr::new(&typed))), short, "{typed}");
+            }
+            let windows = format!(r"C:\tools\{short}.exe");
+            let want = if cfg!(windows) { short } else { FULL };
+            assert_eq!(chosen(Some(OsStr::new(&windows))), want);
+            // Only the name itself: not a longer one, nor another case.
+            assert_eq!(chosen(Some(OsStr::new(&format!("{short}2")))), FULL);
+            assert_eq!(chosen(Some(OsStr::new(&short.to_uppercase()))), FULL);
+        }
     }
 
     #[test]
@@ -134,8 +142,6 @@ mod tests {
         assert_eq!(chosen(Some(OsStr::new("latem-vault.exe"))), FULL);
         // The openvault shim execs latem-vault, but a link named openvault would show this.
         assert_eq!(chosen(Some(OsStr::new("openvault"))), FULL);
-        assert_eq!(chosen(Some(OsStr::new("vault2"))), FULL);
-        assert_eq!(chosen(Some(OsStr::new("Vault"))), FULL);
         assert_eq!(chosen(Some(OsStr::new(""))), FULL);
         assert_eq!(chosen(None), FULL);
     }

@@ -15,13 +15,38 @@ cd "$(dirname "$0")/.."
 rust_version=$(rustc --version)
 rust_version=$(echo "$rust_version" | cut -d' ' -f2)
 
+# The tests whose devices find each other with mDNS. A GitHub macOS runner can't send multicast:
+# macOS asks a person before a program may use the local network, nobody is there to answer, and
+# every send fails with "No route to host". So ci.yml's macOS job sets LATEM_VAULT_CI_NO_MULTICAST
+# and skips these. The Linux job runs them, and so does this script on a Mac.
+needs_multicast="
+    a_device_joins_with_a_code
+    approve_goes_through_the_service
+    collections_says_when_this_device_may_read_none
+    devices_join_through_the_service
+    files_reach_the_other_devices
+    scopes_change_with_an_admin_signature
+    services_sync_a_joined_device
+    endpoints_find_each_other
+    endpoints_under_other_service_names_stay_apart
+    discovery_starts_again_after_it_stops
+"
+
 macos() {
     echo "== macOS: rustfmt, clippy, tests, Swift bindings"
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-    cargo test --workspace --locked
-    cargo test --locked -p latem-vault-cli -p latem-vault-service --all-features
+    set --
+    if [ -n "${LATEM_VAULT_CI_NO_MULTICAST:-}" ]; then
+        echo "== No multicast here: skipping the tests that need it:" $needs_multicast
+        for name in $needs_multicast; do
+            set -- "$@" --skip "$name"
+        done
+    fi
+    # --no-fail-fast, so one run names every failing test rather than the first binary's.
+    cargo test --workspace --locked --no-fail-fast -- "$@"
+    cargo test --locked --no-fail-fast -p latem-vault-cli -p latem-vault-service --all-features -- "$@"
     # The Mac app's bindings, used from Swift against a service.
     scripts/swift-bindings.sh
 }

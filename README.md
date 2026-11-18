@@ -14,7 +14,7 @@ Milestones M1, one device, and M2, devices on the same network, are done: device
 brew install abyssinia-labs/tap/latem-vault      # macOS and Linux, arm64 and x86-64
 ```
 
-The command is `lv`. Its full name is `latem-vault`, and `vlt` is a third name: all three run the same binary, and Homebrew and the release archives put in all three. Another `lv`, a pager, is in Homebrew too; `vlt` always works, even where that one comes first on PATH.
+The command is `lv`. Its full name is `latem-vault`, and `vlt` is a third name: all three run the same binary, and Homebrew and the release archives put in all three. Another `lv`, a pager, is in Homebrew too; `vlt` always works, even where that one comes first on PATH. A service installed from Homebrew by 0.6.0 starts that version's own copy, which `brew upgrade` removes: run `lv service install` after each upgrade until one brings a later release, which starts the service through Homebrew's `opt` link instead.
 
 Each [release](https://github.com/Abyssinia-Labs/latem-vault/releases) also has the binaries as archives, with a checksums file signed by [latem-vault.pub](latem-vault.pub) ([docs/release.md](docs/release.md)). To build from this checkout instead, `cargo install --locked --path crates/cli`, which puts in `latem-vault` only; `ln -s latem-vault ~/.cargo/bin/lv` adds a short name.
 

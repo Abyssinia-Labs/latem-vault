@@ -127,6 +127,8 @@ pub enum Request {
         collection: String,
         name: String,
     },
+    /// This device's scope on each collection the log names.
+    Scopes,
 }
 
 #[derive(Debug)]
@@ -191,6 +193,9 @@ pub enum Response {
     Fetched {
         missing: u64,
     },
+    /// Each collection the log names, by name, or by id until a record has brought its name,
+    /// with this device's scope on it.
+    Scopes(Vec<(String, Scope)>),
 }
 
 /// A piece of a file, in the clear: at most a chunk, which never shows in debug output.
@@ -509,6 +514,7 @@ impl Request {
                 w.str(collection);
                 w.str(name);
             }),
+            Self::Scopes => frame(0x1d, |_| {}),
         }
     }
 
@@ -606,6 +612,7 @@ impl Request {
                 collection: r.string()?,
                 name: r.string()?,
             },
+            0x1d => Self::Scopes,
             _ => return Err(DecodeError::Bad("unknown request")),
         };
         r.finish()?;
@@ -835,6 +842,13 @@ impl Response {
             Self::Chunk(data) => frame(0x95, |w| w.bytes(&data.0)),
             Self::Placement(placement) => frame(0x96, |w| w.u8(placement.code())),
             Self::Fetched { missing } => frame(0x97, |w| w.put(&missing.to_be_bytes())),
+            Self::Scopes(scopes) => frame(0x98, |w| {
+                w.count(scopes.len());
+                for (collection, scope) in scopes {
+                    w.str(collection);
+                    w.u8(scope.code());
+                }
+            }),
         }
     }
 
@@ -1104,6 +1118,11 @@ impl Response {
                 Self::Placement(Placement::from_code(r.u8()?).ok_or(DecodeError::Bad("placement"))?)
             }
             0x97 => Self::Fetched { missing: r.u64()? },
+            0x98 => Self::Scopes(
+                (0..r.count()?)
+                    .map(|_| Ok((r.string()?, r.scope()?)))
+                    .collect::<Result<_, DecodeError>>()?,
+            ),
             _ => return Err(DecodeError::Bad("unknown response")),
         };
         r.finish()?;
@@ -1473,7 +1492,7 @@ mod tests {
         };
         assert_eq!(decoded, device);
 
-        for request in [Request::Collections, Request::Devices] {
+        for request in [Request::Collections, Request::Devices, Request::Scopes] {
             let message = request.encode();
             assert_eq!(&message[..], &[0, 0, 0, 1, message[4]]);
             round_trip_request(&request);
@@ -1864,6 +1883,15 @@ mod tests {
             panic!("fetched");
         };
         assert_eq!(missing, 3);
+        let scopes = vec![
+            ("latem".to_owned(), Scope::Read),
+            ("0a1b".into(), Scope::Hold),
+        ];
+        let Response::Scopes(decoded) = round_trip_response(&Response::Scopes(scopes.clone()))
+        else {
+            panic!("scopes");
+        };
+        assert_eq!(decoded, scopes);
 
         // A listing gives a file's size and how many of its chunks aren't here.
         let listed = vec![

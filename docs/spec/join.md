@@ -158,7 +158,7 @@ The joiner accepts the vault only if both of these hold:
 - It writes its store in one transaction: the vault id, the log and its state, and the grants.
 - It sends joined.
 - From then on it is an ordinary device and syncs records with any peer (sync.md).
-- Until its first sync it has no records, so no collection names either: `openvault collections` lists none, while `openvault devices` already lists the vault's devices.
+- Until its first sync it has no records, so no collection names either: `openvault collections` lists none, while `openvault devices` already lists the vault's devices. Since 0.5.9 `collections` then says how many it may read and what syncing needs (service.md, the CLI), and `join` ends by saying to start the service with `openvault service install`, which on a Mac asks for local network access.
 
 ## Not in v1
 

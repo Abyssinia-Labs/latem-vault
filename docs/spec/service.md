@@ -259,6 +259,7 @@ Since 0.3.3, for the Mac app (design §12), which reaches the service through th
 - Both paths run the same request handler, so a command behaves the same either way.
 - `openvault run` asks for the folder's values, then starts the command itself. The command doesn't inherit anything from the service.
 - `openvault devices` lists the vault's devices: name, platform, key type, and whether each is this device, visible or revoked. Without the service, visibility is unknown, and the list says so.
+- `openvault collections` lists the collections this device can read, one name per line on stdout. Since 0.5.9, when it has none it says why on stderr, so a script still reads nothing: the log names no collection yet; this device may read none of them, so an admin must run `openvault scope`; or it may read some but nothing has synced yet. Then without the service it says to run `openvault service install`, and with the service it says another device that reads them must be on the network. On a Mac both mention the local network permission. It asks with **scopes** (`0x1d`), which answers with **scopes** (`0x98`: count (u32) ‖ collection (str) ‖ scope (u8)): this device's scope on each collection the log names, by name, or by id in hex until a record has brought the name. An older service answers error "unknown request", and the CLI then says to restart it with `openvault service install`.
 
 ## Cost
 

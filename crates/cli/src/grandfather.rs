@@ -1,4 +1,4 @@
-//! `latem-vault grandfather`, and `latem-vault coordinator [set|unset]` on devices
+//! `pinkvault grandfather`, and `pinkvault coordinator [set|unset]` on devices
 //! (coordinator.md, running the grandfather and devices).
 
 use std::fs;
@@ -6,9 +6,9 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
-use latem_vault_core::{Vault, VaultId};
-use latem_vault_net::coord::{self, Address};
-use latem_vault_service::{COORDINATOR, configured_coordinator};
+use pinkvault_core::{Vault, VaultId};
+use pinkvault_net::coord::{self, Address};
+use pinkvault_service::{COORDINATOR, configured_coordinator};
 
 use crate::Home;
 
@@ -18,7 +18,7 @@ pub struct Args {
     /// address, and the router must forward the port, TCP and UDP, to this machine
     #[arg(long)]
     hostname: String,
-    /// The vault it's for, as `latem-vault init` showed it; needed the first time [default: this
+    /// The vault it's for, as `pinkvault init` showed it; needed the first time [default: this
     /// device's vault, if it has one]
     #[arg(long)]
     vault: Option<String>,
@@ -41,7 +41,7 @@ pub struct Args {
 /// Runs the grandfather until Ctrl-C or SIGTERM.
 #[cfg(unix)]
 pub fn run(home: &Home, args: Args) -> Result<()> {
-    use latem_vault_grandfather::{ACME, Certificate, Config, Grandfather, Listen};
+    use pinkvault_grandfather::{ACME, Certificate, Config, Grandfather, Listen};
     use tokio::signal::unix::{SignalKind, signal};
 
     if !coord::is_hostname(&args.hostname) {
@@ -52,7 +52,7 @@ pub fn run(home: &Home, args: Args) -> Result<()> {
             id.parse::<VaultId>()
                 .with_context(|| format!("{id} isn't a vault id"))?,
         ),
-        None => Vault::<latem_vault_keystore::Keys>::id_at(&home.vault()).ok(),
+        None => Vault::<pinkvault_keystore::Keys>::id_at(&home.vault()).ok(),
     };
     let data = args.data.unwrap_or_else(|| home.0.join("grandfather"));
     let certificate = match (args.cert, args.key) {
@@ -77,7 +77,7 @@ pub fn run(home: &Home, args: Args) -> Result<()> {
             })
             .await?;
             crate::name::say!(
-                "Give the vault's devices this address with `latem-vault coordinator set`:\n  {}",
+                "Give the vault's devices this address with `pinkvault coordinator set`:\n  {}",
                 grandfather.address()
             );
             let mut terminate = signal(SignalKind::terminate())?;
@@ -92,7 +92,7 @@ pub fn run(home: &Home, args: Args) -> Result<()> {
 
 #[cfg(not(unix))]
 pub fn run(_: &Home, _: Args) -> Result<()> {
-    bail!("`latem-vault grandfather` doesn't run on Windows yet")
+    bail!("`pinkvault grandfather` doesn't run on Windows yet")
 }
 
 /// Shows the coordinator this device uses, or how to get one.
@@ -108,13 +108,13 @@ pub fn show(home: &Home) -> Result<()> {
             );
         }
         None => {
-            let vault = Vault::<latem_vault_keystore::Keys>::id_at(&home.vault())?;
+            let vault = Vault::<pinkvault_keystore::Keys>::id_at(&home.vault())?;
             println!(
                 "None: this device finds the vault's other devices on the local network only."
             );
             crate::name::say!(
-                "To reach them away from home, run `latem-vault grandfather --vault {vault} \
-                 --hostname <name>` on the vault's always-on machine, then `latem-vault coordinator \
+                "To reach them away from home, run `pinkvault grandfather --vault {vault} \
+                 --hostname <name>` on the vault's always-on machine, then `pinkvault coordinator \
                  set <the address it shows>` here."
             );
         }
@@ -149,9 +149,9 @@ pub fn unset(home: &Home) -> Result<()> {
 /// A running service reads the setting when it starts.
 fn restart_note(home: &Home) {
     #[cfg(unix)]
-    if latem_vault_service::client::is_running(&home.0.join(latem_vault_service::SOCKET)) {
+    if pinkvault_service::client::is_running(&home.0.join(pinkvault_service::SOCKET)) {
         crate::name::say!(
-            "The service takes this up when it starts again: `latem-vault service install` \
+            "The service takes this up when it starts again: `pinkvault service install` \
              restarts it if it's installed."
         );
     }

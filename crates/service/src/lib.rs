@@ -1,4 +1,4 @@
-//! The latem vault service (`docs/spec/service.md`): the one process on a device that holds the
+//! The PinkVault service (`docs/spec/service.md`): the one process on a device that holds the
 //! vault open. It runs the device's iroh endpoint and answers the CLI on a local socket.
 //!
 //! [`handler`] is what each request does. The service runs it for requests on its socket, and
@@ -28,8 +28,8 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::Context as _;
-use latem_vault_core::membership;
-use latem_vault_net::coord::Address;
+use pinkvault_core::membership;
+use pinkvault_net::coord::Address;
 
 /// The files in the vault directory.
 pub const VAULT: &str = "vault.db";

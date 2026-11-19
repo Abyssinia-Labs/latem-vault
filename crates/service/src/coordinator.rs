@@ -6,12 +6,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use latem_vault_core::Vault;
-use latem_vault_keystore::Keys;
-use latem_vault_net::Node;
-use latem_vault_net::coord::{self, Address};
-use latem_vault_net::frame::Reason;
-use latem_vault_net::sync::{Notice, SyncError};
+use pinkvault_core::Vault;
+use pinkvault_keystore::Keys;
+use pinkvault_net::Node;
+use pinkvault_net::coord::{self, Address};
+use pinkvault_net::frame::Reason;
+use pinkvault_net::sync::{Notice, SyncError};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};

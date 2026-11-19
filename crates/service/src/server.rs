@@ -1,4 +1,4 @@
-//! `latem-vault service`: holds the vault open, runs the endpoint, and answers on the socket
+//! `pinkvault service`: holds the vault open, runs the endpoint, and answers on the socket
 //! (service.md).
 
 use std::collections::HashMap;
@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use latem_vault_core::membership::{AdminKey as AdminKeyTrait, Scope};
-use latem_vault_core::sets::SetId;
-use latem_vault_core::{DeviceId, Vault, transport_seed};
-use latem_vault_keystore::Keys;
-use latem_vault_net::join::{self, AdminSession, JoinError};
-use latem_vault_net::{EndpointKey, Event, Node, Options, Relay};
+use pinkvault_core::membership::{AdminKey as AdminKeyTrait, Scope};
+use pinkvault_core::sets::SetId;
+use pinkvault_core::{DeviceId, Vault, transport_seed};
+use pinkvault_keystore::Keys;
+use pinkvault_net::join::{self, AdminSession, JoinError};
+use pinkvault_net::{EndpointKey, Event, Node, Options, Relay};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
@@ -107,7 +107,7 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
     #[cfg(feature = "coordinator")]
     let coordinator = crate::configured_coordinator(dir)?;
     #[cfg(not(feature = "coordinator"))]
-    let coordinator: Option<latem_vault_net::coord::Address> = {
+    let coordinator: Option<pinkvault_net::coord::Address> = {
         let file = dir.join(crate::COORDINATOR);
         if file.exists() {
             warn!(
@@ -121,8 +121,8 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
     let relay = coordinator.as_ref().map(|address| address.relay_url());
     let options = Options {
         alpns: vec![
-            latem_vault_net::sync::ALPN.to_vec(),
-            latem_vault_net::chunks::ALPN.to_vec(),
+            pinkvault_net::sync::ALPN.to_vec(),
+            pinkvault_net::chunks::ALPN.to_vec(),
         ],
         relay: relay.clone().map(Relay::new),
         ..Options::default()
@@ -134,7 +134,7 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
         vault = %vault_id,
         device = %device_id,
         endpoint = %hex(&node.id()),
-        "latem-vault {version} running; socket {}",
+        "pinkvault {version} running; socket {}",
         socket.display()
     );
 
@@ -197,14 +197,14 @@ pub async fn run(dir: &Path, keys: Keys, version: &str) -> Result<()> {
                 let shared = shared.clone();
                 tokio::spawn(async move {
                     match incoming.await {
-                        Ok(connection) if connection.alpn() == latem_vault_net::sync::ALPN => {
+                        Ok(connection) if connection.alpn() == pinkvault_net::sync::ALPN => {
                             shared.engine.accept(connection);
                         }
-                        Ok(connection) if connection.alpn() == latem_vault_net::chunks::ALPN => {
-                            let served = latem_vault_net::chunks::serve(
+                        Ok(connection) if connection.alpn() == pinkvault_net::chunks::ALPN => {
+                            let served = pinkvault_net::chunks::serve(
                                 connection,
                                 shared.vault.clone(),
-                                latem_vault_net::chunks::IDLE,
+                                pinkvault_net::chunks::IDLE,
                             )
                             .await;
                             match served {
@@ -314,7 +314,7 @@ fn answer(shared: &Shared, request: Request) -> Response {
                 version: shared.version.clone(),
                 pid: std::process::id(),
                 // One node per service process, so the process's count is the service's.
-                mdns_stops: u32::try_from(latem_vault_net::discovery_stops()).unwrap_or(u32::MAX),
+                mdns_stops: u32::try_from(pinkvault_net::discovery_stops()).unwrap_or(u32::MAX),
             };
         }
         Request::Peers => return peers(shared),
@@ -331,7 +331,7 @@ fn answer(shared: &Shared, request: Request) -> Response {
         | Request::SetScopes { .. } => Some(Change::Log),
         Request::Placement {
             collection,
-            set: Some(latem_vault_core::Placement::Keep),
+            set: Some(pinkvault_core::Placement::Keep),
         } => Some(Change::Kept(collection.clone())),
         _ => None,
     };
@@ -526,7 +526,7 @@ async fn check_code(shared: &Shared, joiner: EndpointKey, code: Zeroizing<String
         }
         if joins.tries.get(&joiner).copied().unwrap_or(0) >= CODE_TRIES {
             return Response::error(
-                "three wrong codes; run `latem-vault join` on the device again".to_owned(),
+                "three wrong codes; run `pinkvault join` on the device again".to_owned(),
             );
         }
     }
@@ -552,7 +552,7 @@ async fn check_code(shared: &Shared, joiner: EndpointKey, code: Zeroizing<String
             *tries += 1;
             match CODE_TRIES - *tries {
                 0 => Response::error(
-                    "three wrong codes; run `latem-vault join` on the device again".to_owned(),
+                    "three wrong codes; run `pinkvault join` on the device again".to_owned(),
                 ),
                 left => Response::Error {
                     code: ErrorCode::WrongCode,
@@ -646,7 +646,7 @@ async fn approve(
     match finished {
         Ok(()) => Response::Done,
         Err(e) => Response::error(format!(
-            "approved, but the device didn't get the log: {e}; run `latem-vault join` on it again"
+            "approved, but the device didn't get the log: {e}; run `pinkvault join` on it again"
         )),
     }
 }
@@ -668,7 +668,7 @@ async fn refuse(shared: &Shared, session: u32) -> Response {
     }
 }
 
-/// Logs a member that has become visible or gone, and other latem vault endpoints at debug level.
+/// Logs a member that has become visible or gone, and other PinkVault endpoints at debug level.
 fn log_event(shared: &Shared, event: Event) {
     let (key, change) = match event {
         Event::Visible(key) => (key, "is visible"),
@@ -686,7 +686,7 @@ fn log_event(shared: &Shared, event: Event) {
             info!("{name} {change}");
         }
         None => debug!(
-            "latem vault endpoint {} outside this vault {change}",
+            "PinkVault endpoint {} outside this vault {change}",
             hex(&key)
         ),
     }

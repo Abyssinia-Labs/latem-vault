@@ -6,17 +6,17 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use latem_vault_core::SoftwareKeys;
-use latem_vault_crypto::passphrase::SALT_LEN;
-use latem_vault_crypto::{
+use pinkvault_core::SoftwareKeys;
+use pinkvault_crypto::passphrase::SALT_LEN;
+use pinkvault_crypto::{
     PassphraseCost, SigningKey, SymmetricKey, UnwrapKey, WrappedKey, passphrase_key, random_bytes,
 };
 use zeroize::Zeroizing;
 
 use crate::{Backend, Error, Keys, Result};
 
-const MAGIC: &[u8] = latem_vault_crypto::frozen::KEYS_MAGIC;
-const ADMIN_MAGIC: &[u8] = latem_vault_crypto::frozen::ADMIN_KEY_MAGIC;
+const MAGIC: &[u8] = pinkvault_crypto::frozen::KEYS_MAGIC;
+const ADMIN_MAGIC: &[u8] = pinkvault_crypto::frozen::ADMIN_KEY_MAGIC;
 const KIND_SOFTWARE: u8 = 0x01;
 const KIND_SECURE_ENCLAVE: u8 = 0x02;
 const KIND_PASSPHRASE: u8 = 0x03;

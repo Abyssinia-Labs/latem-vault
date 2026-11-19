@@ -1,5 +1,6 @@
-//! The move from openvault to latem vault in 0.6 (OV-11): the names things had before, and
-//! moving `~/.openvault` to `~/.latem-vault` on the first run after it.
+//! The moves to PinkVault's names: from openvault's before 0.6, and from latem vault's in 0.6
+//! (OV-11, OV-16). The names things had before, and moving `~/.latem-vault`, or `~/.openvault`
+//! where that never moved, to `~/.pinkvault` on the first run after.
 //!
 //! The move is one rename on the same disk, made only while no service runs for the vault.
 //! Nothing in the directory is copied or rewritten: the key file, Secure Enclave keys included,
@@ -12,46 +13,72 @@ use std::process::Command;
 use std::{env, fs};
 
 use anyhow::Result;
-use latem_vault_service::home::{self, Location};
-use latem_vault_service::{LOCK, SOCKET};
+use pinkvault_service::home::{self, Location};
+use pinkvault_service::{LOCK, SOCKET};
 
-/// `latem-vault service install`'s LaunchAgent before 0.6.
+/// `service install`'s LaunchAgents before 0.7, newest first, each with the command it was then.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) const OLD_LABEL: &str = "local.openvault.service";
-/// `latem-vault service install`'s systemd user unit before 0.6.
+pub(crate) const OLD_LABELS: [(&str, &str); 2] = [
+    ("dev.latem.vault.service", "latem-vault"),
+    ("local.openvault.service", "openvault"),
+];
+/// `service install`'s systemd user units before 0.7, newest first, each with the command it
+/// was then.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) const OLD_UNIT: &str = "openvault.service";
-/// The Mac app's LaunchAgent until the app is renamed too (OV-12). Its build of latem-vault may
-/// be older than 0.6, and look for the vault only in the old directory.
-pub(crate) const OLD_APP_LABEL: &str = "com.abyssinialabs.openvault.service";
+pub(crate) const OLD_UNITS: [(&str, &str); 2] = [
+    ("latem-vault.service", "latem-vault"),
+    ("openvault.service", "openvault"),
+];
+/// The Mac app's LaunchAgents before it was PinkVault (OV-12), newest first. Their builds of the
+/// service may be older than 0.7, and look for the vault only in the old directories.
+pub(crate) const OLD_APP_LABELS: [&str; 2] = [
+    "com.abyssinialabs.latemvault.service",
+    "com.abyssinialabs.openvault.service",
+];
 
-/// The first latem that finds the vault in `~/.latem-vault`. An older one looks only in
-/// `~/.openvault`, and would lose the vault once it moves.
-const LATEM: Version = Version(0, 12, 0);
+/// The first latem that finds the vault in `~/.pinkvault`. An older one looks only in the old
+/// directories, and would lose the vault once it moves.
+const LATEM: Version = Version(0, 14, 0);
 
-/// The vault directory: `LATEM_VAULT_HOME` or `OPENVAULT_HOME` if either is set, else
-/// `~/.latem-vault`, moved there from `~/.openvault` first if it can be.
+/// The vault directory: `PINKVAULT_HOME`, or an old name for it, if one is set, else
+/// `~/.pinkvault`, moved there from an old directory first if it can be.
 pub(crate) fn locate() -> Result<PathBuf> {
-    match Location::from_env()? {
-        Location::Chosen(dir) => Ok(dir),
-        Location::Default { new, old } => {
-            if home::exists(&new) || !old.is_dir() {
-                return Ok(new);
-            }
-            match blocker().map_or_else(|| move_dir(&old, &new), Err) {
-                Ok(()) => {
-                    eprintln!("Moved the vault from {} to {}.", shown(&old), shown(&new));
-                    Ok(new)
-                }
-                Err(why) => {
-                    crate::name::esay!(
-                        "The vault stays in {} for now, not {}: {why}.",
-                        shown(&old),
-                        shown(&new)
-                    );
-                    Ok(old)
-                }
-            }
+    let location = Location::from_env()?;
+    let Location::Default { new, old } = &location else {
+        return Ok(location.current());
+    };
+    if home::exists(new) {
+        return Ok(new.clone());
+    }
+    let found: Vec<&PathBuf> = old.iter().filter(|dir| dir.is_dir()).collect();
+    let [from] = found[..] else {
+        if let [stays, others @ ..] = &found[..] {
+            // Which is the vault is the person's call, not this command's.
+            let others: Vec<String> = others.iter().map(|dir| shown(dir)).collect();
+            crate::name::esay!(
+                "The vault stays in {} for now, not {}: {} is here too, and only one can move. \
+                 Check which one is the vault you use, with `PINKVAULT_HOME=<directory> \
+                 pinkvault devices`, move the other out of your home directory, then run any \
+                 `pinkvault` command",
+                shown(stays),
+                shown(new),
+                others.join(" and ")
+            );
+        }
+        return Ok(location.current());
+    };
+    match blocker().map_or_else(|| move_dir(from, new), Err) {
+        Ok(()) => {
+            eprintln!("Moved the vault from {} to {}.", shown(from), shown(new));
+            Ok(new.clone())
+        }
+        Err(why) => {
+            crate::name::esay!(
+                "The vault stays in {} for now, not {}: {why}.",
+                shown(from),
+                shown(new)
+            );
+            Ok(from.clone())
         }
     }
 }
@@ -74,7 +101,7 @@ fn blocker() -> Option<String> {
 /// runs, so none starts in between.
 fn move_dir(old: &Path, new: &Path) -> Result<(), String> {
     let running = || {
-        "a service is running for it. Stop it, then run any `latem-vault` command to move it"
+        "a service is running for it. Stop it, then run any `pinkvault` command to move it"
             .to_owned()
     };
     let lock = File::options()
@@ -91,7 +118,7 @@ fn move_dir(old: &Path, new: &Path) -> Result<(), String> {
     }
     // A service from before the lock would answer here without holding it.
     #[cfg(unix)]
-    if latem_vault_service::client::is_running(&old.join(SOCKET)) {
+    if pinkvault_service::client::is_running(&old.join(SOCKET)) {
         return Err(running());
     }
     fs::rename(old, new).map_err(|e| format!("can't move it ({e})"))?;
@@ -132,17 +159,17 @@ fn old_latem() -> Option<String> {
             Some(version) if version >= LATEM => {}
             Some(version) => {
                 return Some(format!(
-                    "{} is latem {version}, which looks for the vault only in the old directory. \
-                     Update it to {LATEM} or later with `latem update`, then run any \
-                     `latem-vault` command",
+                    "{} is latem {version}, which doesn't look for the vault in \
+                     ~/.pinkvault. Update it to {LATEM} or later with `latem update`, then run \
+                     any `pinkvault` command",
                     shown(&latem)
                 ));
             }
             None => {
                 return Some(format!(
                     "`{} --version` didn't say which latem it is, and a latem older than \
-                     {LATEM} looks for the vault only in the old directory. Update it with \
-                     `latem update`, then run any `latem-vault` command",
+                     {LATEM} doesn't look for the vault in ~/.pinkvault. Update it with \
+                     `latem update`, then run any `pinkvault` command",
                     shown(&latem)
                 ));
             }
@@ -169,7 +196,7 @@ fn executable(file: &Path) -> bool {
     file.is_file()
 }
 
-/// Whether `HOME` is this account's home directory, whose `~/.openvault` the Mac app's service
+/// Whether `HOME` is this account's home directory, whose vault directory the Mac app's service
 /// would use. Another `HOME`, as in a test, has a vault the app doesn't know about.
 #[cfg(unix)]
 pub(crate) fn home_is_the_accounts() -> bool {
@@ -243,13 +270,14 @@ mod tests {
     #[test]
     fn versions_are_found_in_what_latem_prints() {
         assert_eq!(
-            Version::find("latem version v0.12.0\n"),
-            Some(Version(0, 12, 0))
+            Version::find("latem version v0.14.0\n"),
+            Some(Version(0, 14, 0))
         );
         assert_eq!(Version::find("latem 0.13.2-rc1"), Some(Version(0, 13, 2)));
         assert_eq!(Version::find("latem version dev"), None);
-        assert!(Version(0, 11, 9) < LATEM);
-        assert!(Version(0, 12, 0) >= LATEM);
+        assert!(Version(0, 12, 0) < LATEM);
+        assert!(Version(0, 13, 9) < LATEM);
+        assert!(Version(0, 14, 0) >= LATEM);
         assert!(Version(1, 0, 0) >= LATEM);
     }
 
@@ -257,8 +285,8 @@ mod tests {
     fn the_directory_moves_in_one_rename() {
         let home = tempfile::tempdir().unwrap();
         let (old, new) = (
-            home.path().join(".openvault"),
             home.path().join(".latem-vault"),
+            home.path().join(".pinkvault"),
         );
         fs::create_dir(&old).unwrap();
         fs::write(old.join("keys"), b"key file").unwrap();
@@ -271,8 +299,8 @@ mod tests {
     fn the_directory_stays_while_a_service_holds_its_lock() {
         let home = tempfile::tempdir().unwrap();
         let (old, new) = (
-            home.path().join(".openvault"),
             home.path().join(".latem-vault"),
+            home.path().join(".pinkvault"),
         );
         fs::create_dir(&old).unwrap();
         let service = File::create(old.join(LOCK)).unwrap();

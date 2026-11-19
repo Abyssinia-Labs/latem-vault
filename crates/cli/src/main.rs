@@ -1,10 +1,10 @@
-//! The `latem-vault` command (design §14).
+//! The `pinkvault` command (design §14).
 //!
-//! Everything for this device lives in one directory, `~/.latem-vault` unless `LATEM_VAULT_HOME`
+//! Everything for this device lives in one directory, `~/.pinkvault` unless `PINKVAULT_HOME`
 //! names another: the key file (`keys`), the vault database (`vault.db`) and, while
-//! `latem-vault service` runs, its socket (`service.sock`). Commands go through the service when
-//! it runs, and open the vault themselves otherwise. Before 0.6 the directory was `~/.openvault`,
-//! which the first run moves (migrate.rs).
+//! `pinkvault service` runs, its socket (`service.sock`). Commands go through the service when
+//! it runs, and open the vault themselves otherwise. In 0.6 the directory was `~/.latem-vault`, and
+//! before that `~/.openvault`; the first run moves it (migrate.rs).
 
 mod files;
 #[cfg(feature = "coordinator")]
@@ -26,29 +26,29 @@ use std::process::{self, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use latem_vault_core::file::Manifest;
-use latem_vault_core::membership::Scope;
-use latem_vault_core::names::is_env_name;
-use latem_vault_core::record::MAX_VALUE_LEN;
-use latem_vault_core::{Kind, Placement, Vault, env_file, names};
-use latem_vault_keystore::{Backend, Keys};
-use latem_vault_service::api::{DeviceSummary, ErrorCode, Item, Listed, Request, Response, Value};
-use latem_vault_service::files::size_label;
-use latem_vault_service::handler::{self, unexpected};
-use latem_vault_service::{ADMIN_KEY, KEYS, SOCKET, VAULT, default_device_name, setup};
+use pinkvault_core::file::Manifest;
+use pinkvault_core::membership::Scope;
+use pinkvault_core::names::is_env_name;
+use pinkvault_core::record::MAX_VALUE_LEN;
+use pinkvault_core::{Kind, Placement, Vault, env_file, names};
+use pinkvault_keystore::{Backend, Keys};
+use pinkvault_service::api::{DeviceSummary, ErrorCode, Item, Listed, Request, Response, Value};
+use pinkvault_service::files::size_label;
+use pinkvault_service::handler::{self, unexpected};
+use pinkvault_service::{ADMIN_KEY, KEYS, SOCKET, VAULT, default_device_name, setup};
 use zeroize::Zeroizing;
 
 /// This build: its version, and the commit it was built from (README, versions).
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
-    env!("LATEM_VAULT_COMMIT"),
+    env!("PINKVAULT_COMMIT"),
     ")"
 );
 
 #[derive(Parser)]
 #[command(
-    name = "latem-vault",
+    name = "pinkvault",
     version = VERSION,
     about = "Secrets and variables, encrypted on your own devices."
 )]
@@ -123,7 +123,7 @@ enum Command {
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<OsString>,
     },
-    /// Join a vault on another device: shows a code to type into `latem-vault approve` there.
+    /// Join a vault on another device: shows a code to type into `pinkvault approve` there.
     Join {
         /// This device's name in the vault [default: this computer's host name]
         #[arg(long)]
@@ -187,7 +187,7 @@ enum Command {
         action: Option<CoordinatorAction>,
     },
     /// Run this vault's relay and coordinator on its always-on machine, so its devices reach each
-    /// other away from home. Prints the address to give them with `latem-vault coordinator set`.
+    /// other away from home. Prints the address to give them with `pinkvault coordinator set`.
     /// Runs until Ctrl-C.
     #[cfg(feature = "coordinator")]
     Grandfather(grandfather::Args),
@@ -281,7 +281,7 @@ enum ServiceAction {
 #[cfg(feature = "coordinator")]
 #[derive(Subcommand)]
 enum CoordinatorAction {
-    /// Use the grandfather at this address, as `latem-vault grandfather` prints it: its relay, and
+    /// Use the grandfather at this address, as `pinkvault grandfather` prints it: its relay, and
     /// its coordinator
     Set { address: String },
     /// Stop using a grandfather: find other devices on the local network only
@@ -321,6 +321,9 @@ enum KeysArg {
 }
 
 fn main() -> ExitCode {
+    if let Some(notice) = name::old_name_notice() {
+        eprintln!("{notice}");
+    }
     let matches = name::command(Cli::command()).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     match dispatch(cli.command) {
@@ -334,7 +337,7 @@ fn main() -> ExitCode {
 
 fn dispatch(command: Command) -> Result<ExitCode> {
     match &command {
-        // They look for the vault themselves: install moves it once openvault's service stops.
+        // They look for the vault themselves: install moves it once the old names' services stop.
         #[cfg(unix)]
         Command::Service {
             action: Some(ServiceAction::Install),
@@ -487,7 +490,7 @@ fn backend(keys: Option<KeysArg>) -> Backend {
 struct Home(PathBuf);
 
 impl Home {
-    /// The vault directory, moved from where it was before 0.6 first if it can be.
+    /// The vault directory, moved from where it was before 0.7 first if it can be.
     fn locate() -> Result<Self> {
         migrate::locate().map(Self)
     }
@@ -507,7 +510,7 @@ impl Home {
     fn require_vault(&self) -> Result<()> {
         if !self.vault().exists() {
             bail!(
-                "no vault in {}; run `latem-vault init` to make one, or `latem-vault join` to join one \
+                "no vault in {}; run `pinkvault init` to make one, or `pinkvault join` to join one \
                  from another device",
                 self.0.display()
             );
@@ -521,7 +524,7 @@ impl Home {
         #[cfg(unix)]
         {
             let socket = self.0.join(SOCKET);
-            if latem_vault_service::client::is_running(&socket) {
+            if pinkvault_service::client::is_running(&socket) {
                 return Ok(Access::Service(socket));
             }
         }
@@ -548,7 +551,7 @@ impl Access {
     fn call(&mut self, request: Request) -> Result<Response> {
         Ok(match self {
             #[cfg(unix)]
-            Self::Service(socket) => latem_vault_service::client::call(socket, &request)
+            Self::Service(socket) => pinkvault_service::client::call(socket, &request)
                 .context("can't reach the service")?
                 .context("the service stopped")?,
             Self::Local { vault, admin_key } => handler::handle(
@@ -644,7 +647,7 @@ impl Access {
 fn load_keys(path: &Path) -> Result<Keys> {
     const ATTEMPTS: usize = 3;
     match Keys::load(path) {
-        Err(latem_vault_keystore::Error::NeedsPassphrase) => {}
+        Err(pinkvault_keystore::Error::NeedsPassphrase) => {}
         keys => return Ok(keys?),
     }
     if !has_terminal() {
@@ -656,7 +659,7 @@ fn load_keys(path: &Path) -> Result<Keys> {
     for attempt in 1..=ATTEMPTS {
         let passphrase = prompt_passphrase("Passphrase for this device's keys (hidden): ")?;
         match Keys::load_with_passphrase(path, &passphrase) {
-            Err(latem_vault_keystore::Error::WrongPassphrase) if attempt < ATTEMPTS => {
+            Err(pinkvault_keystore::Error::WrongPassphrase) if attempt < ATTEMPTS => {
                 eprintln!("Wrong passphrase.");
             }
             keys => return Ok(keys?),
@@ -673,7 +676,7 @@ fn read_new_passphrase() -> Result<Zeroizing<String>> {
         );
     }
     let passphrase = prompt_passphrase("New passphrase for this device's keys (hidden): ")?;
-    latem_vault_keystore::check_passphrase(&passphrase)?;
+    pinkvault_keystore::check_passphrase(&passphrase)?;
     let again = prompt_passphrase("The same passphrase again (hidden): ")?;
     if *again != *passphrase {
         bail!("the passphrases don't match");
@@ -855,7 +858,7 @@ fn devices(home: &Home) -> Result<()> {
     }
     if !access.is_service() {
         println!();
-        name::say!("Run `latem-vault service` to see which of them are on this network.");
+        name::say!("Run `pinkvault service` to see which of them are on this network.");
     }
     Ok(())
 }
@@ -1013,7 +1016,7 @@ fn collections(home: &Home) -> Result<()> {
     Ok(())
 }
 
-/// Why `latem-vault collections` has nothing to list.
+/// Why `pinkvault collections` has nothing to list.
 fn why_no_collections(access: &mut Access) -> Result<String> {
     let scopes = match access.call(Request::Scopes)? {
         Response::Scopes(scopes) => scopes,
@@ -1021,16 +1024,14 @@ fn why_no_collections(access: &mut Access) -> Result<String> {
         Response::Error { message, .. } if message.contains("unknown request") => {
             return Ok(
                 "No collections here yet. The running service is an older build. \
-                 `latem-vault service install` restarts it on this one."
+                 `pinkvault service install` restarts it on this one."
                     .to_owned(),
             );
         }
         other => return Err(unexpected(&other)),
     };
     if scopes.is_empty() {
-        return Ok(
-            "No collections yet. `latem-vault collections create NAME` makes one.".to_owned(),
-        );
+        return Ok("No collections yet. `pinkvault collections create NAME` makes one.".to_owned());
     }
     let readable = scopes
         .iter()
@@ -1045,7 +1046,7 @@ fn why_no_collections(access: &mut Access) -> Result<String> {
             .map_or("DEVICE", |(_, name)| name.as_str());
         return Ok(format!(
             "This device can't read any collection yet. On a device that administers the vault, \
-             run `latem-vault scope {name} COLLECTION read`."
+             run `pinkvault scope {name} COLLECTION read`."
         ));
     }
     let may_read = format!(
@@ -1059,7 +1060,7 @@ fn why_no_collections(access: &mut Access) -> Result<String> {
         );
         if cfg!(target_os = "macos") {
             why.push_str(
-                " If macOS asked whether latem-vault may find devices on your local network, \
+                " If macOS asked whether pinkvault may find devices on your local network, \
                  allow it in System Settings > Privacy & Security > Local Network.",
             );
         }
@@ -1072,11 +1073,11 @@ fn why_no_collections(access: &mut Access) -> Result<String> {
 /// What a device that may read collections needs before anything syncs, which `join` and an
 /// empty `collections` say.
 const START_THE_SERVICE: &str = if cfg!(target_os = "macos") {
-    "Devices sync through the service: run `latem-vault service install` to start it at login. \
-     macOS then asks whether latem-vault may find devices on your local network. Allow it, or \
+    "Devices sync through the service: run `pinkvault service install` to start it at login. \
+     macOS then asks whether pinkvault may find devices on your local network. Allow it, or \
      this Mac can't sync."
 } else {
-    "Devices sync through the service: run `latem-vault service install` to start it at login."
+    "Devices sync through the service: run `pinkvault service install` to start it at login."
 };
 
 /// `1 secret`, `2 secrets`.
@@ -1187,7 +1188,7 @@ fn find_device<'a>(devices: &'a [DeviceSummary], query: &str) -> Result<&'a Devi
     };
     match found.as_slice() {
         [device] => Ok(device),
-        [] => bail!("no device is called {query}; `latem-vault devices` lists them"),
+        [] => bail!("no device is called {query}; `pinkvault devices` lists them"),
         several => {
             let ids: Vec<String> = several
                 .iter()
@@ -1213,7 +1214,7 @@ fn service(home: &Home) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(latem_vault_service::run(&home.0, keys, VERSION))
+        .block_on(pinkvault_service::run(&home.0, keys, VERSION))
 }
 
 /// Points stdout and stderr at the end of `file`, so whatever the service prints goes there,
@@ -1245,7 +1246,7 @@ fn log_to(file: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn service(_: &Home) -> Result<()> {
-    bail!("`latem-vault service` doesn't run on Windows yet")
+    bail!("`pinkvault service` doesn't run on Windows yet")
 }
 
 /// Starting the service at login (service.md, starting at login).
@@ -1260,7 +1261,7 @@ fn service_action(home: &Home, action: ServiceAction) -> Result<()> {
 
 #[cfg(not(unix))]
 fn service_action(_: &Home, _: ServiceAction) -> Result<()> {
-    bail!("`latem-vault service` doesn't run on Windows yet")
+    bail!("`pinkvault service` doesn't run on Windows yet")
 }
 
 fn set(home: &Home, entry: &str, kind: Kind) -> Result<()> {
@@ -1286,7 +1287,7 @@ fn open(home: &Home, entry: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("{collection}/{name} doesn't exist"))?;
     if entry.kind != Kind::File {
         bail!(
-            "{collection}/{name} is a {}; open opens files. `latem-vault get` shows it",
+            "{collection}/{name} is a {}; open opens files. `pinkvault get` shows it",
             kind_label(entry.kind)
         );
     }
@@ -1308,7 +1309,7 @@ fn get(home: &Home, entry: &str, output: Option<&Path>) -> Result<()> {
         return files::get(&mut access, collection, name, &manifest, output);
     }
     if let Some(path) = output {
-        return latem_vault_service::files::write_out(path, false, now_secs(), |file| {
+        return pinkvault_service::files::write_out(path, false, now_secs(), |file| {
             Ok(file.write_all(&entry.value)?)
         });
     }
@@ -1617,7 +1618,7 @@ fn split_entry(entry: &str) -> Result<(&str, &str)> {
 }
 
 /// Reads a value from stdin, either typed at a prompt (hidden for secrets) or piped. One
-/// trailing newline is dropped, so `echo value | latem-vault set …` stores `value`.
+/// trailing newline is dropped, so `echo value | pinkvault set …` stores `value`.
 fn read_value(kind: Kind) -> Result<Zeroizing<Vec<u8>>> {
     let stdin = io::stdin();
     let mut value = if stdin.is_terminal() {
@@ -1651,8 +1652,8 @@ fn read_value(kind: Kind) -> Result<Zeroizing<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use latem_vault_core::DeviceId;
-    use latem_vault_service::api::DeviceSummary;
+    use pinkvault_core::DeviceId;
+    use pinkvault_service::api::DeviceSummary;
 
     use super::find_device;
 

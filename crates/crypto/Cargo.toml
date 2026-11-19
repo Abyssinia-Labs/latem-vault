@@ -1,6 +1,6 @@
 [package]
-name = "latem-vault-crypto"
-description = "latem vault's cryptographic building blocks."
+name = "pinkvault-crypto"
+description = "PinkVault's cryptographic building blocks."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -11,14 +11,14 @@ use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::error::CFError;
 use core_foundation::string::{CFString, CFStringRef};
-use latem_vault_core::DeviceKeys;
-use latem_vault_crypto::sign::signing_input;
-use latem_vault_crypto::{
-    Signature, SignatureContext, SymmetricKey, VerifyingKey, WrapKey, WrappedKey,
-};
 use objc2::rc::Retained;
 use objc2_foundation::NSString;
 use objc2_local_authentication::LAContext;
+use pinkvault_core::DeviceKeys;
+use pinkvault_crypto::sign::signing_input;
+use pinkvault_crypto::{
+    Signature, SignatureContext, SymmetricKey, VerifyingKey, WrapKey, WrappedKey,
+};
 use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
 use security_framework_sys::access_control::{
@@ -102,7 +102,7 @@ impl AdminSigner {
 /// What an admin key signs to ask for Touch ID ahead of the signatures that need it. Every
 /// signature a device checks covers a context label first (`frozen::SIG_*`), so this one
 /// can't pass for any of them, and it's dropped as soon as it's made.
-const PRESENCE: &[u8] = latem_vault_crypto::frozen::ADMIN_PRESENCE;
+const PRESENCE: &[u8] = pinkvault_crypto::frozen::ADMIN_PRESENCE;
 
 /// A device's wrapping and signing keys in the Secure Enclave, plus its local key, which is
 /// kept in the key file wrapped to the Secure Enclave wrapping key.
@@ -149,11 +149,7 @@ impl DeviceKeys for SecureEnclaveKeys {
         self.wrap_key.clone()
     }
 
-    fn unwrap(
-        &self,
-        context: &[u8],
-        wrapped: &WrappedKey,
-    ) -> latem_vault_core::Result<SymmetricKey> {
+    fn unwrap(&self, context: &[u8], wrapped: &WrappedKey) -> pinkvault_core::Result<SymmetricKey> {
         wrapped.unwrap_with(&self.wrap_key, context, |peer| {
             Ok(self.wrapping.ecdh(peer)?)
         })
@@ -163,11 +159,7 @@ impl DeviceKeys for SecureEnclaveKeys {
         self.verifying_key.clone()
     }
 
-    fn sign(
-        &self,
-        context: SignatureContext,
-        message: &[u8],
-    ) -> latem_vault_core::Result<Signature> {
+    fn sign(&self, context: SignatureContext, message: &[u8]) -> pinkvault_core::Result<Signature> {
         let der = self.signing.sign(&signing_input(context, message))?;
         Ok(Signature::from_p256_der(&der)?)
     }

@@ -1,4 +1,4 @@
-//! The log of the commands that run for long, `latem-vault service` and `latem-vault grandfather`.
+//! The log of the commands that run for long, `pinkvault service` and `pinkvault grandfather`.
 
 use std::fmt;
 use std::io;
@@ -12,7 +12,7 @@ use tracing_subscriber::layer::{Context, Filter};
 const RELAY_HTTP: &str = "iroh_relay::server::http_server";
 const CONNECTION_FAILED: &str = "failed to handle connection";
 
-/// Sends the log to stderr, filtered by `LATEM_VAULT_LOG` or else by `default` and without the
+/// Sends the log to stderr, filtered by `PINKVAULT_LOG` or else by `default` and without the
 /// relay's connection errors.
 pub(crate) fn to_stderr(default: &str) {
     use tracing_subscriber::filter::FilterExt as _;
@@ -20,11 +20,7 @@ pub(crate) fn to_stderr(default: &str) {
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::{EnvFilter, Layer, fmt};
 
-    // OPENVAULT_LOG is the name before 0.6, still read for one release.
-    let variable = match std::env::var_os("LATEM_VAULT_LOG") {
-        None if std::env::var_os("OPENVAULT_LOG").is_some() => "OPENVAULT_LOG",
-        _ => "LATEM_VAULT_LOG",
-    };
+    let variable = log_variable(|name| std::env::var_os(name).is_some());
     let (filter, quiet) = match EnvFilter::try_from_env(variable) {
         Ok(filter) => (filter, false),
         Err(_) => (EnvFilter::new(default), true),
@@ -36,15 +32,24 @@ pub(crate) fn to_stderr(default: &str) {
                 .with_target(false)
                 .with_filter(filter.and(QuietConnectionErrors { quiet })),
         )
-        // Starts mDNS again when it stops, whatever LATEM_VAULT_LOG leaves out (service.md).
-        .with(latem_vault_net::discovery_watch())
+        // Starts mDNS again when it stops, whatever PINKVAULT_LOG leaves out (service.md).
+        .with(pinkvault_net::discovery_watch())
         .init();
+}
+
+/// The log's variable: `PINKVAULT_LOG`, or else the first of its old names that `is_set`, 0.6's
+/// and then openvault's, still read for one release.
+fn log_variable(is_set: impl Fn(&str) -> bool) -> &'static str {
+    ["PINKVAULT_LOG", "LATEM_VAULT_LOG", "OPENVAULT_LOG"]
+        .into_iter()
+        .find(|name| is_set(name))
+        .unwrap_or("PINKVAULT_LOG")
 }
 
 /// Leaves out iroh-relay's error for each HTTPS connection that failed, when `quiet`. On a
 /// grandfather's public port they come from scanners and from handshakes that end early, Let's
 /// Encrypt's among them: dozens an hour, and none from the relay itself (coordinator.md, relay).
-/// `LATEM_VAULT_LOG` shows them again.
+/// `PINKVAULT_LOG` shows them again.
 struct QuietConnectionErrors {
     quiet: bool,
 }
@@ -91,6 +96,21 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn the_old_log_variables_are_still_read() {
+        let set = |names: &'static [&'static str]| move |name: &str| names.contains(&name);
+        assert_eq!(log_variable(set(&[])), "PINKVAULT_LOG");
+        assert_eq!(log_variable(set(&["OPENVAULT_LOG"])), "OPENVAULT_LOG");
+        assert_eq!(
+            log_variable(set(&["OPENVAULT_LOG", "LATEM_VAULT_LOG"])),
+            "LATEM_VAULT_LOG"
+        );
+        assert_eq!(
+            log_variable(set(&["OPENVAULT_LOG", "LATEM_VAULT_LOG", "PINKVAULT_LOG"])),
+            "PINKVAULT_LOG"
+        );
+    }
+
     struct Count(Arc<AtomicUsize>);
 
     impl<S: Subscriber> Layer<S> for Count {
@@ -110,13 +130,13 @@ mod tests {
         let filter = EnvFilter::new("info,iroh_relay=warn").and(QuietConnectionErrors { quiet });
         let subscriber = tracing_subscriber::registry()
             .with(Count(count.clone()).with_filter(filter))
-            .with(latem_vault_net::discovery_watch());
+            .with(pinkvault_net::discovery_watch());
         tracing::subscriber::with_default(subscriber, || {
             for _ in 0..2 {
                 tracing::error!(target: RELAY_HTTP, error = "tls handshake eof", "{CONNECTION_FAILED}");
-                tracing::info!(target: "latem_vault", "the log is at entry 24");
+                tracing::info!(target: "pinkvault", "the log is at entry 24");
                 tracing::error!(target: RELAY_HTTP, "failed to accept connection: too many open files");
-                tracing::error!(target: "latem_vault", "{CONNECTION_FAILED}");
+                tracing::error!(target: "pinkvault", "{CONNECTION_FAILED}");
             }
         });
         count.load(Ordering::Relaxed)

@@ -61,7 +61,7 @@ There are no timers and no periodic scans.
 - after a local write, with every visible member that shares the collection;
 - after its log grows, with every visible member. The entries may be its own, the coordinator's (coordinator.md), or taken from a peer in a session. Only entries the device didn't have count, so passing them on stops at devices that have them.
 
-`openvault service` starts them (service.md). A write made through the service is a local write. So is a log entry `approve` appends, which it reports to the service with a changed request.
+`pinkvault service` starts them (service.md). A write made through the service is a local write. So is a log entry `approve` appends, which it reports to the service with a changed request.
 
 **During a session.** After a local write, a device sends the changed set's root at once (roots), and the opener reconciles that set again; the new records follow as items. A device announces a new log head by sending hello again. That costs one extra round trip compared with pushing the records themselves, and sends nothing a reconciliation wouldn't.
 - Every running session announces it, whatever brought the entries: a local change, the coordinator, or another session.
@@ -247,7 +247,7 @@ The device doing this makes the new keys and signs the grants, so it must be abl
 **Versions from a removed writer.**
 - A device that has lost `write` keeps its signing key and the old collection keys. It can still sign records under old epochs, with any name and any Lamport clock, and they pass the header checks.
 - So when choosing an entry's current version, a reader ignores every version whose epoch is older than the collection's current one and whose author no longer has `write` on the collection (records.md, versions).
-- Nothing that device signs, before or after its removal, can then become current. That includes new names: `openvault run` turns entries into environment variables, so an injected one could change what a build runs.
+- Nothing that device signs, before or after its removal, can then become current. That includes new names: `pinkvault run` turns entries into environment variables, so an injected one could change what a build runs.
 
 **Keeping its real writes.**
 - The removed device's earlier writes were legitimate, so each device that still has `write` carries them forward.
@@ -256,7 +256,7 @@ The device doing this makes the new keys and signs the grants, so it must be abl
 - If no device with `write` remains, those entries stay in history only, until a device is given `write` and restores them.
 - **In v1,** only the device that signs the revocation does this, where it has `write`. Other writers learn of the rotation before they hold the new key, and until then they'd have to remember the entries to write again. Until the carried versions arrive, a device that applied the rotation shows each such entry's previous version, or none.
 
-**Reviewing.** `openvault devices revoke` lists the entries the device wrote last, for review, and the secrets it could read, to rotate at their providers (design §7). Since 0.5.3 it also lists the files it could read, to replace any that hold a key, such as a keystore. A file is listed whether or not the device fetched its chunks, since it could have. Since 0.5.4, a collection with more than 10 files lists each folder at its top as one line with its file count, as `documents/sample/ (12 files)`, so a documents folder doesn't make the list as long as the folder; files at the top of a collection, and a folder's only file, are still named.
+**Reviewing.** `pinkvault devices revoke` lists the entries the device wrote last, for review, and the secrets it could read, to rotate at their providers (design §7). Since 0.5.3 it also lists the files it could read, to replace any that hold a key, such as a keystore. A file is listed whether or not the device fetched its chunks, since it could have. Since 0.5.4, a collection with more than 10 files lists each folder at its top as one line with its file count, as `documents/sample/ (12 files)`, so a documents folder doesn't make the list as long as the folder; files at the top of a collection, and a folder's only file, are still named.
 
 **A gap.** A writer that received a forged version from the removed device before it learned of the removal can carry the forgery forward. Sessions exchange the log before records, so the gap closes at that writer's first sync with a device that knows of the removal.
 

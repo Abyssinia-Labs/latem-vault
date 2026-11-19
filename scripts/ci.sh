@@ -17,7 +17,7 @@ rust_version=$(echo "$rust_version" | cut -d' ' -f2)
 
 # The tests whose devices find each other with mDNS. A GitHub macOS runner can't send multicast:
 # macOS asks a person before a program may use the local network, nobody is there to answer, and
-# every send fails with "No route to host". So ci.yml's macOS job sets LATEM_VAULT_CI_NO_MULTICAST
+# every send fails with "No route to host". So ci.yml's macOS job sets PINKVAULT_CI_NO_MULTICAST
 # and skips these. The Linux job runs them, and so does this script on a Mac.
 needs_multicast="
     a_device_joins_with_a_code
@@ -41,7 +41,7 @@ macos() {
     cargo clippy --workspace --all-targets --locked -- -D warnings
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     set --
-    if [ -n "${LATEM_VAULT_CI_NO_MULTICAST:-}" ]; then
+    if [ -n "${PINKVAULT_CI_NO_MULTICAST:-}" ]; then
         echo "== No multicast here: skipping the tests that need it:" $needs_multicast
         for name in $needs_multicast; do
             set -- "$@" --skip "$name"
@@ -49,20 +49,20 @@ macos() {
     fi
     # --no-fail-fast, so one run names every failing test rather than the first binary's.
     cargo test --workspace --locked --no-fail-fast -- "$@"
-    cargo test --locked --no-fail-fast -p latem-vault-cli -p latem-vault-service --all-features -- "$@"
+    cargo test --locked --no-fail-fast -p pinkvault-cli -p pinkvault-service --all-features -- "$@"
     # The Mac app's bindings, used from Swift against a service.
     scripts/swift-bindings.sh
 }
 
 linux_here() {
     echo "== Linux: clippy, tests"
-    # latem-vault-ffi is for the Mac app, and the macOS checks test it. Linking its tests with
+    # pinkvault-ffi is for the Mac app, and the macOS checks test it. Linking its tests with
     # UniFFI's generator beside the others ran the container out of memory.
-    cargo clippy --workspace --exclude latem-vault-ffi --all-targets --locked -- -D warnings
-    cargo clippy --workspace --exclude latem-vault-ffi --all-targets --all-features --locked \
+    cargo clippy --workspace --exclude pinkvault-ffi --all-targets --locked -- -D warnings
+    cargo clippy --workspace --exclude pinkvault-ffi --all-targets --all-features --locked \
         -- -D warnings
-    cargo test --workspace --exclude latem-vault-ffi --locked
-    cargo test --locked -p latem-vault-cli -p latem-vault-service --all-features
+    cargo test --workspace --exclude pinkvault-ffi --locked
+    cargo test --locked -p pinkvault-cli -p pinkvault-service --all-features
 }
 
 linux() {
@@ -72,8 +72,8 @@ linux() {
     mkdir -p target
     docker run --rm \
         --volume "$PWD:/src:ro" \
-        --volume openvault-ci-target:/src/target \
-        --volume openvault-ci-registry:/usr/local/cargo/registry \
+        --volume pinkvault-ci-target:/src/target \
+        --volume pinkvault-ci-registry:/usr/local/cargo/registry \
         --workdir /src \
         "rust:$rust_version-slim" \
         sh -euc 'rustup component add clippy && scripts/ci.sh linux-here'

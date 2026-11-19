@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use latem_vault_core::file::ChunkId;
-use latem_vault_core::membership::Scope;
-use latem_vault_core::{CollectionId, DeviceId, DeviceKeys, Vault, VaultId};
-use latem_vault_crypto::chunk_id;
+use pinkvault_core::file::ChunkId;
+use pinkvault_core::membership::Scope;
+use pinkvault_core::{CollectionId, DeviceId, DeviceKeys, Vault, VaultId};
+use pinkvault_crypto::chunk_id;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -20,8 +20,8 @@ use crate::frame::{self, FrameError, Reason};
 use crate::sync::blocking;
 use crate::wire::Reader;
 
-/// Frozen in [`latem_vault_crypto::frozen`]: it never changes, whatever the product is called.
-pub const ALPN: &[u8] = latem_vault_crypto::frozen::ALPN_CHUNKS;
+/// Frozen in [`pinkvault_crypto::frozen`]: it never changes, whatever the product is called.
+pub const ALPN: &[u8] = pinkvault_crypto::frozen::ALPN_CHUNKS;
 
 /// The most chunks one want asks for.
 pub const MAX_WANT: usize = 64;
@@ -49,7 +49,7 @@ pub trait ChunkStore: Send + Sync + 'static {
         &self,
         collection: CollectionId,
         id: &ChunkId,
-    ) -> latem_vault_core::Result<Option<Vec<u8>>>;
+    ) -> pinkvault_core::Result<Option<Vec<u8>>>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -262,7 +262,7 @@ impl<K: DeviceKeys + Send + 'static> ChunkStore for Mutex<Vault<K>> {
         &self,
         collection: CollectionId,
         id: &ChunkId,
-    ) -> latem_vault_core::Result<Option<Vec<u8>>> {
+    ) -> pinkvault_core::Result<Option<Vec<u8>>> {
         self.lock().expect("poisoned").sealed_chunk(collection, id)
     }
 }
@@ -303,9 +303,9 @@ fn parse_ids(body: &[u8]) -> Result<(CollectionId, Vec<ChunkId>), FrameError> {
 
 #[cfg(test)]
 mod tests {
-    use latem_vault_core::file::{CHUNK_SIZE, Content, Manifest};
-    use latem_vault_core::sets::{ItemId, SetId};
-    use latem_vault_core::{Kind, SoftwareKeys};
+    use pinkvault_core::file::{CHUNK_SIZE, Content, Manifest};
+    use pinkvault_core::sets::{ItemId, SetId};
+    use pinkvault_core::{Kind, SoftwareKeys};
 
     use super::*;
     use crate::Node;
@@ -432,7 +432,7 @@ mod tests {
 
         let stranger = SoftwareKeys::generate();
         let (stranger, _) = Node::start(
-            &latem_vault_core::transport_seed(&stranger),
+            &pinkvault_core::transport_seed(&stranger),
             crate::quiet_test_options(),
         )
         .await

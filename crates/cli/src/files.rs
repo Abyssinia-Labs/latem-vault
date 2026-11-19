@@ -10,15 +10,15 @@ use std::process::{self, ExitCode};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use latem_vault_core::file::{Content, Manifest};
-use latem_vault_core::membership::Scope;
-use latem_vault_core::names::{self, is_env_name};
-use latem_vault_core::{Kind, Placement};
-use latem_vault_service::api::{Item, Request, Response};
-use latem_vault_service::files::{
+use pinkvault_core::file::{Content, Manifest};
+use pinkvault_core::membership::Scope;
+use pinkvault_core::names::{self, is_env_name};
+use pinkvault_core::{Kind, Placement};
+use pinkvault_service::api::{Item, Request, Response};
+use pinkvault_service::files::{
     Caller, disk_encryption, seal_file, size_label, write_contents, write_file, write_out,
 };
-use latem_vault_service::handler::unexpected;
+use pinkvault_service::handler::unexpected;
 
 use crate::{Access, Home};
 
@@ -60,7 +60,7 @@ impl Access {
         }
         bail!(
             "{missing} {chunks} of {collection}/{name} aren't on this device; start the service \
-             (`latem-vault service`) to fetch them from your other devices"
+             (`pinkvault service`) to fetch them from your other devices"
         )
     }
 
@@ -211,7 +211,7 @@ pub fn import(
     }
     if written > 0 {
         crate::name::say!(
-            "The originals are still in {}. Delete them once `latem-vault list {collection}` \
+            "The originals are still in {}. Delete them once `pinkvault list {collection}` \
              shows what you expect.",
             path.display()
         );
@@ -594,11 +594,11 @@ pub fn file_var(name: &str) -> String {
 struct PrivateDir(PathBuf);
 
 impl PrivateDir {
-    /// `latem-vault-<purpose>-<random>` in the user's temporary directory.
+    /// `pinkvault-<purpose>-<random>` in the user's temporary directory.
     fn create(purpose: &str) -> Result<Self> {
         let name = format!(
-            "latem-vault-{purpose}-{}",
-            hex(&latem_vault_crypto::random_bytes::<8>()[..])
+            "pinkvault-{purpose}-{}",
+            hex(&pinkvault_crypto::random_bytes::<8>()[..])
         );
         let path = std::env::temp_dir().join(name);
         let mut builder = fs::DirBuilder::new();

@@ -4,10 +4,10 @@ use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::path::Path;
 
-use latem_vault_core::membership::{LogEntry, Membership};
-use latem_vault_core::{Error, Result, VaultId};
-use latem_vault_crypto::hash::Hash;
-use latem_vault_net::EndpointKey;
+use pinkvault_core::membership::{LogEntry, Membership};
+use pinkvault_core::{Error, Result, VaultId};
+use pinkvault_crypto::hash::Hash;
+use pinkvault_net::EndpointKey;
 use rusqlite::{Connection, OptionalExtension, params};
 
 const SCHEMA: &str = "

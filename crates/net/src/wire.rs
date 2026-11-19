@@ -1,10 +1,10 @@
 //! Message bodies that joining, sync and the coordinator share (sync.md): hellos, log requests
 //! and entries, and items.
 
-use latem_vault_core::VaultId;
-use latem_vault_core::membership::LogEntry;
-use latem_vault_core::sets::SetId;
-use latem_vault_crypto::hash::Hash;
+use pinkvault_core::VaultId;
+use pinkvault_core::membership::LogEntry;
+use pinkvault_core::sets::SetId;
+use pinkvault_crypto::hash::Hash;
 
 use crate::frame::{FrameError, MAX_MESSAGE};
 

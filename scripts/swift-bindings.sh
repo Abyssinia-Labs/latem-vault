@@ -1,7 +1,7 @@
 #!/bin/sh
-# Builds latem-vault-ffi, generates its Swift bindings into target/swift, and runs a Swift program
+# Builds pinkvault-ffi, generates its Swift bindings into target/swift, and runs a Swift program
 # with them against a service in a temporary directory (scripts/ffi-smoke.swift). The Mac app's
-# OpenVaultKit is built from the same library and bindings. macOS only.
+# PinkVaultKit is built from the same library and bindings. macOS only.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -11,17 +11,17 @@ export MACOSX_DEPLOYMENT_TARGET=26.0
 export CARGO_TARGET_DIR=target/ffi
 build=$CARGO_TARGET_DIR/debug
 out=target/swift
-cargo build --locked -p latem-vault-cli -p latem-vault-ffi
+cargo build --locked -p pinkvault-cli -p pinkvault-ffi
 rm -rf "$out"
-cargo run --locked -q -p latem-vault-ffi --bin uniffi-bindgen -- generate \
-    --library "$build/liblatem_vault_ffi.dylib" --language swift --out-dir "$out"
+cargo run --locked -q -p pinkvault-ffi --bin uniffi-bindgen -- generate \
+    --library "$build/libpinkvault_ffi.dylib" --language swift --out-dir "$out"
 # Top-level code has to be in main.swift. The static library, so the program doesn't depend on
 # where the dylib is.
 cp scripts/ffi-smoke.swift "$out/main.swift"
 swiftc -module-name smoke -target "arm64-apple-macos$MACOSX_DEPLOYMENT_TARGET" \
-    -Xcc -fmodule-map-file="$out/latem_vault_ffiFFI.modulemap" -I "$out" \
-    "$out/latem_vault_ffi.swift" "$out/main.swift" \
-    "$build/liblatem_vault_ffi.a" \
+    -Xcc -fmodule-map-file="$out/pinkvault_ffiFFI.modulemap" -I "$out" \
+    "$out/pinkvault_ffi.swift" "$out/main.swift" \
+    "$build/libpinkvault_ffi.a" \
     -framework Security -framework SystemConfiguration -framework CoreFoundation \
     -framework LocalAuthentication \
     -o "$out/smoke"
@@ -32,10 +32,10 @@ cleanup() {
     rm -rf "$home"
 }
 trap cleanup EXIT
-export LATEM_VAULT_HOME="$home"
+export PINKVAULT_HOME="$home"
 # Its own mDNS service name, so no real device or app on the network sees this one.
-export LATEM_VAULT_MDNS_SERVICE="ovt-$$"
-vault=$build/latem-vault
+export PINKVAULT_MDNS_SERVICE="ovt-$$"
+vault=$build/pinkvault
 # The phrase's numbered words run down columns, so each number is followed by its word.
 phrase=$("$vault" init --keys software --name smoke </dev/null | awk '
     { for (i = 1; i < NF; i++) if ($i ~ /^[0-9]+\.$/) word[$i + 0] = $(i + 1) }
@@ -51,5 +51,5 @@ until [ -S "$home/service.sock" ]; do
     fi
     sleep 0.1
 done
-version=$(cargo pkgid -p latem-vault-ffi | sed 's/.*[@#]//')
+version=$(cargo pkgid -p pinkvault-ffi | sed 's/.*[@#]//')
 "$out/smoke" "$home" "$phrase" "$version"

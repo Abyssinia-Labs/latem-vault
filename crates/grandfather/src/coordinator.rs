@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use latem_vault_net::EndpointKey;
-use latem_vault_net::coord::NO_LOG;
-use latem_vault_net::frame::{self, FrameError, Reason};
-use latem_vault_net::sync::SyncError;
-use latem_vault_net::wire::{self, HELLO, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST};
+use pinkvault_net::EndpointKey;
+use pinkvault_net::coord::NO_LOG;
+use pinkvault_net::frame::{self, FrameError, Reason};
+use pinkvault_net::sync::SyncError;
+use pinkvault_net::wire::{self, HELLO, LOG_BATCH, LOG_ENTRIES, LOG_REQUEST};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
@@ -203,7 +203,7 @@ impl Session<'_> {
             Some((seq, _)) if peer_seq > seq => seq + 1,
             Some((seq, hash)) if peer_seq == seq => {
                 if peer_hash != hash {
-                    return Err(SyncError::Store(latem_vault_core::Error::Fork));
+                    return Err(SyncError::Store(pinkvault_core::Error::Fork));
                 }
                 self.received = 0;
                 self.require_member()?;

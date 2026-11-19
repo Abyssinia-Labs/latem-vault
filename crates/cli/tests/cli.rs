@@ -1,4 +1,4 @@
-//! Runs the `latem-vault` binary against a temporary `LATEM_VAULT_HOME`. Keys are software keys,
+//! Runs the `pinkvault` binary against a temporary `PINKVAULT_HOME`. Keys are software keys,
 //! so these tests run anywhere; the keystore crate tests the Secure Enclave and passphrases.
 
 use std::io::Write;
@@ -6,9 +6,9 @@ use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
 
-use latem_vault_core::Vault;
-use latem_vault_crypto::RecoveryKey;
-use latem_vault_keystore::Keys;
+use pinkvault_core::Vault;
+use pinkvault_crypto::RecoveryKey;
+use pinkvault_keystore::Keys;
 
 struct Device {
     home: tempfile::TempDir,
@@ -42,15 +42,15 @@ impl Device {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_latem-vault"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pinkvault"));
         command
             .args(args)
-            .env("LATEM_VAULT_HOME", self.home.path())
+            .env("PINKVAULT_HOME", self.home.path())
             // An mDNS service name for this test process alone: its devices find only each
             // other, and no real device or app on the network sees them or their joiners
             // (service.md, finding devices).
             .env(
-                "LATEM_VAULT_MDNS_SERVICE",
+                "PINKVAULT_MDNS_SERVICE",
                 format!("ovt-{:x}", std::process::id()),
             )
             .stdin(Stdio::null());
@@ -137,9 +137,9 @@ fn phrase(stdout: &str) -> String {
 fn init_creates_a_private_vault_and_shows_the_phrase() {
     let device = Device::empty();
     let home = device.home.path().join("nested");
-    let output = Command::new(env!("CARGO_BIN_EXE_latem-vault"))
+    let output = Command::new(env!("CARGO_BIN_EXE_pinkvault"))
         .args(["init", "--keys", "software", "--name", "Build Mac"])
-        .env("LATEM_VAULT_HOME", &home)
+        .env("PINKVAULT_HOME", &home)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -163,9 +163,9 @@ fn init_creates_a_private_vault_and_shows_the_phrase() {
         assert_eq!(mode(&home.join("vault.db")), 0o600);
     }
 
-    let again = Command::new(env!("CARGO_BIN_EXE_latem-vault"))
+    let again = Command::new(env!("CARGO_BIN_EXE_pinkvault"))
         .args(["init", "--keys", "software"])
-        .env("LATEM_VAULT_HOME", &home)
+        .env("PINKVAULT_HOME", &home)
         .output()
         .unwrap();
     assert!(!again.status.success());
@@ -245,7 +245,7 @@ fn the_version_names_the_build() {
     let version = Device::empty().ok(&["--version"]);
     let build = version
         .trim()
-        .strip_prefix(concat!("latem-vault ", env!("CARGO_PKG_VERSION"), " ("))
+        .strip_prefix(concat!("pinkvault ", env!("CARGO_PKG_VERSION"), " ("))
         .and_then(|rest| rest.strip_suffix(')'))
         .unwrap_or_else(|| panic!("{version}"));
     assert!(
@@ -257,19 +257,15 @@ fn the_version_names_the_build() {
 #[test]
 fn commands_need_a_vault() {
     let device = Device::empty();
-    assert!(
-        device
-            .fails(&["get", "latem/x"])
-            .contains("latem-vault init")
-    );
+    assert!(device.fails(&["get", "latem/x"]).contains("pinkvault init"));
     let error = device.fails(&["collections"]);
     assert!(
-        error.contains("latem-vault init") && error.contains("`latem-vault join` to join one"),
+        error.contains("pinkvault init") && error.contains("`pinkvault join` to join one"),
         "{error}"
     );
 }
 
-/// Runs `latem-vault collections` where it has nothing to list: stdout stays empty for scripts,
+/// Runs `pinkvault collections` where it has nothing to list: stdout stays empty for scripts,
 /// and stderr, returned, says why.
 fn no_collections(device: &Device) -> String {
     let output = device.run(&["collections"]);
@@ -285,7 +281,7 @@ fn collections_says_how_to_make_the_first() {
     device.ok(&["init", "--keys", "software", "--name", "test"]);
     assert_eq!(
         no_collections(&device),
-        "No collections yet. `latem-vault collections create NAME` makes one.\n"
+        "No collections yet. `pinkvault collections create NAME` makes one.\n"
     );
 }
 
@@ -298,7 +294,7 @@ fn collections_says_when_this_device_may_read_none() {
     assert_eq!(
         no_collections(&joiner),
         "This device can't read any collection yet. On a device that administers the vault, \
-         run `latem-vault scope Desktop COLLECTION read`.\n"
+         run `pinkvault scope Desktop COLLECTION read`.\n"
     );
 }
 
@@ -416,7 +412,7 @@ fn run_puts_a_folder_in_the_environment() {
         "--env",
         "prod",
         "--",
-        "latem-vault-no-such-command",
+        "pinkvault-no-such-command",
     ]);
     assert_eq!(missing.status.code(), Some(127));
 }
@@ -631,7 +627,7 @@ fn import_env_writes_everything_or_nothing() {
     );
 }
 
-/// `latem-vault service` running in the background for a device. Stopped with SIGTERM when
+/// `pinkvault service` running in the background for a device. Stopped with SIGTERM when
 /// dropped, as Ctrl-C would.
 #[cfg(unix)]
 struct Service {
@@ -1175,7 +1171,7 @@ fn commands_go_through_the_service() {
 
     let devices = device.ok(&["devices"]);
     assert!(devices.contains("this device"), "{devices}");
-    assert!(!devices.contains("latem-vault service"), "{devices}");
+    assert!(!devices.contains("pinkvault service"), "{devices}");
 
     assert!(service.stop(), "the service didn't exit cleanly");
     assert!(!device.home.path().join("service.sock").exists());
@@ -1229,7 +1225,7 @@ fn devices_lists_this_device() {
         first.contains("file") && first.ends_with("this device"),
         "{devices}"
     );
-    assert!(devices.contains("Run `latem-vault service`"), "{devices}");
+    assert!(devices.contains("Run `pinkvault service`"), "{devices}");
 }
 
 /// Reaching devices away from home is behind the `coordinator` feature, which is off by default.
@@ -1249,7 +1245,7 @@ fn coordinator_is_set_per_device() {
     let device = Device::new();
     let none = device.ok(&["coordinator"]);
     assert!(none.starts_with("None:"), "{none}");
-    assert!(none.contains("latem-vault grandfather --vault "), "{none}");
+    assert!(none.contains("pinkvault grandfather --vault "), "{none}");
 
     let id = "ab".repeat(32);
     let error = device.fails(&["coordinator", "set", &format!("{id}@vault.example.com")]);
@@ -1277,7 +1273,7 @@ fn coordinator_is_set_per_device() {
 static JOINING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A child process that is killed if the test fails before it exits, so a waiting
-/// `latem-vault join` doesn't go on announcing itself.
+/// `pinkvault join` doesn't go on announcing itself.
 #[cfg(unix)]
 struct Child(std::process::Child);
 
@@ -1355,7 +1351,7 @@ fn a_device_joins_with_a_code() {
     // The next step, since nothing syncs until the service runs.
     let next = rest.last().unwrap();
     assert!(
-        next.starts_with("Devices sync through the service: run `latem-vault service install`"),
+        next.starts_with("Devices sync through the service: run `pinkvault service install`"),
         "{rest:?}"
     );
     assert_eq!(
@@ -1501,7 +1497,7 @@ fn scopes_change_with_an_admin_signature() {
 fn services_sync_a_joined_device() {
     use std::time::{Duration, Instant};
 
-    use latem_vault_service::api::{PeerState, Request, Response};
+    use pinkvault_service::api::{PeerState, Request, Response};
 
     let admin = Device::new();
     admin.set("latem/prod/SENTRY_DSN", "--secret", b"https://sentry");
@@ -1512,7 +1508,7 @@ fn services_sync_a_joined_device() {
     assert!(
         why.starts_with(
             "This device may read 1 collection, but nothing has synced yet. Devices sync \
-             through the service: run `latem-vault service install`"
+             through the service: run `pinkvault service install`"
         ),
         "{why}"
     );
@@ -1549,7 +1545,7 @@ fn services_sync_a_joined_device() {
     let started = Instant::now();
     loop {
         let Ok(Some(Response::Peers(peers))) =
-            latem_vault_service::client::call(&socket, &Request::Peers)
+            pinkvault_service::client::call(&socket, &Request::Peers)
         else {
             panic!("no peers: {}", admin_service.log());
         };
@@ -1733,9 +1729,9 @@ fn files_reach_the_other_devices() {
 fn apps_read_and_watch_through_the_service() {
     use std::time::{Duration, Instant};
 
-    use latem_vault_core::Kind;
-    use latem_vault_core::membership::Scope;
-    use latem_vault_service::api::{self, Event, Request, Response, Signer};
+    use pinkvault_core::Kind;
+    use pinkvault_core::membership::Scope;
+    use pinkvault_service::api::{self, Event, Request, Response, Signer};
 
     let device = Device::new();
     device.set("latem/prod/SENTRY_DSN", "--secret", b"https://sentry");
@@ -1743,7 +1739,7 @@ fn apps_read_and_watch_through_the_service() {
     let service = Service::start(&device);
     let socket = device.home.path().join("service.sock");
     let call = |request: Request| {
-        latem_vault_service::client::call(&socket, &request)
+        pinkvault_service::client::call(&socket, &request)
             .unwrap()
             .unwrap()
     };
@@ -1753,7 +1749,7 @@ fn apps_read_and_watch_through_the_service() {
     };
     assert!(!info.admin, "software keys have no admin key");
     let recovery = RecoveryKey::from_phrase(&device.phrase).unwrap();
-    let fingerprint = latem_vault_crypto::hash::hash(recovery.unwrap_key().wrap_key().as_bytes());
+    let fingerprint = pinkvault_crypto::hash::hash(recovery.unwrap_key().wrap_key().as_bytes());
     assert_eq!(info.recovery, fingerprint[..4]);
 
     let Response::CollectionSummaries(summaries) = call(Request::CollectionSummaries) else {
@@ -1850,15 +1846,15 @@ fn devices_join_through_the_service() {
     use std::io::{BufRead, BufReader};
     use std::time::{Duration, Instant};
 
-    use latem_vault_core::membership::Scope;
-    use latem_vault_service::api::{ErrorCode, Request, Response};
+    use pinkvault_core::membership::Scope;
+    use pinkvault_service::api::{ErrorCode, Request, Response};
 
     let _turn = JOINING.lock().unwrap_or_else(|e| e.into_inner());
     let admin = Device::new();
     let service = Service::start(&admin);
     let socket = admin.home.path().join("service.sock");
     let call = |request: Request| {
-        latem_vault_service::client::call(&socket, &request)
+        pinkvault_service::client::call(&socket, &request)
             .unwrap()
             .unwrap()
     };
@@ -1957,7 +1953,7 @@ fn devices_join_through_the_service() {
     assert!(service.stop(), "the service didn't exit cleanly");
 }
 
-/// `latem-vault approve` takes the service's way when one runs.
+/// `pinkvault approve` takes the service's way when one runs.
 #[cfg(unix)]
 #[test]
 fn approve_goes_through_the_service() {
@@ -2002,8 +1998,8 @@ fn approve_goes_through_the_service() {
     assert!(devices.contains("Joiner"), "{devices}");
 }
 
-/// Run as `lv` or `vlt`, the links Homebrew and the release archives put in, hints and help name
-/// the command as typed. `--version` still says `latem-vault`, which latem and the tap look for.
+/// Run as `pink`, the link Homebrew and the release archives put in, hints and help name the
+/// command as typed. `--version` still says `pinkvault`, which latem and the tap look for.
 #[cfg(unix)]
 #[test]
 fn hints_name_the_command_as_typed() {
@@ -2012,47 +2008,63 @@ fn hints_name_the_command_as_typed() {
     let run = |name: &str, args: &[&str]| {
         let link = links.path().join(name);
         if !link.exists() {
-            std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_latem-vault"), &link).unwrap();
+            std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_pinkvault"), &link).unwrap();
         }
         let output = Command::new(&link)
             .args(args)
-            .env("LATEM_VAULT_HOME", home.path().join("none"))
+            .env("PINKVAULT_HOME", home.path().join("none"))
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        let text = String::from_utf8_lossy(&output.stdout).into_owned()
-            + &String::from_utf8_lossy(&output.stderr);
-        (output.status.success(), text)
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
     };
 
-    // The short names: SHORT in src/name.rs.
-    for name in ["lv", "vlt"] {
-        let (ok, text) = run(name, &["list", "latem"]);
+    // The short name: SHORT in src/name.rs.
+    {
+        let name = "pink";
+        let (ok, _, text) = run(name, &["list", "latem"]);
         assert!(!ok);
         assert!(
             text.starts_with(&format!("{name}: no vault in "))
                 && text.contains(&format!("run `{name} init` to make one, or `{name} join`")),
             "{text}"
         );
-        let (ok, text) = run(name, &["join", "--help"]);
+        let (ok, text, _) = run(name, &["join", "--help"]);
         assert!(ok, "{text}");
         assert!(
             text.contains(&format!("type into `{name} approve` there")),
             "{text}"
         );
         assert!(text.contains(&format!("Usage: {name} join")), "{text}");
-        let (ok, text) = run(name, &["--version"]);
-        assert!(ok && text.starts_with("latem-vault "), "{text}");
+        let (ok, text, _) = run(name, &["--version"]);
+        assert!(ok && text.starts_with("pinkvault "), "{text}");
     }
 
-    // Any other name, such as a link left as openvault, gets the binary's own.
-    let (ok, text) = run("openvault", &["list", "latem"]);
-    assert!(!ok);
-    assert!(
-        text.starts_with("latem-vault: no vault in ")
-            && text.contains("run `latem-vault init` to make one"),
-        "{text}"
-    );
-    let (_, text) = run("openvault", &["--help"]);
-    assert!(text.contains("Usage: latem-vault <COMMAND>"), "{text}");
+    // The old names, which the tap links for one release, say so first, then name pinkvault.
+    for old in ["latem-vault", "openvault"] {
+        let notice = format!(
+            "`{old}` is now `pinkvault`, and `pink` for short. The old name works until the next \
+             release.\n"
+        );
+        let (ok, _, text) = run(old, &["list", "latem"]);
+        assert!(!ok);
+        let rest = text
+            .strip_prefix(&notice)
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            rest.starts_with("pinkvault: no vault in ")
+                && rest.contains("run `pinkvault init` to make one"),
+            "{text}"
+        );
+        let (ok, help, text) = run(old, &["--help"]);
+        assert!(ok && text == notice, "{text}");
+        assert!(help.contains("Usage: pinkvault <COMMAND>"), "{help}");
+        // latem reads the version from stdout, which the notice stays out of.
+        let (ok, version, _) = run(old, &["--version"]);
+        assert!(ok && version.starts_with("pinkvault "), "{version}");
+    }
 }

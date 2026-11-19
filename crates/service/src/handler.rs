@@ -6,12 +6,12 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use latem_vault_core::join::JoinRequest;
-use latem_vault_core::membership::{AdminKey as AdminKeyTrait, Change, LogEntry, Scope};
-use latem_vault_core::{Approval, CollectionId, DeviceId, Kind, Revocation, Vault, names};
-use latem_vault_crypto::RecoveryKey;
-use latem_vault_keystore::{AdminKey, Keys};
-use latem_vault_net::EndpointKey;
+use pinkvault_core::join::JoinRequest;
+use pinkvault_core::membership::{AdminKey as AdminKeyTrait, Change, LogEntry, Scope};
+use pinkvault_core::{Approval, CollectionId, DeviceId, Kind, Revocation, Vault, names};
+use pinkvault_crypto::RecoveryKey;
+use pinkvault_keystore::{AdminKey, Keys};
+use pinkvault_net::EndpointKey;
 use zeroize::Zeroizing;
 
 use crate::api::{
@@ -31,7 +31,7 @@ pub struct Context<'a> {
     /// Without one, a request an admin signs loads the key from `admin_key`, and its first
     /// signature asks.
     pub admin: Option<&'a dyn AdminKeyTrait>,
-    /// The latem vault endpoints mDNS can see; `None` without the service.
+    /// The PinkVault endpoints mDNS can see; `None` without the service.
     pub visible: Option<&'a BTreeSet<EndpointKey>>,
 }
 
@@ -293,9 +293,9 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
                 .get(id, &name)?
                 .filter(|entry| entry.kind == Kind::File)
                 .ok_or_else(|| anyhow!("no file {collection}/{name}"))?;
-            let missing = match latem_vault_core::file::Manifest::decode(&entry.value)?.content {
-                latem_vault_core::file::Content::Inline(_) => 0,
-                latem_vault_core::file::Content::Chunks { ids, .. } => {
+            let missing = match pinkvault_core::file::Manifest::decode(&entry.value)?.content {
+                pinkvault_core::file::Content::Inline(_) => 0,
+                pinkvault_core::file::Content::Chunks { ids, .. } => {
                     vault.chunks_not_held(&ids)?.len() as u64
                 }
             };
@@ -366,7 +366,7 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
         Request::Vault => Response::Vault(VaultInfo {
             vault: vault.vault_id(),
             device: vault.device_id(),
-            recovery: latem_vault_crypto::hash::hash(vault.recovery_key().as_bytes())[..4]
+            recovery: pinkvault_crypto::hash::hash(vault.recovery_key().as_bytes())[..4]
                 .try_into()
                 .expect("took 4 bytes"),
             log_head: vault.membership().map_or(0, |m| m.head().0),
@@ -418,7 +418,7 @@ fn run(cx: &mut Context, request: Request) -> Result<Response> {
                 |vault, admin| {
                     ids.iter()
                         .map(|(id, scope, _)| vault.set_scope(device, *id, *scope, &admin))
-                        .collect::<latem_vault_core::Result<Vec<_>>>()
+                        .collect::<pinkvault_core::Result<Vec<_>>>()
                 },
             )?;
             let mut rotated = Vec::new();
@@ -495,7 +495,7 @@ fn summaries(vault: &Vault<Keys>) -> Result<Vec<CollectionSummary>> {
 }
 
 /// This device's scope on each collection the log names, by name, or by id until a record has
-/// brought the name. They tell an empty `latem-vault collections` whether names haven't synced yet
+/// brought the name. They tell an empty `pinkvault collections` whether names haven't synced yet
 /// or this device may read nothing.
 fn scopes(vault: &Vault<Keys>) -> Result<Vec<(String, Scope)>> {
     let Some(membership) = vault.membership() else {
@@ -528,7 +528,7 @@ fn log_lines(vault: &Vault<Keys>, admin_key: &Path, from: u64, max: u16) -> Resu
     };
     let this_admin = match AdminKey::load(admin_key) {
         Ok(key) => Some(key.verifying_key()),
-        Err(latem_vault_keystore::Error::NotFound(_)) => None,
+        Err(pinkvault_keystore::Error::NotFound(_)) => None,
         Err(e) => return Err(e).context("can't load this device's admin key"),
     };
     let names = vault.collections()?;
@@ -591,7 +591,7 @@ fn as_admin<T>(
     recovery_phrase: Option<&str>,
     action: &'static str,
     reason: String,
-    f: impl FnOnce(&mut Vault<Keys>, &dyn AdminKeyTrait) -> latem_vault_core::Result<T>,
+    f: impl FnOnce(&mut Vault<Keys>, &dyn AdminKeyTrait) -> pinkvault_core::Result<T>,
 ) -> Result<T> {
     // Listed when it was asked for; checked again, since the log may have changed since.
     if let Some(admin) = approved.filter(|admin| is_admin(vault, admin)) {
@@ -671,7 +671,7 @@ fn create_collection(
 fn listed_admin_key(vault: &Vault<Keys>, path: &Path) -> Result<Option<AdminKey>> {
     let key = match AdminKey::load(path) {
         Ok(key) => key,
-        Err(latem_vault_keystore::Error::NotFound(_)) => return Ok(None),
+        Err(pinkvault_keystore::Error::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e).context("can't load this device's admin key"),
     };
     Ok(is_admin(vault, &key).then_some(key))
@@ -789,7 +789,7 @@ fn devices(vault: &Vault<Keys>, visible: Option<&BTreeSet<EndpointKey>>) -> Vec<
 }
 
 /// The endpoint id a transport key gives: its 32 Ed25519 key bytes, after the algorithm byte.
-pub(crate) fn transport_endpoint(key: &latem_vault_crypto::VerifyingKey) -> Option<EndpointKey> {
+pub(crate) fn transport_endpoint(key: &pinkvault_crypto::VerifyingKey) -> Option<EndpointKey> {
     key.is_ed25519()
         .then(|| key.as_bytes()[1..].try_into().ok())
         .flatten()
@@ -809,8 +809,8 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    use latem_vault_crypto::{Signature, SignatureContext, SigningKey, VerifyingKey};
-    use latem_vault_keystore::Backend;
+    use pinkvault_crypto::{Signature, SignatureContext, SigningKey, VerifyingKey};
+    use pinkvault_keystore::Backend;
 
     use super::*;
 
@@ -846,7 +846,7 @@ mod tests {
             &self,
             context: SignatureContext,
             message: &[u8],
-        ) -> latem_vault_core::Result<Signature> {
+        ) -> pinkvault_core::Result<Signature> {
             self.wait_for_user();
             Ok(self.key.sign(context, message))
         }

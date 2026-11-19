@@ -12,19 +12,19 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use latem_vault_core::file::Manifest;
-use latem_vault_core::membership::{DeviceName, Scope as CoreScope};
-use latem_vault_core::{DeviceId, Kind as CoreKind, Placement as CorePlacement, env_file};
-use latem_vault_crypto::pake;
-use latem_vault_keystore::{Backend, Keys};
-use latem_vault_service::api::{self, ErrorCode, Request, Response};
-use latem_vault_service::{client, files, home, setup};
+use pinkvault_core::file::Manifest;
+use pinkvault_core::membership::{DeviceName, Scope as CoreScope};
+use pinkvault_core::{DeviceId, Kind as CoreKind, Placement as CorePlacement, env_file};
+use pinkvault_crypto::pake;
+use pinkvault_keystore::{Backend, Keys};
+use pinkvault_service::api::{self, ErrorCode, Request, Response};
+use pinkvault_service::{client, files, home, setup};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
-/// This library's version, as `latem-vault --version` prints its number.
+/// This library's version, as `pinkvault --version` prints its number.
 #[uniffi::export]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
@@ -33,7 +33,7 @@ pub fn version() -> String {
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum VaultError {
     /// No service answers on the socket.
-    #[error("the latem vault service isn't running")]
+    #[error("the PinkVault service isn't running")]
     NotRunning,
     /// Signing needs the recovery phrase: ask for it and call again with it.
     #[error("{message}")]
@@ -303,7 +303,7 @@ pub struct EnvLine {
     pub line: u32,
 }
 
-/// Reads a `.env` file as `latem-vault import-env` does, and so as latem does. If any line can't
+/// Reads a `.env` file as `pinkvault import-env` does, and so as latem does. If any line can't
 /// be read, nothing is returned, and the error names the line but never shows it.
 #[uniffi::export]
 pub fn parse_env(file: Vec<u8>) -> Result<Vec<EnvLine>, VaultError> {
@@ -346,17 +346,17 @@ pub struct DeviceHome {
     pub joining: bool,
 }
 
-/// The vault directory `home`, or `LATEM_VAULT_HOME` or `~/.latem-vault` without one: whether it
+/// The vault directory `home`, or `PINKVAULT_HOME` or `~/.pinkvault` without one: whether it
 /// holds a vault, and how its keys are kept. An app checks this before starting the service,
 /// which can't run without a vault or ask for a passphrase.
 #[uniffi::export]
 pub fn device_home(home: Option<String>) -> Result<DeviceHome, VaultError> {
     let home = locate(home)?;
-    let keys = home.join(latem_vault_service::KEYS);
+    let keys = home.join(pinkvault_service::KEYS);
     let keys = match keys.exists() {
         false => None,
         true => Some(
-            match latem_vault_keystore::backend_of(&keys).map_err(|e| failed(e.to_string()))? {
+            match pinkvault_keystore::backend_of(&keys).map_err(|e| failed(e.to_string()))? {
                 Backend::SecureEnclave => KeyStorage::SecureEnclave,
                 Backend::Software => KeyStorage::Software,
                 Backend::Passphrase => KeyStorage::Passphrase,
@@ -368,7 +368,7 @@ pub fn device_home(home: Option<String>) -> Result<DeviceHome, VaultError> {
             .to_str()
             .ok_or_else(|| failed(format!("{} isn't UTF-8", home.display())))?
             .to_owned(),
-        vault: home.join(latem_vault_service::VAULT).exists(),
+        vault: home.join(pinkvault_service::VAULT).exists(),
         keys,
         joining: setup::join_in_progress(&home),
     })
@@ -377,7 +377,7 @@ pub fn device_home(home: Option<String>) -> Result<DeviceHome, VaultError> {
 /// This computer's host name without `.local`, as a new device's name in the log.
 #[uniffi::export]
 pub fn default_device_name() -> String {
-    latem_vault_service::default_device_name()
+    pinkvault_service::default_device_name()
 }
 
 /// Whether this Mac has a Secure Enclave for a new device's keys, which `init` and `join` then
@@ -400,7 +400,7 @@ pub struct NewVault {
     pub admin: bool,
 }
 
-/// Makes a vault in `home` with this device as its first member, as `latem-vault init` does
+/// Makes a vault in `home` with this device as its first member, as `pinkvault init` does
 /// (service.md, without the service). With the Secure Enclave the device gets an admin key too.
 /// `passphrase` is for [`KeyStorage::Passphrase`]. No service runs yet; start one after.
 #[uniffi::export]
@@ -413,7 +413,7 @@ pub fn create_vault(
     let home = locate(home)?;
     let passphrase = passphrase.map(Zeroizing::new);
     if let Some(passphrase) = &passphrase {
-        latem_vault_keystore::check_passphrase(passphrase).map_err(|e| failed(e.to_string()))?;
+        pinkvault_keystore::check_passphrase(passphrase).map_err(|e| failed(e.to_string()))?;
     }
     DeviceName {
         platform: std::env::consts::OS.into(),
@@ -428,7 +428,7 @@ pub fn create_vault(
         &name,
     )
     .map_err(|e| failed(format!("{e:#}")))?;
-    let recovery = latem_vault_crypto::hash::hash(created.vault.recovery_key().as_bytes());
+    let recovery = pinkvault_crypto::hash::hash(created.vault.recovery_key().as_bytes());
     Ok(NewVault {
         vault: created.vault.vault_id().to_string(),
         device: created.vault.device_id().to_string(),
@@ -485,7 +485,7 @@ impl Joining {
     }
 }
 
-/// Starts joining a vault from `home`, as `latem-vault join` does: makes this device's keys with
+/// Starts joining a vault from `home`, as `pinkvault join` does: makes this device's keys with
 /// `keys`, or loads those of a join in progress, and announces it on the local network with a
 /// 6-digit code for an admin to type. It returns at once; the join runs on its own thread, on an
 /// endpoint of its own, for up to 10 minutes. Once `listener` hears it ended without an error,
@@ -510,7 +510,7 @@ pub fn join_vault(
         backend(keys),
         || match &passphrase {
             Some(passphrase) => {
-                latem_vault_keystore::check_passphrase(passphrase)?;
+                pinkvault_keystore::check_passphrase(passphrase)?;
                 Ok(passphrase.clone())
             }
             None => anyhow::bail!("keys behind a passphrase need one"),
@@ -534,7 +534,7 @@ pub fn join_vault(
         stop: Mutex::new(Some(stop)),
     });
     std::thread::Builder::new()
-        .name("latem-vault join".into())
+        .name("pinkvault join".into())
         .spawn(move || {
             let progress = |progress| {
                 listener.on_progress(match progress {
@@ -580,7 +580,7 @@ fn fingerprint(bytes: &[u8]) -> String {
     )
 }
 
-/// `home`, or the directory the CLI uses: `LATEM_VAULT_HOME`, or `~/.latem-vault`. Until the CLI
+/// `home`, or the directory the CLI uses: `PINKVAULT_HOME`, or `~/.pinkvault`. Until the CLI
 /// or the service has moved it there, the vault may still be in the directory it had before
 /// 0.6, and this finds it there ([`home::Location::current`]).
 fn locate(home: Option<String>) -> Result<PathBuf, VaultError> {
@@ -600,11 +600,11 @@ pub struct Client {
 
 #[uniffi::export]
 impl Client {
-    /// The client for the vault in `home`, or in `LATEM_VAULT_HOME` or `~/.latem-vault` without one.
+    /// The client for the vault in `home`, or in `PINKVAULT_HOME` or `~/.pinkvault` without one.
     #[uniffi::constructor]
     pub fn new(home: Option<String>) -> Result<Arc<Self>, VaultError> {
         Ok(Arc::new(Self {
-            socket: locate(home)?.join(latem_vault_service::SOCKET),
+            socket: locate(home)?.join(pinkvault_service::SOCKET),
         }))
     }
 
@@ -1015,7 +1015,7 @@ impl Client {
         }
         let reading = stream.try_clone()?;
         std::thread::Builder::new()
-            .name("latem-vault watch".into())
+            .name("pinkvault watch".into())
             .spawn(move || listen(reading, listener))?;
         Ok(Arc::new(Watch { stream }))
     }
@@ -1140,7 +1140,7 @@ fn device_id(id: &str) -> Result<DeviceId, VaultError> {
         .map_err(|_| failed(format!("{id} isn't a device id")))
 }
 
-/// The client as the shared file code calls it (`latem_vault_service::files`).
+/// The client as the shared file code calls it (`pinkvault_service::files`).
 struct Calls<'a>(&'a Client);
 
 impl files::Caller for Calls<'_> {
@@ -1304,8 +1304,7 @@ mod tests {
 
     #[test]
     fn an_empty_home_has_no_vault_or_keys() {
-        let home =
-            std::env::temp_dir().join(format!("latem-vault-ffi-home-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("pinkvault-ffi-home-{}", std::process::id()));
         let found = device_home(Some(home.to_string_lossy().into_owned())).unwrap();
         assert_eq!((found.vault, found.keys), (false, None));
         assert_eq!(found.path, home.to_string_lossy());
@@ -1402,14 +1401,14 @@ mod tests {
 
     fn temp_home(name: &str) -> PathBuf {
         let home =
-            std::env::temp_dir().join(format!("latem-vault-ffi-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("pinkvault-ffi-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         home
     }
 
     #[test]
     fn a_missing_service_is_not_running() {
-        let home = std::env::temp_dir().join(format!("latem-vault-ffi-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("pinkvault-ffi-{}", std::process::id()));
         let client = Client::new(Some(home.to_string_lossy().into_owned())).unwrap();
         assert!(!client.is_running());
         assert!(matches!(client.vault(), Err(VaultError::NotRunning)));

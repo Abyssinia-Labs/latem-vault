@@ -5,9 +5,9 @@
 
 use std::io::{self, Read, Write};
 
-use latem_vault_core::file::ChunkId;
-use latem_vault_core::membership::Scope;
-use latem_vault_core::{DeviceId, FileLine, Kind, Placement, Review, VaultId, Written};
+use pinkvault_core::file::ChunkId;
+use pinkvault_core::membership::Scope;
+use pinkvault_core::{DeviceId, FileLine, Kind, Placement, Review, VaultId, Written};
 use zeroize::Zeroizing;
 
 /// The longest message, type and body: a folder of large values still fits.
@@ -38,13 +38,13 @@ pub enum Request {
     List {
         collection: String,
     },
-    /// The current values under `folder/`, for `latem-vault run`.
+    /// The current values under `folder/`, for `pinkvault run`.
     Folder {
         collection: String,
         folder: String,
     },
     Devices,
-    /// Something wrote to the vault without the service, such as `latem-vault approve`: the
+    /// Something wrote to the vault without the service, such as `pinkvault approve`: the
     /// service reloads what it keeps and tells the other devices.
     Changed,
     /// What a device can read and wrote last, before revoking it.
@@ -156,7 +156,7 @@ pub enum Response {
         carried: u32,
     },
     Status {
-        /// The service's version, as `latem-vault --version` prints it.
+        /// The service's version, as `pinkvault --version` prints it.
         version: String,
         pid: u32,
         /// How many times mDNS has stopped since the service started.

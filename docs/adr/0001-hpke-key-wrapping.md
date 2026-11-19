@@ -16,6 +16,6 @@ Use HPKE in base mode: DHKEM(P-256) or DHKEM(X25519), HKDF-SHA256 and ChaCha20-P
 
 - One standard covers both curves. A device's keystore decides the curve, and the format records it in the `kem_id` prefix.
 - Hardware keys work without a helper process. The Secure Enclave computes only the ECDH, and the crate does the rest of RFC 9180. That code decrypts RFC 9180 test vector A.5.1 and matches the `hpke` crate.
-- age would have needed `age-plugin-se` for Secure Enclave keys, and a plugin protocol between OpenVault and a separate binary. It has no native P-256 recipient.
+- age would have needed `age-plugin-se` for Secure Enclave keys, and a plugin protocol between PinkVault and a separate binary. It has no native P-256 recipient.
 - Wrapped keys aren't age files, so the `age` command can't open them. That was never a goal.
 - Post-quantum wrapping remains open ([crypto.md](../spec/crypto.md#open-questions)). The `hpke` crate supports hybrid KEMs, and the `kem_id` prefix leaves room to add one.

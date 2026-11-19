@@ -2016,145 +2016,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "latem-vault-cli"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "clap",
- "latem-vault-core",
- "latem-vault-crypto",
- "latem-vault-grandfather",
- "latem-vault-keystore",
- "latem-vault-net",
- "latem-vault-service",
- "libc",
- "rpassword",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zeroize",
-]
-
-[[package]]
-name = "latem-vault-core"
-version = "0.6.0"
-dependencies = [
- "hex",
- "latem-vault-crypto",
- "rusqlite",
- "tempfile",
- "thiserror 2.0.21",
- "zeroize",
-]
-
-[[package]]
-name = "latem-vault-crypto"
-version = "0.6.0"
-dependencies = [
- "argon2",
- "bip39",
- "blake3",
- "chacha20poly1305",
- "ed25519-dalek",
- "getrandom 0.4.3",
- "hex",
- "hkdf",
- "hpke",
- "p256",
- "sha2",
- "spake2",
- "subtle",
- "thiserror 2.0.21",
- "zeroize",
-]
-
-[[package]]
-name = "latem-vault-ffi"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "latem-vault-core",
- "latem-vault-crypto",
- "latem-vault-keystore",
- "latem-vault-service",
- "thiserror 2.0.21",
- "tokio",
- "uniffi",
- "zeroize",
-]
-
-[[package]]
-name = "latem-vault-grandfather"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "iroh",
- "iroh-relay",
- "latem-vault-core",
- "latem-vault-crypto",
- "latem-vault-net",
- "n0-future",
- "rcgen",
- "rusqlite",
- "rustls",
- "tempfile",
- "tokio",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "latem-vault-keystore"
-version = "0.6.0"
-dependencies = [
- "core-foundation",
- "latem-vault-core",
- "latem-vault-crypto",
- "objc2",
- "objc2-foundation",
- "objc2-local-authentication",
- "security-framework",
- "security-framework-sys",
- "tempfile",
- "thiserror 2.0.21",
- "zeroize",
-]
-
-[[package]]
-name = "latem-vault-net"
-version = "0.6.0"
-dependencies = [
- "iroh",
- "iroh-mdns-address-lookup",
- "latem-vault-core",
- "latem-vault-crypto",
- "n0-future",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "latem-vault-service"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "latem-vault-core",
- "latem-vault-crypto",
- "latem-vault-keystore",
- "latem-vault-net",
- "libc",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "zeroize",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2952,6 +2813,145 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pinkvault-cli"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "pinkvault-core",
+ "pinkvault-crypto",
+ "pinkvault-grandfather",
+ "pinkvault-keystore",
+ "pinkvault-net",
+ "pinkvault-service",
+ "rpassword",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "pinkvault-core"
+version = "0.7.0"
+dependencies = [
+ "hex",
+ "pinkvault-crypto",
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "pinkvault-crypto"
+version = "0.7.0"
+dependencies = [
+ "argon2",
+ "bip39",
+ "blake3",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "hex",
+ "hkdf",
+ "hpke",
+ "p256",
+ "sha2",
+ "spake2",
+ "subtle",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "pinkvault-ffi"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "pinkvault-core",
+ "pinkvault-crypto",
+ "pinkvault-keystore",
+ "pinkvault-service",
+ "thiserror 2.0.21",
+ "tokio",
+ "uniffi",
+ "zeroize",
+]
+
+[[package]]
+name = "pinkvault-grandfather"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "iroh-relay",
+ "n0-future",
+ "pinkvault-core",
+ "pinkvault-crypto",
+ "pinkvault-net",
+ "rcgen",
+ "rusqlite",
+ "rustls",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "pinkvault-keystore"
+version = "0.7.0"
+dependencies = [
+ "core-foundation",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "pinkvault-core",
+ "pinkvault-crypto",
+ "security-framework",
+ "security-framework-sys",
+ "tempfile",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "pinkvault-net"
+version = "0.7.0"
+dependencies = [
+ "iroh",
+ "iroh-mdns-address-lookup",
+ "n0-future",
+ "pinkvault-core",
+ "pinkvault-crypto",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "pinkvault-service"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "pinkvault-core",
+ "pinkvault-crypto",
+ "pinkvault-keystore",
+ "pinkvault-net",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
 
 [[package]]
 name = "pkcs8"

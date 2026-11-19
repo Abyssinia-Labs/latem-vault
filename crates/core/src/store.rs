@@ -14,10 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use latem_vault_crypto::hash::{Hash, contexts, derive_key, keyed_hash};
-use latem_vault_crypto::{
-    RecoveryKey, SigningKey, SymmetricKey, VerifyingKey, WrapKey, WrappedKey,
-};
+use pinkvault_crypto::hash::{Hash, contexts, derive_key, keyed_hash};
+use pinkvault_crypto::{RecoveryKey, SigningKey, SymmetricKey, VerifyingKey, WrapKey, WrappedKey};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
@@ -1138,7 +1136,7 @@ fn connect(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "foreign_keys", true)?;
     // Overwrite deleted content instead of leaving it in free pages.
     conn.pragma_update(None, "secure_delete", true)?;
-    // Several `latem-vault run` processes may read while another writes.
+    // Several `pinkvault run` processes may read while another writes.
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
 }
@@ -1686,7 +1684,7 @@ fn entry_label_aad(collection: CollectionId, tag: &Hash) -> Vec<u8> {
 mod tests {
     use std::path::PathBuf;
 
-    use latem_vault_crypto::RecoveryKey;
+    use pinkvault_crypto::RecoveryKey;
 
     use super::*;
     use crate::SoftwareKeys;
@@ -1999,7 +1997,7 @@ mod tests {
     /// store (README, versions). Change both together.
     #[test]
     fn the_build_version_follows_the_store_version() {
-        assert_eq!((env!("CARGO_PKG_VERSION_MINOR"), SCHEMA_VERSION), ("6", 7));
+        assert_eq!((env!("CARGO_PKG_VERSION_MINOR"), SCHEMA_VERSION), ("7", 7));
     }
 
     #[test]
@@ -2077,7 +2075,7 @@ mod tests {
         let path = s.path.with_file_name(file);
         let head = admin.membership().unwrap().head();
         let keys = SoftwareKeys::from_parts(
-            latem_vault_crypto::UnwrapKey::from_secret_bytes(
+            pinkvault_crypto::UnwrapKey::from_secret_bytes(
                 &joiner_keys.parts().0.to_secret_bytes(),
             )
             .unwrap(),

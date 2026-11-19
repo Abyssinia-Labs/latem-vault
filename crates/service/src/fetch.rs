@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use latem_vault_core::file::{ChunkId, Content, Manifest};
-use latem_vault_core::membership::Scope;
-use latem_vault_core::{CollectionId, DeviceId, Kind, Placement, Vault};
-use latem_vault_keystore::Keys;
-use latem_vault_net::chunks::{self, MAX_WANT};
-use latem_vault_net::{EndpointAddr, EndpointId, EndpointKey, Node, RelayUrl};
+use pinkvault_core::file::{ChunkId, Content, Manifest};
+use pinkvault_core::membership::Scope;
+use pinkvault_core::{CollectionId, DeviceId, Kind, Placement, Vault};
+use pinkvault_keystore::Keys;
+use pinkvault_net::chunks::{self, MAX_WANT};
+use pinkvault_net::{EndpointAddr, EndpointId, EndpointKey, Node, RelayUrl};
 use tokio::sync::broadcast;
 use tokio::task::block_in_place;
 use tokio::time::timeout;

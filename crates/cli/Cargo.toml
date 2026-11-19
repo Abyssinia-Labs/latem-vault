@@ -1,6 +1,6 @@
 [package]
-name = "latem-vault-cli"
-description = "The latem-vault command."
+name = "pinkvault-cli"
+description = "The pinkvault command."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,18 +8,18 @@ repository.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "latem-vault"
+name = "pinkvault"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-latem-vault-core = { path = "../core" }
-latem-vault-crypto = { path = "../crypto" }
-latem-vault-grandfather = { path = "../grandfather", optional = true }
-latem-vault-keystore = { path = "../keystore" }
-latem-vault-net = { path = "../net" }
-latem-vault-service = { path = "../service" }
+pinkvault-core = { path = "../core" }
+pinkvault-crypto = { path = "../crypto" }
+pinkvault-grandfather = { path = "../grandfather", optional = true }
+pinkvault-keystore = { path = "../keystore" }
+pinkvault-net = { path = "../net" }
+pinkvault-service = { path = "../service" }
 rpassword = "7.5.4"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
@@ -27,9 +27,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1.9"
 
 [features]
-# `latem-vault grandfather` and `latem-vault coordinator`, for reaching the vault's devices away from
+# `pinkvault grandfather` and `pinkvault coordinator`, for reaching the vault's devices away from
 # home (coordinator.md). Off by default: devices find each other on the local network only.
-coordinator = ["dep:latem-vault-grandfather", "latem-vault-service/coordinator"]
+coordinator = ["dep:pinkvault-grandfather", "pinkvault-service/coordinator"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

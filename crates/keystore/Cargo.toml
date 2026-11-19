@@ -1,6 +1,6 @@
 [package]
-name = "latem-vault-keystore"
-description = "Where a latem vault device keeps its keys: a key file, or the Secure Enclave."
+name = "pinkvault-keystore"
+description = "Where a PinkVault device keeps its keys: a key file, or the Secure Enclave."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-latem-vault-core = { path = "../core" }
-latem-vault-crypto = { path = "../crypto" }
+pinkvault-core = { path = "../core" }
+pinkvault-crypto = { path = "../crypto" }
 thiserror = "2"
 zeroize = "1.9"
 

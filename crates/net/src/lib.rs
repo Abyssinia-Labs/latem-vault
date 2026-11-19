@@ -2,7 +2,7 @@
 //!
 //! The endpoint uses no DNS or pkarr publishing and no port mapping, and no relay unless the
 //! device has a coordinator configured, whose grandfather's relay is then the only one it uses
-//! (coordinator.md). It finds other latem vault endpoints with mDNS under its own service name;
+//! (coordinator.md). It finds other PinkVault endpoints with mDNS under its own service name;
 //! which of them are members is for the membership log to say. When mDNS stops, the node starts
 //! it again ([`discovery_watch`]).
 
@@ -35,22 +35,28 @@ use tracing::{info, warn};
 pub use watch::{discovery_stops, discovery_watch};
 
 /// The mDNS service name: endpoints appear as `<endpoint id>._<MDNS_SERVICE>._udp.local.`. Frozen
-/// in [`latem_vault_crypto::frozen`]: it never changes, whatever the product is called.
-pub const MDNS_SERVICE: &str = latem_vault_crypto::frozen::MDNS_SERVICE;
+/// in [`pinkvault_crypto::frozen`]: it never changes, whatever the product is called.
+pub const MDNS_SERVICE: &str = pinkvault_crypto::frozen::MDNS_SERVICE;
 
 /// Names another mDNS service for this process's endpoints, so that they find only endpoints
 /// started with the same name. Tests set it, so their devices never meet the real ones on the
 /// network, nor a real app see their joiners (service.md, finding devices).
-pub const MDNS_SERVICE_VAR: &str = "LATEM_VAULT_MDNS_SERVICE";
-/// [`MDNS_SERVICE_VAR`] before 0.6, still read for one release.
-pub const OLD_MDNS_SERVICE_VAR: &str = "OPENVAULT_MDNS_SERVICE";
+pub const MDNS_SERVICE_VAR: &str = "PINKVAULT_MDNS_SERVICE";
+/// [`MDNS_SERVICE_VAR`]'s earlier names, newest first: 0.6's, then openvault's. Still read for
+/// one release.
+pub const OLD_MDNS_SERVICE_VARS: [&str; 2] = ["LATEM_VAULT_MDNS_SERVICE", "OPENVAULT_MDNS_SERVICE"];
 
-/// The mDNS service name endpoints use: [`MDNS_SERVICE_VAR`]'s, if it's set, else
-/// [`OLD_MDNS_SERVICE_VAR`]'s, else [`MDNS_SERVICE`].
+/// The mDNS service name endpoints use: [`MDNS_SERVICE_VAR`]'s, if it's set, else the first of
+/// [`OLD_MDNS_SERVICE_VARS`] that is, else [`MDNS_SERVICE`].
 pub fn mdns_service() -> String {
-    std::env::var(MDNS_SERVICE_VAR)
-        .or_else(|_| std::env::var(OLD_MDNS_SERVICE_VAR))
-        .ok()
+    mdns_service_from(|name| std::env::var(name).ok())
+}
+
+/// [`mdns_service`], with `var` for the environment.
+fn mdns_service_from(var: impl Fn(&str) -> Option<String>) -> String {
+    std::iter::once(MDNS_SERVICE_VAR)
+        .chain(OLD_MDNS_SERVICE_VARS)
+        .find_map(var)
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| MDNS_SERVICE.to_owned())
 }
@@ -78,7 +84,7 @@ const RESTART_SETTLED: Duration = Duration::from_secs(10 * 60);
 /// An endpoint id: the Ed25519 public key of a device's transport key.
 pub type EndpointKey = [u8; 32];
 
-/// A change in which latem vault endpoints mDNS can see.
+/// A change in which PinkVault endpoints mDNS can see.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     Visible(EndpointKey),
@@ -216,7 +222,7 @@ impl Node {
         *self.endpoint.id().as_bytes()
     }
 
-    /// The latem vault endpoints mDNS can see now, members or not.
+    /// The PinkVault endpoints mDNS can see now, members or not.
     pub fn visible(&self) -> BTreeSet<EndpointKey> {
         self.visible
             .lock()
@@ -493,6 +499,34 @@ mod tests {
         for node in [a, stranger, c, d] {
             node.close().await;
         }
+    }
+
+    #[test]
+    fn the_old_mdns_variables_are_still_read() {
+        let with = |vars: &'static [(&'static str, &'static str)]| {
+            mdns_service_from(|name| {
+                vars.iter()
+                    .find(|(var, _)| *var == name)
+                    .map(|(_, value)| (*value).to_owned())
+            })
+        };
+        assert_eq!(with(&[]), MDNS_SERVICE);
+        assert_eq!(with(&[("OPENVAULT_MDNS_SERVICE", "ov")]), "ov");
+        assert_eq!(
+            with(&[
+                ("OPENVAULT_MDNS_SERVICE", "ov"),
+                ("LATEM_VAULT_MDNS_SERVICE", "lv")
+            ]),
+            "lv"
+        );
+        assert_eq!(
+            with(&[
+                ("OPENVAULT_MDNS_SERVICE", "ov"),
+                ("LATEM_VAULT_MDNS_SERVICE", "lv"),
+                ("PINKVAULT_MDNS_SERVICE", "pv")
+            ]),
+            "pv"
+        );
     }
 
     #[test]

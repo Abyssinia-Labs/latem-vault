@@ -4,8 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use latem_vault_crypto::SymmetricKey;
-use latem_vault_crypto::hash::Hash;
+use pinkvault_crypto::SymmetricKey;
+use pinkvault_crypto::hash::Hash;
 use rusqlite::{Transaction, params};
 
 use super::sync::counts;

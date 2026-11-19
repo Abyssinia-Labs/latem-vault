@@ -1,4 +1,4 @@
-# OpenVault design
+# PinkVault design
 
 Status: draft, 2026-11-04
 Repos: `Abyssinia-Labs/openvault` (public), `Abyssinia-Labs/openvault-apple` and `Abyssinia-Labs/openvault-cloud` (private)
@@ -7,7 +7,7 @@ Repos: `Abyssinia-Labs/openvault` (public), `Abyssinia-Labs/openvault-apple` and
 
 Secrets, variables and private files stay on the machine they were created on. Moving latem-cloud's Android build to the desktop failed because the desktop had none of the variables, secrets or signing files, and there was no safe way to bring them over from machines on the same network. Moving to a new laptop runs into the same problem. Password managers aren't built for environment variables or files, and the hosted alternatives either cost money or ask you to trust a third party with the data.
 
-OpenVault keeps secrets, variables and files encrypted on your own devices. A device you enroll gets exactly the collections it is scoped to. Your devices reach each other on the LAN and over the internet, and nothing you own is stored on a server.
+PinkVault keeps secrets, variables and files encrypted on your own devices. A device you enroll gets exactly the collections it is scoped to. Your devices reach each other on the LAN and over the internet, and nothing you own is stored on a server.
 
 ## 2. Goals and non-goals
 
@@ -31,7 +31,7 @@ Not in v1:
 
 | Term | Meaning |
 | --- | --- |
-| Vault | Everything one person keeps in OpenVault: one membership log and its collections. |
+| Vault | Everything one person keeps in PinkVault: one membership log and its collections. |
 | Collection | The unit of scope and encryption, such as `latem-cloud`, `ssh` or `documents`. Has its own key. |
 | Entry | A secret, a variable or a file inside a collection. |
 | Device | One OS install with its own keys. A dual-boot desktop is two devices. |
@@ -66,7 +66,7 @@ Not in v1:
 
 ### Known limits
 
-- A compromised device reads what it is scoped to while it is compromised. Revoking it stops future access but can't take back what was read, so OpenVault lists the secrets to rotate at their providers.
+- A compromised device reads what it is scoped to while it is compromised. Revoking it stops future access but can't take back what was read, so PinkVault lists the secrets to rotate at their providers.
 - While an app has a file open, the file is plaintext in that app's memory, and often in its autosave or temp files.
 - WSL can't reach a TPM or Windows Hello, so its keys are files. Scope it narrowly.
 - An attacker controlling the MacBook can try to get a malicious change signed the next time you press Touch ID. Admin prompts show exactly what is being signed; an unexpected prompt is an incident.
@@ -97,10 +97,10 @@ Control messages (joins, approvals, the device directory, the membership log) go
 
 On each device:
 
-- **Service** (`openvault service`) owns the encrypted store, the keys and sync. It exposes a local API on a Unix socket (a named pipe on Windows) and serves the web UI on `localhost`.
-- **CLI** (`openvault`) is a client of the service.
+- **Service** (`pinkvault service`) owns the encrypted store, the keys and sync. It exposes a local API on a Unix socket (a named pipe on Windows) and serves the web UI on `localhost`.
+- **CLI** (`pinkvault`) is a client of the service.
 - **Apps.** The macOS app bundles the service as a LaunchAgent. The iOS app runs the core in-process, because iOS won't keep a background service running.
-- **Grandfather** (`openvault grandfather`) runs the coordinator, the relay and `hold` storage. It is designed to run in Docker.
+- **Grandfather** (`pinkvault grandfather`) runs the coordinator, the relay and `hold` storage. It is designed to run in Docker.
 
 ## 6. Data model
 
@@ -159,12 +159,12 @@ The coordinator distributes the log, and devices also exchange it directly, so a
 1. An admin signs `revoke_device`. Every device that sees it stops serving and accepting connections from the revoked device.
 2. Each collection the device could read moves to a new key epoch, and new writes use the new key.
 3. Versions the revoked device signed under old epochs stop counting, so nothing it signs with its old keys can become current. The remaining writers rewrite the entries it had last written, so its real changes are kept ([sync.md](spec/sync.md#revoking-and-reducing-scopes)). Nothing else is re-encrypted, since the device has already read it; file chunks are re-encrypted only on request (see §19).
-4. OpenVault lists every secret and file the revoked device could read, so you can rotate the secrets at their providers and replace any file that holds a key.
+4. PinkVault lists every secret and file the revoked device could read, so you can rotate the secrets at their providers and replace any file that holds a key.
 
 ## 8. Joining
 
-1. On the new device, `openvault join` (or the app) creates its keys, in hardware where available, and shows a 6-digit code.
-2. On the MacBook, a notification or `openvault approve` asks for the code. The two devices run the PAKE through the coordinator's mailbox, or directly on the LAN when there is no coordinator. Inside the channel the PAKE authenticates, the new device sends its public keys and the MacBook sends the vault's genesis hash, so a coordinator can't substitute either one.
+1. On the new device, `pinkvault join` (or the app) creates its keys, in hardware where available, and shows a 6-digit code.
+2. On the MacBook, a notification or `pinkvault approve` asks for the code. The two devices run the PAKE through the coordinator's mailbox, or directly on the LAN when there is no coordinator. Inside the channel the PAKE authenticates, the new device sends its public keys and the MacBook sends the vault's genesis hash, so a coordinator can't substitute either one.
 3. The MacBook shows the device's name, platform and proposed scopes. After Touch ID, it signs `add_device` and the scope entries and wraps the keys for the device's collections.
 4. The new device verifies the log from genesis, receives its wrapped keys through the mailbox, and pulls its data from other devices over iroh.
 
@@ -225,10 +225,10 @@ For the current machines:
 ## 13. Files
 
 - Files are always encrypted at rest. There is no plaintext mirror mode.
-- **Import:** `openvault import <folder> --collection <name>` encrypts a folder into the store. It requires full-disk encryption on the importing device (FileVault, LUKS or BitLocker), because the original plaintext may survive on the SSD after deletion.
+- **Import:** `pinkvault import <folder> --collection <name>` encrypts a folder into the store. It requires full-disk encryption on the importing device (FileVault, LUKS or BitLocker), because the original plaintext may survive on the SSD after deletion.
 - **Open:**
-  - `openvault open <collection>/<path>` decrypts the file to a private temporary location and opens it in its app. It re-encrypts on each save and deletes the temporary copy when you end it with Enter, since an app closing a document can't be seen.
-  - `openvault get` writes a file to stdout or to a path you name.
+  - `pinkvault open <collection>/<path>` decrypts the file to a private temporary location and opens it in its app. It re-encrypts on each save and deletes the temporary copy when you end it with Enter, since an app closing a document can't be seen.
+  - `pinkvault get` writes a file to stdout or to a path you name.
   - Apple platforms use File Provider; Linux gets a FUSE mount later.
 - **Placement:** keep a copy, or fetch on demand from the nearest holder.
 - The formats, sync and commands are in [files.md](spec/files.md). Its first stage, files on one device, was built in 0.4.0.
@@ -237,25 +237,25 @@ For the current machines:
 ## 14. Interfaces
 
 ```
-openvault init                                  create a vault; this device becomes admin; shows the recovery key
-openvault join                                  on a new device: create keys, show a code
-openvault approve                               on an admin: enter the code, review, Touch ID
-openvault devices [revoke <device>]
-openvault scope <device> <collection> none|hold|read|write
-openvault collections [create <name>]
-openvault set <collection>/<name> --secret|--var    value read from stdin
-openvault get <collection>/<name> [-o <path>]   a value, or a file's bytes
-openvault list <collection>[/<folder>]          names and kinds, and files' sizes, never values
-openvault delete <collection>/<name>
-openvault run --collection <c> --env <e> [--prefix <p>] -- <command>   variables and secrets as env; files as temporary paths
-openvault import-env <file> --collection <c> --env <e> [--var <name>]...   a NAME=value file, such as latem's secrets.env
-openvault import <path> --collection <c> [--into <folder>]   a file, or a folder's files
-openvault placement <collection> [keep|on-demand]   which of a collection's file chunks this device keeps
-openvault open <collection>/<path>
-openvault keys [passphrase [--remove]]          how this device's keys are kept; give a key file a passphrase, change it or remove it
-openvault service [install|uninstall|status]    run the service, or have the system start it at login
-openvault grandfather --hostname <name> [--vault <id>]   on the always-on machine: the relay and coordinator *
-openvault coordinator [set <address>|unset]     use a grandfather, to reach the vault's devices away from home *
+pinkvault init                                  create a vault; this device becomes admin; shows the recovery key
+pinkvault join                                  on a new device: create keys, show a code
+pinkvault approve                               on an admin: enter the code, review, Touch ID
+pinkvault devices [revoke <device>]
+pinkvault scope <device> <collection> none|hold|read|write
+pinkvault collections [create <name>]
+pinkvault set <collection>/<name> --secret|--var    value read from stdin
+pinkvault get <collection>/<name> [-o <path>]   a value, or a file's bytes
+pinkvault list <collection>[/<folder>]          names and kinds, and files' sizes, never values
+pinkvault delete <collection>/<name>
+pinkvault run --collection <c> --env <e> [--prefix <p>] -- <command>   variables and secrets as env; files as temporary paths
+pinkvault import-env <file> --collection <c> --env <e> [--var <name>]...   a NAME=value file, such as latem's secrets.env
+pinkvault import <path> --collection <c> [--into <folder>]   a file, or a folder's files
+pinkvault placement <collection> [keep|on-demand]   which of a collection's file chunks this device keeps
+pinkvault open <collection>/<path>
+pinkvault keys [passphrase [--remove]]          how this device's keys are kept; give a key file a passphrase, change it or remove it
+pinkvault service [install|uninstall|status]    run the service, or have the system start it at login
+pinkvault grandfather --hostname <name> [--vault <id>]   on the always-on machine: the relay and coordinator *
+pinkvault coordinator [set <address>|unset]     use a grandfather, to reach the vault's devices away from home *
 ```
 
 \* Only in builds with the cargo feature `coordinator`, which is off by default ([coordinator.md](spec/coordinator.md)).
@@ -266,25 +266,25 @@ The local API runs on a Unix socket or named pipe for the CLI and apps, and on `
 
 To confirm with the latem session.
 
-- latem adds an `openvault` secret store next to `keychain` and `file`.
+- latem adds a `pinkvault` secret store next to `keychain` and `file`.
 - **Mapping:**
   - One collection per repo.
   - Entries named `<env>/<NAME>`, of kind `var` or `secret`.
   - Files (signing keystores, `google-services.json`, service-account JSON) are written to a temporary path for the length of the job, exposed through an environment variable, and deleted afterward.
-- **Variables come from OpenVault,** so every machine sees the same values and amendment A68's mismatches disappear.
+- **Variables come from PinkVault,** so every machine sees the same values and amendment A68's mismatches disappear.
 - **latem-cloud keeps INV-2.** It still sees only names, and can show "machine X lacks collection Y" by name.
-- **Onboarding.** latem's first-run "copy from which machine?" becomes `openvault join` plus scope approval.
+- **Onboarding.** latem's first-run "copy from which machine?" becomes `pinkvault join` plus scope approval.
 - **Before M2,** `latem secrets copy --to HOST` was the stopgap.
-- **From M1,** latem can take its secrets from OpenVault without a new store. Bring them in with `openvault import-env ~/.latem/secrets.env --collection latem --env <e>`, then start latem with `openvault run --collection latem --env <e> --prefix LATEM_SECRET_ -- latem …`. latem's environment provider reads `LATEM_SECRET_<NAME>` before its other stores.
+- **From M1,** latem can take its secrets from PinkVault without a new store. Bring them in with `pinkvault import-env ~/.latem/secrets.env --collection latem --env <e>`, then start latem with `pinkvault run --collection latem --env <e> --prefix LATEM_SECRET_ -- latem …`. latem's environment provider reads `LATEM_SECRET_<NAME>` before its other stores.
 
 ## 16. Repositories and stack
 
 Three repos under Abyssinia-Labs.
 
-### `openvault` (public, Apache-2.0 OR MIT)
+### `pinkvault` (public, Apache-2.0 OR MIT)
 
 ```
-openvault/
+pinkvault/
   Cargo.toml                 Rust workspace
   crates/
     crypto/                  encryption, signatures, PAKE; audited libraries only
@@ -294,7 +294,7 @@ openvault/
     service/                 background service: local API, serves the web UI
     coordinator/             mailbox, directory, log copy, push relay; single- and multi-tenant
     ffi/                     UniFFI bindings (Swift now, Kotlin later)
-    cli/                     the `openvault` binary: CLI, `service`, `grandfather`
+    cli/                     the `pinkvault` binary: CLI, `service`, `grandfather`
   web/                       local web UI: TanStack Router SPA, Tailwind 4, shadcn on Base UI, Biome
   docker/                    one image with grandfather and device modes; compose example
   tests/                     several devices, a coordinator and a relay in one process
@@ -311,7 +311,7 @@ openvault/
 ```
 openvault-apple/
   project.yml                XcodeGen spec; no hand-edited .pbxproj
-  Packages/OpenVaultKit/     binaryTarget pinned to an openvault release (XCFramework + checksum),
+  Packages/PinkVaultKit/     binaryTarget pinned to a pinkvault release (XCFramework + checksum),
                              the UniFFI Swift bindings for that release, models, shared SwiftUI views
   macOS/
     App/
@@ -324,7 +324,7 @@ openvault-apple/
   .github/workflows/         TestFlight, notarization
 ```
 
-- `OpenVaultKit` gives both apps one Swift API, backed by the bundled service on macOS and by the in-process core on iOS.
+- `PinkVaultKit` gives both apps one Swift API, backed by the bundled service on macOS and by the in-process core on iOS.
 - The Mac app ships directly, signed with Developer ID and notarized. iOS ships through TestFlight and the App Store.
 
 ### `openvault-cloud` (private, from `start-convex-template`)
@@ -334,7 +334,7 @@ openvault-cloud/
   packages/web/
     src/routes/              marketing, passkey sign-in, dashboard (devices, plan, relays), billing
     convex/                  accounts, subscriptions, plan limits, enrollment tokens
-  infra/fleet/               hosted coordinator and relay regions, pinned to an openvault release
+  infra/fleet/               hosted coordinator and relay regions, pinned to a pinkvault release
   docs/                      PRD, ADRs, runbook
   .github/workflows/         the template's checks and deploys, plus fleet deploys
 ```
@@ -349,7 +349,7 @@ Changes from the template:
 
 ### Releases
 
-1. Tag a release of `openvault`.
+1. Tag a release of `pinkvault`.
 2. CI publishes the binaries (macOS, Linux and Windows), the Docker image to GHCR, and the XCFramework with its Swift bindings as release assets.
 3. `openvault-apple` and `openvault-cloud` each update their pin in a PR.
 
@@ -373,7 +373,7 @@ The hosted product's plans and running costs are documented in `openvault-cloud`
 | Milestone | Delivers | Done when |
 | --- | --- | --- |
 | M0 Spec | Threat model, protocol spec, ADRs for §19 | Crypto and wire formats are written down |
-| M1 One device | Store, collections, secrets and variables, CLI, `openvault run`, Secure Enclave and file keystores | `~/.latem/secrets.env` can be replaced on the MacBook |
+| M1 One device | Store, collections, secrets and variables, CLI, `pinkvault run`, Secure Enclave and file keystores | `~/.latem/secrets.env` can be replaced on the MacBook |
 | M2 LAN | PAKE join without a coordinator, membership log, admin Touch ID, recovery key, peer sync over iroh, latem store | The Android build runs on the desktop with secrets from the MacBook |
 | M3 Grandfather | Coordinator, relay, `hold` storage, Docker image | The MacBook reaches the mini from outside the house |
 | M4 Files | Chunked encrypted files, import, `open` and `get`, on-demand fetch, local web UI | A signing keystore and a documents folder sync and open on every device |
@@ -383,15 +383,15 @@ The hosted product's plans and running costs are documented in `openvault-cloud`
 Later: native Windows, Android, a Linux FUSE mount, a hardware security key for recovery, and an external security audit before the hosted launch.
 
 **Progress.**
-- **M1 was done on 2026-11-07.** The MacBook's vault took latem's secrets from the mini, streamed over ssh into `openvault import-env -`, because latem's `secrets.env` files are on the mini and the desktop, not the MacBook. The membership log, admin Touch ID and recovery key from M2 were built during M1.
+- **M1 was done on 2026-11-07.** The MacBook's vault took latem's secrets from the mini, streamed over ssh into `pinkvault import-env -`, because latem's `secrets.env` files are on the mini and the desktop, not the MacBook. The membership log, admin Touch ID and recovery key from M2 were built during M1.
 - **M2 was done on 2026-11-09.**
   - On 2026-11-08 the desktop joined the MacBook's vault with a 6-digit code and synced latem's secrets over the LAN. Revoking a device followed the same day.
-  - latem reads a repository's secrets from OpenVault first since latem#60 (its A86). The secrets moved from the one `latem` collection to one collection per repository (§15).
+  - latem reads a repository's secrets from PinkVault first since latem#60 (its A86). The secrets moved from the one `latem` collection to one collection per repository (§15).
   - tsedal's Android preview build ran on the desktop, signed with the vault's keystore, and uploaded to Play. The mini joined too, and its iOS build signed and uploaded to TestFlight the same way.
-  - Each machine runs `openvault service` from a LaunchAgent or a systemd user unit, written by hand for now.
-- **M3 is under way** ([coordinator.md](spec/coordinator.md)). Stage 1, `openvault grandfather` with its relay and the coordinator's log copy, and `openvault coordinator set` on devices, was built on 2026-11-10. The same day it ran on the Mac mini as `grandfather.latem.dev`, with a Let's Encrypt certificate, and the MacBook, the desktop and the mini used it; the MacBook reached the coordinator and the relay from a phone's connection. Its idle traffic came out at about 2.5 KB a second per device, from iroh's keep-alives and holepunching on an open coordinator connection and from QUIC address discovery. Devices now exchange with the coordinator only when there is something to exchange and every 15 minutes, and the relay has no address discovery, which brought it to about 75 bytes a second ([coordinator.md, cost](spec/coordinator.md#cost)). M3 was then paused, to work on the local network first: since 0.3.2 the coordinator is built only with the cargo feature `coordinator`, which is off by default.
-- **M5 has started, with the Mac app** (SwiftUI, from the "OpenVault screens" canvas, direction D), ahead of M4's files. Stage 1 was built on 2026-11-10 in 0.3.3: the local API an app needs ([service.md, for apps](spec/service.md#for-apps)): summaries, entry details, the log, several scope changes under one Touch ID, a watch that pushes events, and joins run by the service, which `openvault approve` now uses too. Also the Swift bindings in `crates/ffi`, tested from Swift against a service by `scripts/swift-bindings.sh`. Stage 2 was built on 2026-11-11 in `openvault-apple`: the app's shell, its LaunchAgent for the bundled service, and, in 0.3.4, `openvault service --log` and `deviceHome` for it ([service.md, the Mac app](spec/service.md#starting-at-login)). The MacBook runs the service from the app since then. Stage 3 followed the same day: a collection's entries by folder, Touch ID to show or copy a secret, adding, changing and deleting entries, new collections, `.env` import, ⌘K and the whole log. For the import, 0.3.5 moved `import-env`'s parser into `openvault-core` and gave the app `parseEnv`, so both read a file the same way. Stage 4 followed: approving a device that asks to join, from Devices or a notification, scopes, revoking with the secrets to change afterwards, and a first run that makes a vault or joins one. For that, 0.3.6 moved what `init` and `join` do into `openvault-service` (`setup`), so the bindings make and join vaults without a service (`createVault`, `joinVault`; [service.md, without the service](spec/service.md#for-apps)). Next: files (M4).
-- **M4 was done on 2026-11-12** ([files.md](spec/files.md)). Stage 1 was built on 2026-11-11 in 0.4.0, store version 7: files on one device. A file is an entry of kind `0x03` whose value is its manifest; a file of up to 64 KiB is kept in it, and a larger one in 1 MiB chunks sealed with a nonce from their plaintext, so equal chunks are kept once. `import`, `get -o`, `list` with sizes, `run` with files as temporary paths, and `placement`. Chunks no current version names are deleted 30 days later. Stage 2 followed on 2026-11-12 in 0.5.0: chunks travel over their own protocol, `openvault/chunks/1`, from devices that read the collection. A kept collection gets a new file's chunks once the session that brought its record catches up, and `get` and `run` fetch what a file is missing, through a new local API request; an on-demand collection keeps at most 2 GiB. Stage 3 followed the same day in 0.5.1: `openvault open` writes a copy to a private directory, opens it in its app, and writes each save as a new version once it has settled, then deletes the copy. Stage 4 followed the same day in 0.5.2: the Mac app lists files, opens them in their apps with each save a version, saves copies, imports files and folders dropped on a collection, and sets placement ([files.md, the Mac app](spec/files.md#the-mac-app)); the CLI and the bindings share the file code. Stage 5, the other machines, followed: latem 0.8 gives a build its collection's files as paths (its A88), tsedal and latem-cloud sign their mobile builds from a keystore and keys kept as files, and since 0.5.3 a revoke lists the files the device could read as well as its secrets, in 0.5.4 a folder at a time past 10 files. Then a sample documents folder of six files, 5.9 MiB, went into a new `documents` collection on the MacBook. The desktop, whose root file system isn't on dm-crypt, refused to import. The files reached the desktop and the mini within seconds, and each machine opened one in its app and saved it: TextEdit through the Mac app on the MacBook, Mousepad on the desktop and TextEdit on the mini. Each save reached the other two, and the desktop's save of a 5.7 MiB file sent only its last chunk. The local web UI, planned with M4, wasn't built: it waits with the File Provider and a FUSE mount, which build on the same files ([files.md, not in v1](spec/files.md#not-in-v1)).
+  - Each machine runs `pinkvault service` from a LaunchAgent or a systemd user unit, written by hand for now.
+- **M3 is under way** ([coordinator.md](spec/coordinator.md)). Stage 1, `pinkvault grandfather` with its relay and the coordinator's log copy, and `pinkvault coordinator set` on devices, was built on 2026-11-10. The same day it ran on the Mac mini as `grandfather.latem.dev`, with a Let's Encrypt certificate, and the MacBook, the desktop and the mini used it; the MacBook reached the coordinator and the relay from a phone's connection. Its idle traffic came out at about 2.5 KB a second per device, from iroh's keep-alives and holepunching on an open coordinator connection and from QUIC address discovery. Devices now exchange with the coordinator only when there is something to exchange and every 15 minutes, and the relay has no address discovery, which brought it to about 75 bytes a second ([coordinator.md, cost](spec/coordinator.md#cost)). M3 was then paused, to work on the local network first: since 0.3.2 the coordinator is built only with the cargo feature `coordinator`, which is off by default.
+- **M5 has started, with the Mac app** (SwiftUI, from the "PinkVault screens" canvas, direction D), ahead of M4's files. Stage 1 was built on 2026-11-10 in 0.3.3: the local API an app needs ([service.md, for apps](spec/service.md#for-apps)): summaries, entry details, the log, several scope changes under one Touch ID, a watch that pushes events, and joins run by the service, which `pinkvault approve` now uses too. Also the Swift bindings in `crates/ffi`, tested from Swift against a service by `scripts/swift-bindings.sh`. Stage 2 was built on 2026-11-11 in `openvault-apple`: the app's shell, its LaunchAgent for the bundled service, and, in 0.3.4, `pinkvault service --log` and `deviceHome` for it ([service.md, the Mac app](spec/service.md#starting-at-login)). The MacBook runs the service from the app since then. Stage 3 followed the same day: a collection's entries by folder, Touch ID to show or copy a secret, adding, changing and deleting entries, new collections, `.env` import, ⌘K and the whole log. For the import, 0.3.5 moved `import-env`'s parser into `pinkvault-core` and gave the app `parseEnv`, so both read a file the same way. Stage 4 followed: approving a device that asks to join, from Devices or a notification, scopes, revoking with the secrets to change afterwards, and a first run that makes a vault or joins one. For that, 0.3.6 moved what `init` and `join` do into `pinkvault-service` (`setup`), so the bindings make and join vaults without a service (`createVault`, `joinVault`; [service.md, without the service](spec/service.md#for-apps)). Next: files (M4).
+- **M4 was done on 2026-11-12** ([files.md](spec/files.md)). Stage 1 was built on 2026-11-11 in 0.4.0, store version 7: files on one device. A file is an entry of kind `0x03` whose value is its manifest; a file of up to 64 KiB is kept in it, and a larger one in 1 MiB chunks sealed with a nonce from their plaintext, so equal chunks are kept once. `import`, `get -o`, `list` with sizes, `run` with files as temporary paths, and `placement`. Chunks no current version names are deleted 30 days later. Stage 2 followed on 2026-11-12 in 0.5.0: chunks travel over their own protocol, `openvault/chunks/1`, from devices that read the collection. A kept collection gets a new file's chunks once the session that brought its record catches up, and `get` and `run` fetch what a file is missing, through a new local API request; an on-demand collection keeps at most 2 GiB. Stage 3 followed the same day in 0.5.1: `pinkvault open` writes a copy to a private directory, opens it in its app, and writes each save as a new version once it has settled, then deletes the copy. Stage 4 followed the same day in 0.5.2: the Mac app lists files, opens them in their apps with each save a version, saves copies, imports files and folders dropped on a collection, and sets placement ([files.md, the Mac app](spec/files.md#the-mac-app)); the CLI and the bindings share the file code. Stage 5, the other machines, followed: latem 0.8 gives a build its collection's files as paths (its A88), tsedal and latem-cloud sign their mobile builds from a keystore and keys kept as files, and since 0.5.3 a revoke lists the files the device could read as well as its secrets, in 0.5.4 a folder at a time past 10 files. Then a sample documents folder of six files, 5.9 MiB, went into a new `documents` collection on the MacBook. The desktop, whose root file system isn't on dm-crypt, refused to import. The files reached the desktop and the mini within seconds, and each machine opened one in its app and saved it: TextEdit through the Mac app on the MacBook, Mousepad on the desktop and TextEdit on the mini. Each save reached the other two, and the desktop's save of a 5.7 MiB file sent only its last chunk. The local web UI, planned with M4, wasn't built: it waits with the File Provider and a FUSE mount, which build on the same files ([files.md, not in v1](spec/files.md#not-in-v1)).
 
 ## 19. Open decisions
 
@@ -402,4 +402,4 @@ Later: native Windows, Android, a Linux FUSE mount, a hardware security key for 
    - The remaining writers rewrite only the entries that device wrote last, so its real changes are kept.
    - File chunks are re-encrypted only on request.
 3. **Chunking: fixed size or content-defined.** Content-defined chunking deduplicates better but reveals more about file contents. Decided in [files.md](spec/files.md#chunks): fixed 1 MiB chunks, built in 0.4.0.
-4. **Name.** `openvault` and the `openvault-*` names are free on GitHub (Abyssinia-Labs) and crates.io. Small GitHub projects already use "OpenVault" (one is a password manager and file locker), and it is also the name of a broadband data company. Check the trademark before the hosted launch.
+4. **Name.** PinkVault since 0.7, after OpenVault and then latem vault. On 2026-11-18 `pinkvault` and `pink-vault` were free on crates.io and npm, nothing called pinkvault was in Homebrew, and no password or secrets product used the name. Check the trademark before the hosted launch.

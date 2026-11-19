@@ -1,7 +1,7 @@
-//! latem vault's collections, records, membership log and local store.
+//! PinkVault's collections, records, membership log and local store.
 //!
 //! Formats are specified in `docs/spec/records.md` and `docs/spec/membership.md`. Cryptography comes from
-//! `latem-vault-crypto`; device keys come from whatever implements [`DeviceKeys`].
+//! `pinkvault-crypto`; device keys come from whatever implements [`DeviceKeys`].
 
 pub mod env_file;
 pub mod file;
@@ -29,7 +29,7 @@ pub use store::{
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Crypto(#[from] latem_vault_crypto::Error),
+    Crypto(#[from] pinkvault_crypto::Error),
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("i/o error: {0}")]

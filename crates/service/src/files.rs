@@ -10,8 +10,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use latem_vault_core::Kind;
-use latem_vault_core::file::{CHUNK_SIZE, ChunkId, Content, MAX_INLINE, MAX_SIZE, Manifest};
+use pinkvault_core::Kind;
+use pinkvault_core::file::{CHUNK_SIZE, ChunkId, Content, MAX_INLINE, MAX_SIZE, Manifest};
 use zeroize::Zeroizing;
 
 use crate::api::{ChunkData, Item, Request, Response};
@@ -207,7 +207,7 @@ pub fn write_out(
         .ok_or_else(|| anyhow!("{} isn't a file name", path.display()))?;
     let mut partial = OsString::from(".");
     partial.push(file_name);
-    partial.push(".latem-vault-partial");
+    partial.push(".pinkvault-partial");
     let partial = dir.join(partial);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -274,7 +274,7 @@ pub fn disk_encryption() -> Result<(), String> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        Err("latem vault can't tell whether this disk is encrypted".into())
+        Err("PinkVault can't tell whether this disk is encrypted".into())
     }
 }
 

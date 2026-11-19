@@ -15,12 +15,12 @@ All integers are big-endian.
 ## Commands
 
 ```
-openvault join [--name <name>] [--keys <backend>]       on the new device
-openvault approve [--write|--read|--hold <collection>]...   on an admin device
+pinkvault join [--name <name>] [--keys <backend>]       on the new device
+pinkvault approve [--write|--read|--hold <collection>]...   on an admin device
 ```
 
 **join**
-- Creates the device's keys (keystore.md) and a file `joining` in the openvault directory that holds its device id, so an interrupted join can resume with the same identity. The file goes once the store is written.
+- Creates the device's keys (keystore.md) and a file `joining` in the vault directory that holds its device id, so an interrupted join can resume with the same identity. The file goes once the store is written.
 - Waits up to 10 minutes for an admin, showing the code.
 - Running it again on the same device reuses the keys and the device id, and shows a new code.
 - It runs its own endpoint, with ALPN `openvault/join/1`. There is no vault yet for a service to hold.
@@ -29,8 +29,8 @@ openvault approve [--write|--read|--hold <collection>]...   on an admin device
 **approve**
 - Looks for devices waiting to join on the local network for up to 15 seconds. It picks the device itself if there is only one, and otherwise asks which.
 - Asks for that device's code and shows the device for review.
-- Scopes come from its flags. A device approved without any has none until `openvault scope` sets them.
-- While `openvault service` runs, it asks the service, which checks the code and signs (service.md, for apps). Otherwise it opens the vault itself and runs its own endpoint, which mDNS doesn't announce.
+- Scopes come from its flags. A device approved without any has none until `pinkvault scope` sets them.
+- While `pinkvault service` runs, it asks the service, which checks the code and signs (service.md, for apps). Otherwise it opens the vault itself and runs its own endpoint, which mDNS doesn't announce.
 - A vault without a membership log yet can't approve anyone. Creating a collection starts the log (membership.md, creating a vault).
 
 ## Finding the device
@@ -158,7 +158,7 @@ The joiner accepts the vault only if both of these hold:
 - It writes its store in one transaction: the vault id, the log and its state, and the grants.
 - It sends joined.
 - From then on it is an ordinary device and syncs records with any peer (sync.md).
-- Until its first sync it has no records, so no collection names either: `openvault collections` lists none, while `openvault devices` already lists the vault's devices. Since 0.5.9 `collections` then says how many it may read and what syncing needs (service.md, the CLI), and `join` ends by saying to start the service with `openvault service install`, which on a Mac asks for local network access.
+- Until its first sync it has no records, so no collection names either: `pinkvault collections` lists none, while `pinkvault devices` already lists the vault's devices. Since 0.5.9 `collections` then says how many it may read and what syncing needs (service.md, the CLI), and `join` ends by saying to start the service with `pinkvault service install`, which on a Mac asks for local network access.
 
 ## Not in v1
 

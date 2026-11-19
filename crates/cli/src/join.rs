@@ -1,4 +1,4 @@
-//! `latem-vault join` and `latem-vault approve` (join.md, commands).
+//! `pinkvault join` and `pinkvault approve` (join.md, commands).
 //!
 //! The joiner runs its own endpoint, because it has no vault for a service to hold yet. `approve`
 //! goes through the service when one runs (service.md, for apps), and otherwise runs its own
@@ -8,17 +8,17 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use latem_vault_core::membership::{AdminKey as _, DeviceName, Scope};
-use latem_vault_core::{CollectionId, Vault, transport_seed};
-use latem_vault_crypto::pake;
-use latem_vault_keystore::{AdminKey, Backend, Keys};
-use latem_vault_net::join::{self, AdminSession, JoinError};
-use latem_vault_net::{EndpointKey, Node, Options};
+use pinkvault_core::membership::{AdminKey as _, DeviceName, Scope};
+use pinkvault_core::{CollectionId, Vault, transport_seed};
+use pinkvault_crypto::pake;
+use pinkvault_keystore::{AdminKey, Backend, Keys};
+use pinkvault_net::join::{self, AdminSession, JoinError};
+use pinkvault_net::{EndpointKey, Node, Options};
 use tokio::runtime::Runtime;
 use tokio::time::Instant;
 
-use latem_vault_service::handler;
-use latem_vault_service::setup::{self, ATTEMPTS, JoinProgress};
+use pinkvault_service::handler;
+use pinkvault_service::setup::{self, ATTEMPTS, JoinProgress};
 
 use crate::{Home, load_keys, read_new_passphrase, read_recovery_phrase};
 
@@ -37,7 +37,7 @@ pub fn join(home: &Home, backend: Backend, name: String) -> Result<()> {
     println!("Joining as {} ({}).", name.name, name.platform);
     println!();
     crate::name::say!(
-        "On a device that administers the vault, run `latem-vault approve` and enter this code:"
+        "On a device that administers the vault, run `pinkvault approve` and enter this code:"
     );
     println!();
     println!("    {} {}", &code[..3], &code[3..]);
@@ -60,7 +60,7 @@ pub fn join(home: &Home, backend: Backend, name: String) -> Result<()> {
         progress,
         std::future::pending(),
     ));
-    let vault = joined.context("run `latem-vault join` again for a new code")?;
+    let vault = joined.context("run `pinkvault join` again for a new code")?;
     println!();
     println!("Joined the vault {} as {}.", vault.vault_id(), name.name);
     println!();
@@ -72,8 +72,8 @@ pub fn approve(home: &Home, write: &[String], read: &[String], hold: &[String]) 
     home.require_vault()?;
     #[cfg(unix)]
     {
-        let socket = home.0.join(latem_vault_service::SOCKET);
-        if latem_vault_service::client::is_running(&socket) {
+        let socket = home.0.join(pinkvault_service::SOCKET);
+        if pinkvault_service::client::is_running(&socket) {
             return approve_through_service(&socket, write, read, hold);
         }
     }
@@ -113,9 +113,7 @@ fn approve_with(
             Err(JoinError::WrongCode) => {
                 attempts += 1;
                 if attempts == ATTEMPTS {
-                    bail!(
-                        "three wrong codes; run `latem-vault join` and `latem-vault approve` again"
-                    );
+                    bail!("three wrong codes; run `pinkvault join` and `pinkvault approve` again");
                 }
                 eprintln!("Wrong code.");
             }
@@ -185,9 +183,9 @@ fn approve_with(
     );
     // A running service reloads the log and tells the other devices (service.md, the store).
     #[cfg(unix)]
-    let _ = latem_vault_service::client::call(
-        &home.0.join(latem_vault_service::SOCKET),
-        &latem_vault_service::api::Request::Changed,
+    let _ = pinkvault_service::client::call(
+        &home.0.join(pinkvault_service::SOCKET),
+        &pinkvault_service::api::Request::Changed,
     );
     Ok(())
 }
@@ -200,11 +198,11 @@ fn approve_through_service(
     read: &[String],
     hold: &[String],
 ) -> Result<()> {
-    use latem_vault_service::api::{ErrorCode, Request, Response};
+    use pinkvault_service::api::{ErrorCode, Request, Response};
 
     let call = |request: &Request| -> Result<Response> {
-        latem_vault_service::client::call(socket, request)?
-            .ok_or_else(|| anyhow!("the service stopped; run `latem-vault approve` again"))
+        pinkvault_service::client::call(socket, request)?
+            .ok_or_else(|| anyhow!("the service stopped; run `pinkvault approve` again"))
     };
     let mut scopes: Vec<(String, Scope)> = Vec::new();
     for (names, scope) in [
@@ -240,9 +238,7 @@ fn approve_through_service(
     };
     let joiner = match joiners.as_slice() {
         [] => {
-            bail!(
-                "no device on this network is waiting to join; run `latem-vault join` on it first"
-            )
+            bail!("no device on this network is waiting to join; run `pinkvault join` on it first")
         }
         [joiner] => {
             eprintln!("Found {} ({}).", joiner.name, joiner.platform);
@@ -370,9 +366,7 @@ fn pick_joiner(runtime: &Runtime, node: &Node) -> Result<(EndpointKey, String)> 
     let label = |(platform, name): &(String, String)| format!("{name} ({platform})");
     match joiners.as_slice() {
         [] => {
-            bail!(
-                "no device on this network is waiting to join; run `latem-vault join` on it first"
-            )
+            bail!("no device on this network is waiting to join; run `pinkvault join` on it first")
         }
         [(key, hint)] => {
             eprintln!("Found {}.", label(hint));
@@ -420,7 +414,7 @@ fn scopes(
 fn listed_admin_key(home: &Home, vault: &Vault<Keys>) -> Result<Option<AdminKey>> {
     let key = match AdminKey::load(&home.admin()) {
         Ok(key) => key,
-        Err(latem_vault_keystore::Error::NotFound(_)) => return Ok(None),
+        Err(pinkvault_keystore::Error::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let listed = vault

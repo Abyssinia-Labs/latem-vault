@@ -73,7 +73,7 @@ mod tests {
 
     use super::*;
 
-    /// RFC 9106 §5.3, which uses a secret and associated data that latem vault doesn't.
+    /// RFC 9106 §5.3, which uses a secret and associated data that PinkVault doesn't.
     #[test]
     fn argon2id_matches_rfc_9106() {
         let params = ParamsBuilder::new()

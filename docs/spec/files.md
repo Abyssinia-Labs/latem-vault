@@ -54,7 +54,7 @@ chunk id     BLAKE3.derive_key("openvault v1 chunk id", sealed)
 
 ## Local store
 
-- **Where chunks live.** Each chunk is a file `chunks/<first two hex digits>/<id in hex>` in the openvault directory, mode 0600, directories 0700. They stay out of SQLite, so the database holds only small rows and a chunk is written once.
+- **Where chunks live.** Each chunk is a file `chunks/<first two hex digits>/<id in hex>` in the vault directory, mode 0600, directories 0700. They stay out of SQLite, so the database holds only small rows and a chunk is written once.
 - **What the store keeps of them.** Store version 7 adds:
   - a `chunks` table of each chunk this device holds: its id, collection, epoch, size, the day it was last written or read, and the time it stopped being referenced, if it has;
   - a `file_chunks` table of the chunks each current file version names, whether this device holds them or not, so it knows which chunks are missing and which no version names any more;
@@ -108,12 +108,12 @@ Each request is one bidirectional stream, with sync.md's framing. The asker send
 ## Commands
 
 ```
-openvault import <path> --collection <c> [--into <folder>] [--disk-not-encrypted]   a file, or a folder's files
-openvault get <collection>/<name> [-o <path>]                  a file to stdout, or to a path
-openvault open <collection>/<name>                             open a copy; each save writes a new version
-openvault run --collection <c> --env <folder> -- <command>     the folder's files as temporary paths too
-openvault placement <collection> [keep|on-demand]
-openvault list <collection>[/<folder>]                         files show their size, and whether they're here
+pinkvault import <path> --collection <c> [--into <folder>] [--disk-not-encrypted]   a file, or a folder's files
+pinkvault get <collection>/<name> [-o <path>]                  a file to stdout, or to a path
+pinkvault open <collection>/<name>                             open a copy; each save writes a new version
+pinkvault run --collection <c> --env <folder> -- <command>     the folder's files as temporary paths too
+pinkvault placement <collection> [keep|on-demand]
+pinkvault list <collection>[/<folder>]                         files show their size, and whether they're here
 ```
 
 **import**
@@ -147,7 +147,7 @@ openvault list <collection>[/<folder>]                         files show their 
 
 ## The Mac app
 
-Since 0.5.2 the Swift bindings list files with their sizes and how many of their chunks aren't here, and fetch, write out and write files through the shared code the CLI uses (`openvault_service::files`). The app (`openvault-apple`):
+Since 0.5.2 the Swift bindings list files with their sizes and how many of their chunks aren't here, and fetch, write out and write files through the shared code the CLI uses (`pinkvault_service::files`). The app (`openvault-apple`):
 
 - **Lists** a collection's files among its entries, with their kinds and sizes, and a ring while chunks are missing, through a path into nested folders, as a list or a grid (canvas, d/Documents). Counts include files. A Collections screen shows what each collection holds and how many of its files are on this Mac (canvas, d/Collections).
 - **Locks** files until Touch ID says someone is at the Mac, as a secret's value is: once unlocked, every file stays open for 5 minutes, and locks again at once when the Mac sleeps, its screen locks or the session switches away. Preview, Open and Save a copy need it. Like a secret's, it's a check that someone is there, not a key: the CLI reads files without it.

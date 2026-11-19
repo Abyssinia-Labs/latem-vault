@@ -1,6 +1,6 @@
 [package]
-name = "latem-vault-service"
-description = "The latem vault service: holds the vault open, runs the endpoint, and answers the CLI on a local socket."
+name = "pinkvault-service"
+description = "The PinkVault service: holds the vault open, runs the endpoint, and answers the CLI on a local socket."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,10 +10,10 @@ publish.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 libc = "0.2.191"
-latem-vault-core = { path = "../core" }
-latem-vault-crypto = { path = "../crypto" }
-latem-vault-keystore = { path = "../keystore" }
-latem-vault-net = { path = "../net" }
+pinkvault-core = { path = "../core" }
+pinkvault-crypto = { path = "../crypto" }
+pinkvault-keystore = { path = "../keystore" }
+pinkvault-net = { path = "../net" }
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1"

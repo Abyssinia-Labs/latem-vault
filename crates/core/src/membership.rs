@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use latem_vault_crypto::hash::{self, Hash, contexts};
-use latem_vault_crypto::{
+use pinkvault_crypto::hash::{self, Hash, contexts};
+use pinkvault_crypto::{
     Signature, SignatureContext, SigningKey, SymmetricKey, VerifyingKey, WrapKey, WrappedKey,
 };
 
@@ -1105,7 +1105,7 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use latem_vault_crypto::{RecoveryKey, UnwrapKey};
+    use pinkvault_crypto::{RecoveryKey, UnwrapKey};
 
     use super::*;
 
@@ -1364,7 +1364,7 @@ mod tests {
         let tampered = LogEntry::from_bytes(&bytes).unwrap();
         assert!(matches!(
             m.clone().apply(&tampered),
-            Err(Error::Crypto(latem_vault_crypto::Error::BadSignature))
+            Err(Error::Crypto(pinkvault_crypto::Error::BadSignature))
         ));
         let mut bytes = second.to_bytes();
         *bytes.last_mut().unwrap() ^= 1;

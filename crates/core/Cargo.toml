@@ -1,6 +1,6 @@
 [package]
-name = "latem-vault-core"
-description = "latem vault's collections, records and local store."
+name = "pinkvault-core"
+description = "PinkVault's collections, records and local store."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 hex = "0.4"
-latem-vault-crypto = { path = "../crypto" }
+pinkvault-crypto = { path = "../crypto" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 thiserror = "2"
 zeroize = "1.9"

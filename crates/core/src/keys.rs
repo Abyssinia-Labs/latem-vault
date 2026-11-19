@@ -1,5 +1,5 @@
-use latem_vault_crypto::hash::{contexts, derive_key};
-use latem_vault_crypto::{
+use pinkvault_crypto::hash::{contexts, derive_key};
+use pinkvault_crypto::{
     Signature, SignatureContext, SigningKey, SymmetricKey, UnwrapKey, VerifyingKey, WrapKey,
     WrappedKey,
 };

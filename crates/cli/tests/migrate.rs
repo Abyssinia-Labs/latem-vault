@@ -1,5 +1,6 @@
-//! The first run after 0.6 moves `~/.openvault` to `~/.latem-vault` (migrate.rs), in a
-//! temporary `HOME` with no `LATEM_VAULT_HOME`, and a `PATH` that holds only a fake `latem`.
+//! The first run after 0.7 moves `~/.latem-vault`, or `~/.openvault` where that never moved, to
+//! `~/.pinkvault` (migrate.rs), in a temporary `HOME` with no vault variable set, and a `PATH`
+//! that holds only a fake `latem`.
 #![cfg(unix)]
 
 use std::fs;
@@ -8,20 +9,33 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// The vault directories before 0.7: 0.6's, then openvault's.
+const OLD: [&str; 2] = [".latem-vault", ".openvault"];
+
+/// Every name for the vault directory's variable, the old ones included.
+const HOME_VARS: [&str; 3] = ["PINKVAULT_HOME", "LATEM_VAULT_HOME", "OPENVAULT_HOME"];
+
 struct Home {
     dir: tempfile::TempDir,
 }
 
 impl Home {
-    /// A home directory with a vault where openvault kept it, holding `latem/A`.
-    fn with_old_vault() -> Self {
+    /// A home directory with a vault in `~/<old>`, holding `latem/A`.
+    fn with_vault_in(old: &str) -> Self {
         let home = Self {
             dir: tempfile::tempdir().unwrap(),
         };
         fs::create_dir(home.bin()).unwrap();
-        let init = home
+        home.make_vault(old, "1");
+        home
+    }
+
+    /// Makes a vault in `~/<dir>` whose `latem/A` is `value`.
+    fn make_vault(&self, dir: &str, value: &str) {
+        let dir = self.path(dir);
+        let init = self
             .command(&["init", "--keys", "software", "--name", "old"])
-            .env("LATEM_VAULT_HOME", home.old_dir())
+            .env("PINKVAULT_HOME", &dir)
             .output()
             .unwrap();
         assert!(init.status.success(), "{}", stderr(&init));
@@ -29,16 +43,16 @@ impl Home {
             &["collections", "create", "latem"][..],
             &["set", "latem/A", "--var"],
         ] {
-            let mut child = home
+            let mut child = self
                 .command(args)
-                .env("LATEM_VAULT_HOME", home.old_dir())
+                .env("PINKVAULT_HOME", &dir)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
             let input = if args[0] == "set" {
-                "1".to_owned()
+                value.to_owned()
             } else {
                 phrase(&String::from_utf8_lossy(&init.stdout))
             };
@@ -46,15 +60,14 @@ impl Home {
             let output = child.wait_with_output().unwrap();
             assert!(output.status.success(), "{}", stderr(&output));
         }
-        home
     }
 
-    fn old_dir(&self) -> PathBuf {
-        self.dir.path().join(".openvault")
+    fn path(&self, dir: &str) -> PathBuf {
+        self.dir.path().join(dir)
     }
 
     fn new_dir(&self) -> PathBuf {
-        self.dir.path().join(".latem-vault")
+        self.path(".pinkvault")
     }
 
     fn bin(&self) -> PathBuf {
@@ -73,17 +86,18 @@ impl Home {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_latem-vault"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pinkvault"));
+        command.args(args);
+        for variable in HOME_VARS {
+            command.env_remove(variable);
+        }
         command
-            .args(args)
-            .env_remove("LATEM_VAULT_HOME")
-            .env_remove("OPENVAULT_HOME")
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XPC_SERVICE_NAME")
             .env("HOME", self.dir.path())
             .env("PATH", self.bin())
             .env(
-                "LATEM_VAULT_MDNS_SERVICE",
+                "PINKVAULT_MDNS_SERVICE",
                 format!("ovm-{:x}", std::process::id()),
             )
             .stdin(Stdio::null());
@@ -96,16 +110,16 @@ impl Home {
         output
     }
 
-    /// `latem-vault service` on the old directory, as openvault's would be.
-    fn old_service(&self) -> Service {
+    /// `pinkvault service` on `~/<old>`, as 0.6's or openvault's would be.
+    fn old_service(&self, old: &str) -> Service {
         let child = self
             .command(&["service"])
-            .env("LATEM_VAULT_HOME", self.old_dir())
+            .env("PINKVAULT_HOME", self.path(old))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let socket = self.old_dir().join("service.sock");
+        let socket = self.path(old).join("service.sock");
         let started = Instant::now();
         while std::os::unix::net::UnixStream::connect(&socket).is_err() {
             assert!(started.elapsed() < Duration::from_secs(20), "no service");
@@ -149,56 +163,97 @@ fn phrase(stdout: &str) -> String {
 }
 
 #[test]
-fn the_first_run_moves_the_vault() {
-    let home = Home::with_old_vault();
-    let keys = fs::read(home.old_dir().join("keys")).unwrap();
+fn the_first_run_moves_the_vault_from_each_old_directory() {
+    for old in OLD {
+        let home = Home::with_vault_in(old);
+        let keys = fs::read(home.path(old).join("keys")).unwrap();
 
+        let moved = home.run(&["get", "latem/A"]);
+        assert_eq!(stdout(&moved), "1");
+        assert_eq!(
+            stderr(&moved),
+            format!("Moved the vault from ~/{old} to ~/.pinkvault.\n")
+        );
+        assert!(!home.path(old).exists());
+        assert_eq!(fs::read(home.new_dir().join("keys")).unwrap(), keys);
+
+        let again = home.run(&["get", "latem/A"]);
+        assert_eq!(stdout(&again), "1");
+        assert_eq!(stderr(&again), "");
+    }
+}
+
+#[test]
+fn two_old_directories_stay_where_they_are() {
+    let home = Home::with_vault_in(".latem-vault");
+    home.make_vault(".openvault", "2");
+
+    // 0.6 used ~/.latem-vault, so commands go on using it, and nothing moves.
+    let stayed = home.run(&["get", "latem/A"]);
+    assert_eq!(stdout(&stayed), "1");
+    let why = stderr(&stayed);
+    assert!(
+        why.starts_with(
+            "The vault stays in ~/.latem-vault for now, not ~/.pinkvault: ~/.openvault is here \
+             too, and only one can move."
+        ),
+        "{why}"
+    );
+    assert!(home.path(".latem-vault").is_dir() && home.path(".openvault").is_dir());
+    assert!(!home.new_dir().exists());
+
+    // Once the person has moved one aside, the other moves.
+    fs::rename(home.path(".openvault"), home.path("openvault-aside")).unwrap();
     let moved = home.run(&["get", "latem/A"]);
     assert_eq!(stdout(&moved), "1");
     assert_eq!(
         stderr(&moved),
-        "Moved the vault from ~/.openvault to ~/.latem-vault.\n"
+        "Moved the vault from ~/.latem-vault to ~/.pinkvault.\n"
     );
-    assert!(!home.old_dir().exists());
-    assert_eq!(fs::read(home.new_dir().join("keys")).unwrap(), keys);
+}
 
-    let again = home.run(&["get", "latem/A"]);
-    assert_eq!(stdout(&again), "1");
-    assert_eq!(stderr(&again), "");
+#[test]
+fn the_new_directory_wins_over_an_old_one() {
+    let home = Home::with_vault_in(".pinkvault");
+    home.make_vault(".latem-vault", "2");
+    let output = home.run(&["get", "latem/A"]);
+    assert_eq!(stdout(&output), "1");
+    assert_eq!(stderr(&output), "");
+    assert!(home.path(".latem-vault").is_dir());
 }
 
 #[test]
 fn an_old_latem_keeps_the_vault_where_it_is() {
-    let home = Home::with_old_vault();
-    home.latem("v0.11.2");
+    let home = Home::with_vault_in(".latem-vault");
+    home.latem("v0.13.2");
 
     let stayed = home.run(&["get", "latem/A"]);
     assert_eq!(stdout(&stayed), "1");
     let why = stderr(&stayed);
     assert!(
         why.starts_with(
-            "The vault stays in ~/.openvault for now, not ~/.latem-vault: ~/bin/latem is latem \
-             0.11.2"
+            "The vault stays in ~/.latem-vault for now, not ~/.pinkvault: ~/bin/latem is latem \
+             0.13.2"
         ),
         "{why}"
     );
     assert!(why.contains("`latem update`"), "{why}");
-    assert!(home.old_dir().is_dir() && !home.new_dir().exists());
+    assert!(home.path(".latem-vault").is_dir() && !home.new_dir().exists());
 
-    home.latem("v0.12.0");
+    home.latem("v0.14.0");
     let moved = home.run(&["get", "latem/A"]);
     assert!(
         stderr(&moved).starts_with("Moved the vault"),
         "{}",
         stderr(&moved)
     );
-    assert!(home.new_dir().is_dir() && !home.old_dir().exists());
+    assert!(home.new_dir().is_dir() && !home.path(".latem-vault").exists());
 }
 
 #[test]
 fn a_running_service_keeps_the_vault_where_it_is() {
-    let home = Home::with_old_vault();
-    let service = home.old_service();
+    let home = Home::with_vault_in(".latem-vault");
+    let service = home.old_service(".latem-vault");
 
     let stayed = home.run(&["get", "latem/A"]);
     assert_eq!(stdout(&stayed), "1");
@@ -207,7 +262,7 @@ fn a_running_service_keeps_the_vault_where_it_is() {
         "{}",
         stderr(&stayed)
     );
-    assert!(home.old_dir().is_dir() && !home.new_dir().exists());
+    assert!(home.path(".latem-vault").is_dir() && !home.new_dir().exists());
 
     drop(service);
     let moved = home.run(&["get", "latem/A"]);
@@ -216,12 +271,12 @@ fn a_running_service_keeps_the_vault_where_it_is() {
         "{}",
         stderr(&moved)
     );
-    assert!(!home.old_dir().join("service.sock").exists());
+    assert!(!home.new_dir().join("service.sock").exists());
 }
 
 #[test]
 fn the_service_moves_the_vault_when_it_starts() {
-    let home = Home::with_old_vault();
+    let home = Home::with_vault_in(".openvault");
     let log = home.dir.path().join("service.log");
     let child = home
         .command(&["service", "--log", log.to_str().unwrap()])
@@ -241,22 +296,51 @@ fn the_service_moves_the_vault_when_it_starts() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let log = fs::read_to_string(&log).unwrap();
-    assert!(log.starts_with("Moved the vault from"), "{log}");
-    assert!(!home.old_dir().exists());
+    assert!(
+        log.starts_with("Moved the vault from ~/.openvault"),
+        "{log}"
+    );
+    assert!(!home.path(".openvault").exists());
     assert_eq!(stdout(&home.run(&["get", "latem/A"])), "1");
 }
 
+/// The old variables are still read, and a directory any of them names is used as it is.
 #[test]
 fn a_chosen_directory_is_never_moved() {
-    let home = Home::with_old_vault();
-    for variable in ["LATEM_VAULT_HOME", "OPENVAULT_HOME"] {
+    let home = Home::with_vault_in(".latem-vault");
+    for variable in HOME_VARS {
         let output = home
             .command(&["get", "latem/A"])
-            .env(variable, home.old_dir())
+            .env(variable, home.path(".latem-vault"))
             .output()
             .unwrap();
-        assert_eq!(stdout(&output), "1", "{}", stderr(&output));
+        assert_eq!(stdout(&output), "1", "{variable}: {}", stderr(&output));
         assert_eq!(stderr(&output), "");
-        assert!(home.old_dir().is_dir() && !home.new_dir().exists());
+        assert!(home.path(".latem-vault").is_dir() && !home.new_dir().exists());
     }
+}
+
+/// `PINKVAULT_HOME` wins over the old names, and 0.6's over openvault's.
+#[test]
+fn the_newest_variable_wins() {
+    let home = Home::with_vault_in("a");
+    home.make_vault("b", "2");
+    home.make_vault("c", "3");
+    let get = |vars: &[(&str, &str)]| {
+        let mut command = home.command(&["get", "latem/A"]);
+        for (variable, dir) in vars {
+            command.env(variable, home.path(dir));
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        stdout(&output)
+    };
+    let all = [
+        ("PINKVAULT_HOME", "a"),
+        ("LATEM_VAULT_HOME", "b"),
+        ("OPENVAULT_HOME", "c"),
+    ];
+    assert_eq!(get(&all), "1");
+    assert_eq!(get(&all[1..]), "2");
+    assert_eq!(get(&all[2..]), "3");
 }

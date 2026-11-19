@@ -1,6 +1,6 @@
 # Security policy
 
-OpenVault is pre-release and hasn't had a security audit. An external audit is planned before the hosted launch (design §18).
+PinkVault is pre-release and hasn't had a security audit. An external audit is planned before the hosted launch (design §18).
 
 ## Reporting a vulnerability
 

@@ -2,7 +2,7 @@
 
 Status: draft, 2026-11-07. Changed 2026-11-09: starting at login, and the status request. Changed 2026-11-11: `--log`, the Mac app's LaunchAgent, `parseEnv`, and making or joining a vault from the bindings. Implemented by `crates/net` (the endpoint and discovery), `crates/service` (the service and its local API) and `crates/cli` (starting at login). Builds on [records.md](records.md), [membership.md](membership.md) and [keystore.md](keystore.md). Sync ([sync.md](sync.md)) and joining ([join.md](join.md)) run inside it once they are built. The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking) and [§14](../design.md#14-interfaces).
 
-`openvault service` is the one process on a device that holds the vault open. It:
+`pinkvault service` is the one process on a device that holds the vault open. It:
 - unlocks the device's keys once, so a passphrase is typed once per run rather than once per command;
 - runs the device's iroh endpoint and finds the vault's other devices on the local network;
 - answers the CLI over a local socket.
@@ -11,46 +11,60 @@ All integers are big-endian.
 
 ## Running it
 
-- `openvault service` runs in the foreground and logs to stderr. It stops on Ctrl-C or SIGTERM, and removes its socket as it goes.
+- `pinkvault service` runs in the foreground and logs to stderr. It stops on Ctrl-C or SIGTERM, and removes its socket as it goes.
 - `--log FILE` appends stdout and stderr to FILE instead, from before the vault is opened, so an error at startup lands there too. A leading `~/` is the home directory, for a LaunchAgent bundled in an app, which can't name it.
 - It opens the vault as any command does: from the Secure Enclave, or after asking for the passphrase (keystore.md, passphrases).
-- One service runs per vault. It holds a lock on `service.lock` in the openvault directory while it runs, and a second service that can't take the lock exits. The operating system drops the lock when a service crashes, so a socket found while holding it is left over, and is replaced.
-- `openvault service install` has the operating system start it at login instead (below), and so does the Mac app, with a LaunchAgent of its own.
+- One service runs per vault. It holds a lock on `service.lock` in the vault directory while it runs, and a second service that can't take the lock exits. The operating system drops the lock when a service crashes, so a socket found while holding it is left over, and is replaced.
+- `pinkvault service install` has the operating system start it at login instead (below), and so does the Mac app, with a LaunchAgent of its own.
+
+## The directory
+
+A device keeps its key file, its vault database and the service's socket in one directory: `~/.pinkvault`, or the one `PINKVAULT_HOME` names. `LATEM_VAULT_HOME` and `OPENVAULT_HOME`, its names in 0.6 and before, are still read for one release, after it. So are `LATEM_VAULT_LOG` and `OPENVAULT_LOG` after `PINKVAULT_LOG`, and `LATEM_VAULT_MDNS_SERVICE` and `OPENVAULT_MDNS_SERVICE` after `PINKVAULT_MDNS_SERVICE`.
+
+The directory was `~/.latem-vault` in 0.6, and `~/.openvault` before. With no variable set and no `~/.pinkvault`, the first command or service of 0.7 renames the old one to `~/.pinkvault` (`crates/cli/src/migrate.rs`). It's one rename on the same disk, made while holding the service's lock, so the key file and the Secure Enclave keys go with it and no service starts in between. Until it can, the command uses the old directory and says on stderr why it stayed:
+- a service runs for the old directory;
+- a definition with an old name would start a build that doesn't look in `~/.pinkvault` (`install` replaces it);
+- the Mac app's agent from before PinkVault is loaded;
+- the latem first on `PATH`, or in `~/.local/bin`, is older than 0.14.0, the first that looks in `~/.pinkvault`;
+- both `~/.latem-vault` and `~/.openvault` exist. Only the person can say which is the vault, so commands use `~/.latem-vault`, as 0.6 did, until one is moved out of the way.
+
+Once `~/.pinkvault` exists, it's the directory, whatever old ones are left. The apps read the directory the same way without moving anything (`home::Location::current`). The move, the old variables and the old commands go one release after 0.7 (OV-15).
 
 ## Starting at login
 
-`openvault service install` has the operating system start the service when the user logs in, and start it again if it stops. `openvault service uninstall` undoes that, and `openvault service status` says how things stand. It was written after the MacBook, the desktop and the mini each needed a definition written by hand to keep latem's builds working (design §18, progress).
+`pinkvault service install` has the operating system start the service when the user logs in, and start it again if it stops. `pinkvault service uninstall` undoes that, and `pinkvault service status` says how things stand. It was written after the MacBook, the desktop and the mini each needed a definition written by hand to keep latem's builds working (design §18, progress).
 
 **install**
-- It refuses keys that need a passphrase, since nobody would be there to type it. It names two ways out: `openvault keys passphrase --remove` (keystore.md, changing the protection), or starting the service by hand.
-- The definition runs the binary that `install` was run from, by its absolute path. A binary in a cargo `target` directory changes with each build, so `install` warns about one. For a Homebrew install, that path is the formula's `opt` link (`<prefix>/opt/latem-vault/bin/latem-vault`), worked out from the keg's `<prefix>/Cellar/latem-vault/<version>/bin/latem-vault` when the link leads to it. The keg goes away with the next `brew upgrade`, and the link moves onto the new one. Until latem vault 0.6.0, definitions named the keg.
-- `OPENVAULT_HOME`, when it's set, goes into the definition.
+- It refuses keys that need a passphrase, since nobody would be there to type it. It names two ways out: `pinkvault keys passphrase --remove` (keystore.md, changing the protection), or starting the service by hand.
+- The definition runs the binary that `install` was run from, by its absolute path. A binary in a cargo `target` directory changes with each build, so `install` warns about one. For a Homebrew install, that path is the formula's `opt` link (`<prefix>/opt/pinkvault/bin/pinkvault`), worked out from the keg's `<prefix>/Cellar/pinkvault/<version>/bin/pinkvault` when the link leads to it. The keg goes away with the next `brew upgrade`, and the link moves onto the new one. Until 0.7.0, definitions named the keg.
+- `PINKVAULT_HOME`, when it or an old name for it is set, goes into the definition as `PINKVAULT_HOME`.
+- It first stops and removes the definitions the service had under its old names: `dev.latem.vault.service` and `local.openvault.service` on macOS, `latem-vault.service` and `openvault.service` on Linux. Then it moves the vault to `~/.pinkvault` if it can (the directory, below).
 - It stops if a service is already running that the operating system didn't start, such as one in a terminal. That one has to be stopped first.
 - Running it again is safe, and it's how a new build takes over: it writes the definition again and restarts the service.
 - It then waits up to 10 seconds for the socket to answer, and says whether it did.
 
 **macOS: a LaunchAgent.**
-- `~/Library/LaunchAgents/local.openvault.service.plist`, with `RunAtLoad`, `KeepAlive` and a `ThrottleInterval` of 30 seconds.
-- Output goes to `~/Library/Logs/openvault-service.log`.
+- `~/Library/LaunchAgents/com.abyssinialabs.pinkvault.service.plist`, with `RunAtLoad`, `KeepAlive` and a `ThrottleInterval` of 30 seconds.
+- Output goes to `~/Library/Logs/pinkvault-service.log`.
 - It's loaded with `launchctl bootout` and then `bootstrap`, in the `gui/<uid>` domain. macOS can load a new file in that directory by itself, so a definition that's already loaded is restarted with `launchctl kickstart -k` instead.
-- macOS then shows a "Background Items Added" notice. It also asks, once, whether openvault may use the local network, and, with the firewall on, whether it may accept incoming connections.
+- macOS then shows a "Background Items Added" notice. It also asks, once, whether pinkvault may use the local network, and, with the firewall on, whether it may accept incoming connections.
 - A binary built with cargo is signed ad hoc, and macOS asks again for each new build. Until someone answers, mDNS stops and starts again (discovery).
 
 **Linux: a systemd user unit.**
-- `$XDG_CONFIG_HOME/systemd/user/openvault.service`, or `~/.config/systemd/user/openvault.service`, with `Restart=on-failure` and `RestartSec=30`, after `network-online.target`.
+- `$XDG_CONFIG_HOME/systemd/user/pinkvault.service`, or `~/.config/systemd/user/pinkvault.service`, with `Restart=on-failure` and `RestartSec=30`, after `network-online.target`.
 - `install` runs `systemctl --user daemon-reload`, `enable` and `restart`.
-- Output goes to the journal: `journalctl --user -u openvault`.
+- Output goes to the journal: `journalctl --user -u pinkvault`.
 - Without lingering, a user's units start at login rather than at boot. `install` says so and shows `loginctl enable-linger <user>`. It doesn't run it, because it changes how the system starts.
 - Without a systemd user instance, as in some WSL setups, `install` fails and says so.
 
 **uninstall** stops the service and removes the definition. The vault is untouched.
 
 **The Mac app** bundles this binary and starts it with a LaunchAgent of its own, in place of `install`'s (M5, `openvault-apple`):
-- The agent, `com.abyssinialabs.openvault.service`, is in the app bundle and registered with `SMAppService`. It runs `Contents/Helpers/openvault service --log ~/Library/Logs/openvault-service.log`, with `RunAtLoad`, `KeepAlive` and a `ThrottleInterval` of 30 seconds, as `install`'s does.
+- The agent, `com.abyssinialabs.pinkvault.service`, is in the app bundle and registered with `SMAppService`. It runs `Contents/Helpers/pinkvault service --log ~/Library/Logs/pinkvault-service.log`, with `RunAtLoad`, `KeepAlive` and a `ThrottleInterval` of 30 seconds, as `install`'s does.
 - The app registers it only for a vault whose keys need no passphrase. It asks the library first (`deviceHome`: whether there's a vault, and how its keys are kept).
-- Before registering, it runs the bundled `openvault service uninstall` if `install`'s definition is there, so that two agents don't start two services for one vault.
+- Before registering, it runs the bundled `pinkvault service uninstall` if `install`'s definition is there, so that two agents don't start two services for one vault.
 - The binary is signed with the app's Developer ID, so macOS keeps one answer to its local network question across builds.
-- The CLI knows the app's agent by its label. While launchd has it loaded, `install` refuses and names the switch in Login Items that turns it off. `status` says the app starts the service, and that updating the app moves it onto a new build. `uninstall` says the app starts it rather than that nothing was installed.
+- The agent has `install`'s label, so launchd runs only one of the two. The CLI tells them apart by where launchd has the definition from: `install`'s file in `~/Library/LaunchAgents`, or `(submitted by smd.<pid>)` for one `SMAppService` registered. It also knows the app's agents from before PinkVault, `com.abyssinialabs.latemvault.service` and `com.abyssinialabs.openvault.service`. While launchd has one of the app's loaded, `install` refuses and names the switch in Login Items that turns it off. `status` says the app starts the service, and that updating the app moves it onto a new build. `uninstall` says the app starts it rather than that nothing was installed.
 
 **status** says:
 - whether a definition is installed, and where;
@@ -77,26 +91,26 @@ Each device runs one iroh endpoint (design §10):
 
 ### Discovery
 
-- The endpoint finds others with mDNS, under the service name `openvault`: `<endpoint id>._openvault._udp.local.`.
-  - Other iroh applications use their own service names, so they don't see OpenVault devices and OpenVault doesn't see them.
-  - `OPENVAULT_MDNS_SERVICE` names another service, 1 to 15 letters, digits and hyphens starting with a letter, for every endpoint the process starts. The tests and `scripts/swift-bindings.sh` set it to one of their own (`ovt-<pid>`), so their devices find only each other: before, a real service saw a test's joiner, and the Mac app showed it asking to join. A name that doesn't fit stops the endpoint with an error.
+- The endpoint finds others with mDNS, under the service name `pinkvault`: `<endpoint id>._openvault._udp.local.`.
+  - Other iroh applications use their own service names, so they don't see PinkVault devices and PinkVault doesn't see them.
+  - `PINKVAULT_MDNS_SERVICE` names another service, 1 to 15 letters, digits and hyphens starting with a letter, for every endpoint the process starts. The tests and `scripts/swift-bindings.sh` set it to one of their own (`ovt-<pid>`), so their devices find only each other: before, a real service saw a test's joiner, and the Mac app showed it asking to join. A name that doesn't fit stops the endpoint with an error.
   - Devices that are members announce nothing besides their endpoint id and addresses. A joining device also announces its platform and name (join.md, finding the device).
 - mDNS queries go out every 5 seconds, plus a random delay that grows with the number of peers. A peer that stops answering expires after a few cycles.
-- **When mDNS stops.** swarm-discovery, under iroh's mDNS lookup, stops all of mDNS when one of its sockets fails: the device stops announcing itself and hears nobody. It happens, for instance, on a Mac whose service starts while macOS is still deciding whether it may use the local network. The only sign is a warning from swarm-discovery, so the service watches its log for it, whatever `OPENVAULT_LOG` shows. Then:
+- **When mDNS stops.** swarm-discovery, under iroh's mDNS lookup, stops all of mDNS when one of its sockets fails: the device stops announcing itself and hears nobody. It happens, for instance, on a Mac whose service starts while macOS is still deciding whether it may use the local network. The only sign is a warning from swarm-discovery, so the service watches its log for it, whatever `PINKVAULT_LOG` shows. Then:
   - The members it could see count as gone, since the stopped lookup can't say who leaves.
   - After 5 seconds it starts a new lookup in place of the stopped one, and finds them again.
   - If mDNS keeps stopping, the wait doubles each time, up to 5 minutes. Once mDNS has run for 10 minutes, the next wait is 5 seconds again.
   - Each stop and each start is logged.
 - **Visible members.** A member is visible while mDNS has found an endpoint whose id is the transport key of a device in the log that isn't revoked. The service compares against the log when asked, so a change to the log needs no rescan.
-- Other OpenVault endpoints, from other vaults or joining devices, are never dialed.
-- The service logs each member that becomes visible or stops being visible, by its name (membership.md, names key). Other OpenVault endpoints are logged only at debug level (`OPENVAULT_LOG=debug`).
+- Other PinkVault endpoints, from other vaults or joining devices, are never dialed.
+- The service logs each member that becomes visible or stops being visible, by its name (membership.md, names key). Other PinkVault endpoints are logged only at debug level (`PINKVAULT_LOG=debug`).
 
 ## Local API
 
 **The socket.**
-- `service.sock` in the openvault directory, next to the vault (`~/.openvault/service.sock` unless `OPENVAULT_HOME` names another directory).
+- `service.sock` in the vault directory, next to the vault (`~/.pinkvault/service.sock` unless `PINKVAULT_HOME` names another directory).
 - The directory is mode 0700 and the socket 0600.
-- A socket's path must fit in a socket address, about 100 bytes, so `OPENVAULT_HOME` can't be a deeply nested directory. A service that can't bind says so and exits, and commands then open the vault themselves.
+- A socket's path must fit in a socket address, about 100 bytes, so `PINKVAULT_HOME` can't be a deeply nested directory. A service that can't bind says so and exits, and commands then open the vault themselves.
 - The service also checks that each connection comes from a process running as its own user, and closes it otherwise.
 - On Windows, a named pipe comes later.
 
@@ -127,13 +141,13 @@ Each device runs one iroh endpoint (design §10):
 | `0x0d` | status | — |
 
 - **set** writes every entry in one transaction, as `import-env` needs.
-- **folder** returns the current values under `folder/`, for `openvault run`.
+- **folder** returns the current values under `folder/`, for `pinkvault run`.
 - **changed** says that something wrote to the vault without the service, as `approve` does. The service reloads what it keeps, as before every request, and starts sessions as after a log entry (sync.md, starting a session).
 - **create collection** signs with this device's admin key when it has one, which asks for Touch ID. Otherwise it needs the recovery phrase. Without one in the request, it fails with "recovery phrase needed", and the CLI asks for the phrase and sends the request again.
-- **review** returns what a device can read and what it wrote last, which `openvault devices revoke` shows before asking (sync.md, reviewing): the secrets and, since 0.5.3, the files of each collection it reads. Since 0.5.4 a collection with more than 10 files gives each folder at its top as one line with its count.
+- **review** returns what a device can read and what it wrote last, which `pinkvault devices revoke` shows before asking (sync.md, reviewing): the secrets and, since 0.5.3, the files of each collection it reads. Since 0.5.4 a collection with more than 10 files gives each folder at its top as one line with its count.
 - **revoke** revokes a device (sync.md, revoking and reducing scopes). It signs like create collection, and starts sessions as after a log entry.
 - **set scope** changes a device's scope on a collection, signed and followed by sessions in the same way. It fails before asking for a signature if the device already has that scope.
-- **status** returns the service's version, its process id, and how many times mDNS has stopped since it started (discovery). Only the service answers it. A service older than 0.2.2 answers with an error, which `openvault service status` reports as an older build.
+- **status** returns the service's version, its process id, and how many times mDNS has stopped since it started (discovery). Only the service answers it. A service older than 0.2.2 answers with an error, which `pinkvault service status` reports as an older build.
 
 ### Responses
 
@@ -193,7 +207,7 @@ Since 0.4.0 ([files.md](files.md#the-service)). get, set, delete, list and folde
 
 ### For apps
 
-Since 0.3.3, for the Mac app (design §12), which reaches the service through the Swift bindings in `crates/ffi` (`scripts/swift-bindings.sh` builds them). The CLI and the service come from the same release, so the local API has no version of its own: an older service answers these with error "unknown request" until `openvault service install` restarts it on the new build.
+Since 0.3.3, for the Mac app (design §12), which reaches the service through the Swift bindings in `crates/ffi` (`scripts/swift-bindings.sh` builds them). The CLI and the service come from the same release, so the local API has no version of its own: an older service answers these with error "unknown request" until `pinkvault service install` restarts it on the new build.
 
 | Type | Request | Body |
 | --- | --- | --- |
@@ -241,31 +255,31 @@ Since 0.3.3, for the Mac app (design §12), which reaches the service through th
 - **approve** approves the session's request with the scopes given, signed like revoke: with this device's admin key, which asks for Touch ID, or with the recovery phrase. It then sends the joiner the log and grants, and starts sessions as after a log entry.
 - **refuse** tells the joiner it wasn't approved, and ends the session.
 - A session ends after approve or refuse, when the joiner goes away, or after 10 minutes, the code's lifetime. At most 4 are open at once.
-- `openvault approve` uses these when the service runs, and its own endpoint otherwise.
+- `pinkvault approve` uses these when the service runs, and its own endpoint otherwise.
 
 **Without the service.** The bindings also do some things themselves:
-- `deviceHome` (0.3.4) says whether an openvault directory holds a vault, how its keys are kept, and (0.3.6) whether a join was begun there and not finished.
-- `parseEnv` (0.3.5) reads a `.env` file with `import-env`'s parser, which is in `openvault-core` for that reason. An app's import then reads each file the same way the CLI and latem do. The parser refuses a NUL byte in a value, which no environment variable can hold.
-- `createVault` (0.3.6) makes a vault as `openvault init` does, and returns the recovery phrase to show once. With the Secure Enclave the device gets an admin key too.
-- `joinVault` (0.3.6) joins one as `openvault join` does (join.md, commands). It returns the code at once and runs the join on a thread of its own, on an endpoint of its own, telling a listener when an admin types a wrong code, when the code matched, and how it ended. `stop` ends it, and so does dropping it. `forgetJoin` removes the keys of a join that didn't finish.
+- `deviceHome` (0.3.4) says whether a vault directory holds a vault, how its keys are kept, and (0.3.6) whether a join was begun there and not finished.
+- `parseEnv` (0.3.5) reads a `.env` file with `import-env`'s parser, which is in `pinkvault-core` for that reason. An app's import then reads each file the same way the CLI and latem do. The parser refuses a NUL byte in a value, which no environment variable can hold.
+- `createVault` (0.3.6) makes a vault as `pinkvault init` does, and returns the recovery phrase to show once. With the Secure Enclave the device gets an admin key too.
+- `joinVault` (0.3.6) joins one as `pinkvault join` does (join.md, commands). It returns the code at once and runs the join on a thread of its own, on an endpoint of its own, telling a listener when an admin types a wrong code, when the code matched, and how it ended. `stop` ends it, and so does dropping it. `forgetJoin` removes the keys of a join that didn't finish.
 - `defaultDeviceName` and `secureEnclaveAvailable` (0.3.6) give the defaults `init` and `join` use: the host name, and the Secure Enclave when there is one.
-- These are what `init` and `join` do without the terminal, in `openvault_service::setup`, so the CLI and the apps share them. There's no service until the vault exists; the app starts one after.
+- These are what `init` and `join` do without the terminal, in `pinkvault_service::setup`, so the CLI and the apps share them. There's no service until the vault exists; the app starts one after.
 
 ## The CLI
 
 - Every command except `init`, `service`, `join` and `approve` connects to the socket first. `join` and `approve` run their own endpoints (join.md, commands).
   - **If the service answers,** the command goes through it, and nothing asks for a passphrase.
-  - **Otherwise,** the command opens the vault itself, as before. The service is optional, and `openvault run` still works on a device that doesn't run it.
+  - **Otherwise,** the command opens the vault itself, as before. The service is optional, and `pinkvault run` still works on a device that doesn't run it.
 - Both paths run the same request handler, so a command behaves the same either way.
-- `openvault run` asks for the folder's values, then starts the command itself. The command doesn't inherit anything from the service.
-- `openvault devices` lists the vault's devices: name, platform, key type, and whether each is this device, visible or revoked. Without the service, visibility is unknown, and the list says so.
-- `openvault collections` lists the collections this device can read, one name per line on stdout. Since 0.5.9, when it has none it says why on stderr, so a script still reads nothing: the log names no collection yet; this device may read none of them, so an admin must run `openvault scope`; or it may read some but nothing has synced yet. Then without the service it says to run `openvault service install`, and with the service it says another device that reads them must be on the network. On a Mac both mention the local network permission. It asks with **scopes** (`0x1d`), which answers with **scopes** (`0x98`: count (u32) ‖ collection (str) ‖ scope (u8)): this device's scope on each collection the log names, by name, or by id in hex until a record has brought the name. An older service answers error "unknown request", and the CLI then says to restart it with `openvault service install`.
+- `pinkvault run` asks for the folder's values, then starts the command itself. The command doesn't inherit anything from the service.
+- `pinkvault devices` lists the vault's devices: name, platform, key type, and whether each is this device, visible or revoked. Without the service, visibility is unknown, and the list says so.
+- `pinkvault collections` lists the collections this device can read, one name per line on stdout. Since 0.5.9, when it has none it says why on stderr, so a script still reads nothing: the log names no collection yet; this device may read none of them, so an admin must run `pinkvault scope`; or it may read some but nothing has synced yet. Then without the service it says to run `pinkvault service install`, and with the service it says another device that reads them must be on the network. On a Mac both mention the local network permission. It asks with **scopes** (`0x1d`), which answers with **scopes** (`0x98`: count (u32) ‖ collection (str) ‖ scope (u8)): this device's scope on each collection the log names, by name, or by id in hex until a record has brought the name. An older service answers error "unknown request", and the CLI then says to restart it with `pinkvault service install`.
 
 ## Cost
 
 | Case | Cost |
 | --- | --- |
-| Idle | One mDNS query every 5 seconds or more, each answered by every OpenVault device on the network: a few hundred bytes of multicast. No connections and no database reads. |
+| Idle | One mDNS query every 5 seconds or more, each answered by every PinkVault device on the network: a few hundred bytes of multicast. No connections and no database reads. |
 | A command | One socket round trip, plus the same database reads as opening the vault directly, minus unlocking the keys. |
 | A change by another process | One extra read of the membership state, on the next request. |
 | A request an admin signs | The vault is locked twice: once for the checks before Touch ID, once to sign. The second lock adds one more `data_version` check, and nothing else is read twice. |

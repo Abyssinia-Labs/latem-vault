@@ -2,7 +2,7 @@
 //! ids. Each is summarized by its item count and the sum of its ids, which a store keeps up to
 //! date as items arrive, so a set's root costs one row to read.
 
-use latem_vault_crypto::hash::{contexts, derive_key};
+use pinkvault_crypto::hash::{contexts, derive_key};
 
 use crate::CollectionId;
 

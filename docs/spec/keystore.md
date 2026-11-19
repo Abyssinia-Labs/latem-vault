@@ -18,7 +18,7 @@ A device keeps its keys in one of three backends:
 | Signing | Ed25519, in the key file | Ed25519, sealed in the key file | P-256, in the Secure Enclave |
 | Local key ([records.md](records.md#local-store)) | In the key file | Sealed in the key file | In the key file, wrapped to the Secure Enclave wrapping key |
 
-`openvault init` uses the Secure Enclave when the Mac has one, and a passphrase otherwise: Linux, Windows and WSL until TPM support (design §12). Software keys are for a device that must open the vault with nobody there to type a passphrase, such as a container, or a build machine whose service starts at boot (service.md, starting at login).
+`pinkvault init` uses the Secure Enclave when the Mac has one, and a passphrase otherwise: Linux, Windows and WSL until TPM support (design §12). Software keys are for a device that must open the vault with nobody there to type a passphrase, such as a container, or a build machine whose service starts at boot (service.md, starting at login).
 
 Secure Enclave keys never leave the Secure Enclave, so moving onto it or off it means new device keys. A key file can gain, change or lose its passphrase, though, since kinds `0x01` and `0x03` hold the same keys (changing the protection, below).
 
@@ -76,23 +76,23 @@ Creating a key file writes it and then loads it back. A key that won't restore i
 ## Passphrases
 
 **Choosing one.**
-- `openvault init` asks for the passphrase twice, before it creates anything.
+- `pinkvault init` asks for the passphrase twice, before it creates anything.
 - It must be at least 12 characters and at most 1024 bytes of UTF-8.
 - It's used as typed, with no Unicode normalization. It never leaves the device, so it's always typed on the same keyboard and system.
 
 **Unlocking.**
-- `openvault` asks for the passphrase on the terminal itself (`/dev/tty`), not on stdin, so commands that read stdin, such as `import-env -`, still work.
+- `pinkvault` asks for the passphrase on the terminal itself (`/dev/tty`), not on stdin, so commands that read stdin, such as `import-env -`, still work.
 - After three wrong passphrases the command stops.
 - With no terminal, the command fails and says so. Nothing reads a passphrase from an environment variable or a file, where it would sit next to the key file it protects.
-- For now every command asks. Once `openvault service` runs (M2), it asks once and keeps the keys while it runs.
+- For now every command asks. Once `pinkvault service` runs (M2), it asks once and keeps the keys while it runs.
 
 **Forgetting it.** A forgotten passphrase can't be recovered, so the device is treated as lost. Its collections are still on the other devices and wrapped to the recovery key. It joins again as a new device, and the old one is revoked.
 
 ## Changing the protection
 
-- `openvault keys` says how this device's keys are kept: in the Secure Enclave, or in a key file with or without a passphrase.
-- `openvault keys passphrase` gives a key file a passphrase, or changes the one it has. It asks for the current passphrase if there is one, then for the new one twice, by the rules for choosing one.
-- `openvault keys passphrase --remove` takes the passphrase away. It asks for the current one, says that anyone who copies the key file will then have the keys, and asks before it goes on.
+- `pinkvault keys` says how this device's keys are kept: in the Secure Enclave, or in a key file with or without a passphrase.
+- `pinkvault keys passphrase` gives a key file a passphrase, or changes the one it has. It asks for the current passphrase if there is one, then for the new one twice, by the rules for choosing one.
+- `pinkvault keys passphrase --remove` takes the passphrase away. It asks for the current one, says that anyone who copies the key file will then have the keys, and asks before it goes on.
 - Secure Enclave keys are refused, with the reason.
 
 **The same keys.** Only the protection changes. The device keeps its id and its transport key, nothing goes into the membership log, and the other devices see no difference.
@@ -105,7 +105,7 @@ Creating a key file writes it and then loads it back. A key that won't restore i
 
 If a step fails, `keys` is as it was.
 
-**Copies made earlier.** A passphrase protects the file from the moment it's added. A copy of the old file, in a backup for instance, still opens without one, and the old file's blocks can stay on the disk until they're reused. `openvault keys passphrase` says so when it adds one.
+**Copies made earlier.** A passphrase protects the file from the moment it's added. A copy of the old file, in a backup for instance, still opens without one, and the old file's blocks can stay on the disk until they're reused. `pinkvault keys passphrase` says so when it adds one.
 
 **A running service** keeps the keys it unlocked, so it needn't restart. A service that the operating system starts can't type a passphrase, though (service.md, starting at login). Adding one where the service is installed says that the service won't start again by itself.
 
@@ -117,7 +117,7 @@ If a step fails, `keys` is as it was.
   - The key is not permanent.
   - Access control is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` with `privateKeyUsage`.
 - No user presence is required. Device keys are used on every read, and Touch ID is kept for the admin key (below).
-- The keys work only after the first unlock since boot. They then keep working while the screen is locked, so `openvault run` works in jobs on a locked Mac mini.
+- The keys work only after the first unlock since boot. They then keep working while the screen is locked, so `pinkvault run` works in jobs on a locked Mac mini.
 
 **Storage.**
 - The keys aren't in the keychain. A Secure Enclave key there needs the data protection keychain and a `keychain-access-groups` entitlement, which needs a signed app with a provisioning profile.
@@ -138,11 +138,11 @@ If a step fails, `keys` is as it was.
 
 **Unwrapping.**
 - The Secure Enclave computes the ECDH x-coordinate (`kSecKeyAlgorithmECDHKeyExchangeStandard`).
-- `openvault-crypto` runs the rest of HPKE (crypto.md, hardware keys).
+- `pinkvault-crypto` runs the rest of HPKE (crypto.md, hardware keys).
 
 ## Admin key
 
-The device that administers the vault, the MacBook in design §12, has an admin key that signs membership log entries (membership.md). `openvault init` creates one on a Mac with a Secure Enclave, and genesis lists it next to the recovery admin key. Devices without a Secure Enclave get none, and sign as admin with the recovery phrase.
+The device that administers the vault, the MacBook in design §12, has an admin key that signs membership log entries (membership.md). `pinkvault init` creates one on a Mac with a Secure Enclave, and genesis lists it next to the recovery admin key. Devices without a Secure Enclave get none, and sign as admin with the recovery phrase.
 
 **The key.**
 - A P-256 Secure Enclave key, created and restored as above.
@@ -155,14 +155,14 @@ The device that administers the vault, the MacBook in design §12, has an admin 
 - An approval that signs several things asks once. A join, for example, signs add_device and its set_scope entries; a revocation signs rotate_epoch entries and grants too.
 - The `LAContext` is authenticated once, with a reason that names the whole approval, and is then passed to every signature in it.
 - In `crates/keystore`, an `AdminKey` restores its key with one context the first time it's used, and signs every later signature with that key, so one approval uses one `AdminKey`.
-- Checked on a MacBook with macOS 26 on 2026-11-07: `cargo test -p openvault-keystore -- --ignored` signs three times and asks once. Since 0.5.8 the test authenticates first (below), then signs three times. Checked again on 2026-11-13: one prompt, and coreauthd logged one signing evaluation (`evaluateACL … operation:osgn`) and one Touch ID match for the four signatures.
+- Checked on a MacBook with macOS 26 on 2026-11-07: `cargo test -p pinkvault-keystore -- --ignored` signs three times and asks once. Since 0.5.8 the test authenticates first (below), then signs three times. Checked again on 2026-11-13: one prompt, and coreauthd logged one signing evaluation (`evaluateACL … operation:osgn`) and one Touch ID match for the four signatures.
 
 **Asking first.** A caller can ask before it signs. The service does this so that the vault isn't locked while the dialog is open (service.md, asking for Touch ID).
 - `AdminKey::authenticate` restores the key with its context and signs the fixed input `openvault v1 admin presence`, which asks. The approval's signatures then use the same context and don't ask.
-- Every signature openvault checks covers a context label first (`openvault v1 sig …`), so this one can't pass for any of them. It's dropped as soon as it's made, and never stored or sent.
+- Every signature pinkvault checks covers a context label first (`openvault v1 sig …`), so this one can't pass for any of them. It's dropped as soon as it's made, and never stored or sent.
 - A signature, rather than evaluating the key's access control with `LAContext`, because it's the call the approval's other signatures already make, so the same context is known to carry the authentication over.
 
-**The admin key file.** It sits next to the key file, as `admin` in the `openvault` directory, with the same rules: created only if absent, mode 0600, refused if others can read it or if it's over 16 KiB.
+**The admin key file.** It sits next to the key file, as `admin` in the vault directory, with the same rules: created only if absent, mode 0600, refused if others can read it or if it's over 16 KiB.
 
 ```
 magic  "openvault v1 admin key" ‖ 0x00   23 bytes

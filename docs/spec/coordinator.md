@@ -1,8 +1,8 @@
 # Coordinator spec, v1
 
-Status: draft, 2026-11-10. Milestone M3 (design §18), built in stages: the relay and the log copy first, then addresses and presence, then joins away from home. Stage 1 is built and paused: since 0.3.2 the grandfather, `openvault coordinator` and the service's use of them are compiled only with the cargo feature `coordinator` (`cargo install --locked --path crates/cli --features coordinator`), which is off by default. A service built without it ignores a `coordinator` file, with a warning. Builds on [service.md](service.md), [sync.md](sync.md), [join.md](join.md) and [membership.md](membership.md). The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking), [§11](../design.md#11-coordinator) and [§12](../design.md#12-platforms).
+Status: draft, 2026-11-10. Milestone M3 (design §18), built in stages: the relay and the log copy first, then addresses and presence, then joins away from home. Stage 1 is built and paused: since 0.3.2 the grandfather, `pinkvault coordinator` and the service's use of them are compiled only with the cargo feature `coordinator` (`cargo install --locked --path crates/cli --features coordinator`), which is off by default. A service built without it ignores a `coordinator` file, with a warning. Builds on [service.md](service.md), [sync.md](sync.md), [join.md](join.md) and [membership.md](membership.md). The design is in [design §5](../design.md#5-architecture), [§10](../design.md#10-networking), [§11](../design.md#11-coordinator) and [§12](../design.md#12-platforms).
 
-The grandfather is the vault's always-on machine: the Mac mini here. `openvault grandfather` runs two things there for one vault:
+The grandfather is the vault's always-on machine: the Mac mini here. `pinkvault grandfather` runs two things there for one vault:
 - **a relay**, which forwards traffic between devices that can't reach each other directly;
 - **a coordinator**, which keeps a copy of the membership log, a directory of where each device can be reached, who is online, and a board where devices waiting to join can be found.
 
@@ -25,20 +25,20 @@ A device with no coordinator configured works as in M2: local network only, no r
 ## Running the grandfather
 
 ```
-openvault grandfather --vault <vault id> --hostname <name> [--port 443] [--data <dir>]
+pinkvault grandfather --vault <vault id> --hostname <name> [--port 443] [--data <dir>]
                       [--cert <file> --key <file>]
-openvault grandfather install [same options]     start it at login, as service.md's install does
+pinkvault grandfather install [same options]     start it at login, as service.md's install does
 ```
 
-- **Its data directory** is `--data`, by default `grandfather` in the openvault directory.
+- **Its data directory** is `--data`, by default `grandfather` in the vault directory.
 - **Its identity.** At its first start it creates an iroh secret key in `grandfather.key` in its data directory (mode 0600). Its endpoint id is the coordinator's identity. It is not a device: it isn't in the log and holds no collection keys.
-- **Its address**, which devices are given, is `ov1:<endpoint id in hex>@<hostname>[:<port>]`, with the port left out when it's 443. `openvault grandfather` prints it when it starts.
+- **Its address**, which devices are given, is `ov1:<endpoint id in hex>@<hostname>[:<port>]`, with the port left out when it's 443. `pinkvault grandfather` prints it when it starts.
 - **Its port.** The port is TCP for the relay's HTTPS and UDP for the coordinator. The relay has no QUIC address discovery, so there is no UDP 7842 (relay, below).
 - **One vault.** `--vault` names it at the first start, and the data directory remembers it. The coordinator takes only a log whose genesis has that vault id (membership.md, creating a vault), so a device of another vault can't take it over.
   - Until a device gives it the log, it takes the first genesis with that id. The vault id isn't secret (sync.md's hello carries it), so an endpoint that got there first could leave it holding another log. Devices would then be refused, which costs availability only; removing `coordinator.db` starts it over.
 - **Where it runs.**
   - **On a Linux host,** in Docker: the image's `grandfather` mode (below).
-  - **On the Mac mini, natively,** with `openvault grandfather install`. Docker Desktop on macOS passes connections through its own network, so the relay would see that network's address instead of each device's, and could no longer tell devices their own public address, which hole punching needs.
+  - **On the Mac mini, natively,** with `pinkvault grandfather install`. Docker Desktop on macOS passes connections through its own network, so the relay would see that network's address instead of each device's, and could no longer tell devices their own public address, which hole punching needs.
 - **Reaching it from outside.**
   - `--hostname` must resolve to the home connection's public address (an A record, and an AAAA record where IPv6 works), kept current by dynamic DNS.
   - The router forwards TCP and UDP on the port to the grandfather.
@@ -58,7 +58,7 @@ openvault grandfather install [same options]     start it at login, as service.m
   It denies everyone else, so it isn't a free relay for the internet. iroh tries a refused connection again about every 16 seconds.
 - **When the list is read.** The relay checks an endpoint when it connects. A device revoked while connected keeps its connection until it drops; other devices refuse it anyway (sync.md), and a revoked device's own service leaves the relay (devices, below).
 - **Presence.** The relay knows which admitted endpoints are connected. That is what "online" means here, and it is kept in memory only, never written.
-- **Its log** leaves out iroh-relay's error for each HTTPS connection that failed. On a public port 443 those come from scanners and from handshakes that end early, Let's Encrypt's checks among them: 35 in the first hour of the first run, none of them the relay's own fault. `OPENVAULT_LOG` shows them again.
+- **Its log** leaves out iroh-relay's error for each HTTPS connection that failed. On a public port 443 those come from scanners and from handshakes that end early, Let's Encrypt's checks among them: 35 in the first hour of the first run, none of them the relay's own fault. `PINKVAULT_LOG` shows them again.
 
 ## Coordinator
 
@@ -109,7 +109,7 @@ Framing, hello, the log messages and errors are sync.md's. The rest:
 - A member going offline is a change too.
 
 **The join board.**
-- A joiner that was given the coordinator's address (`openvault join --coordinator`) connects, posts its hint, and keeps the connection open while it waits.
+- A joiner that was given the coordinator's address (`pinkvault join --coordinator`) connects, posts its hint, and keeps the connection open while it waits.
 - Its entry ends when that connection closes, or after 10 minutes.
 - The board holds at most 16 entries. A post when it's full gets error "bad message", and the joiner says the board is full.
 - list joins answers with the entries left.
@@ -118,8 +118,8 @@ Framing, hello, the log messages and errors are sync.md's. The rest:
 ## Devices
 
 **Configuring.**
-- `openvault coordinator set <address>` keeps the address in a file `coordinator` in the openvault directory. `openvault coordinator` shows it, and whether the coordinator answers.
-- `openvault coordinator unset` goes back to the local network only.
+- `pinkvault coordinator set <address>` keeps the address in a file `coordinator` in the vault directory. `pinkvault coordinator` shows it, and whether the coordinator answers.
+- `pinkvault coordinator unset` goes back to the local network only.
 - The address is per device. Keeping it in the membership log, signed by an admin, so every device learns it, is not in v1.
 
 **In the service**, with a coordinator configured:
@@ -131,8 +131,8 @@ Framing, hello, the log messages and errors are sync.md's. The rest:
 - **Reachable members.** A member is reachable while mDNS shows it or the coordinator says it's online. Every rule in sync.md about visible members applies to reachable ones: sessions start when a member becomes reachable and after local writes and log entries, retries stop when it isn't reachable, and a member that isn't reachable is never dialed.
 
 **Joining away from home.**
-- `openvault join --coordinator <address>` posts to the board and also announces itself on mDNS, as now.
-- `openvault approve` lists the board's entries along with mDNS's, if this device has a coordinator configured.
+- `pinkvault join --coordinator <address>` posts to the board and also announces itself on mDNS, as now.
+- `pinkvault approve` lists the board's entries along with mDNS's, if this device has a coordinator configured.
 - The join runs as join.md says, over iroh, through the relay when it must. The PAKE binds both transport keys to the code, so neither the relay nor the coordinator can get in the middle.
 - The new device takes the coordinator's address as its own.
 
@@ -144,9 +144,9 @@ Framing, hello, the log messages and errors are sync.md's. The rest:
 
 ## Docker image
 
-One image, `openvault`, for linux/amd64 and linux/arm64, with two modes:
-- **`grandfather`:** `openvault grandfather`, with its data directory in a volume. It needs host networking, or ports published without address translation, for the relay.
-- **`device`:** `openvault service` with software keys (keystore.md) in a volume, for a host that keeps `hold` copies with no native install.
+One image, `pinkvault`, for linux/amd64 and linux/arm64, with two modes:
+- **`grandfather`:** `pinkvault grandfather`, with its data directory in a volume. It needs host networking, or ports published without address translation, for the relay.
+- **`device`:** `pinkvault service` with software keys (keystore.md) in a volume, for a host that keeps `hold` copies with no native install.
 
 A compose example and a self-hosting guide (`docs/self-hosting.md`) come with it.
 

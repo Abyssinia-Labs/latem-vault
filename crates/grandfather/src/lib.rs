@@ -19,8 +19,8 @@ use anyhow::{Context as _, Result};
 use iroh::endpoint::{BindOpts, presets};
 use iroh::{Endpoint, RelayMode, SecretKey};
 use iroh_relay::server::Server;
-use latem_vault_core::VaultId;
-use latem_vault_net::coord::{self, Address};
+use pinkvault_core::VaultId;
+use pinkvault_net::coord::{self, Address};
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
@@ -204,7 +204,7 @@ fn load_or_create_key(path: &Path) -> Result<SecretKey> {
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     match options.open(path) {
         Ok(mut file) => {
-            let seed = latem_vault_crypto::random_bytes::<32>();
+            let seed = pinkvault_crypto::random_bytes::<32>();
             file.write_all(&*seed)?;
             file.sync_all()?;
             Ok(SecretKey::from_bytes(&seed))

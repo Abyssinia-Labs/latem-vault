@@ -101,4 +101,4 @@ _ = diskNotEncrypted()
 
 watch.stop()
 check(listener.ended.wait(timeout: .now() + 10) == .success, "the watch didn't end")
-print("latem-vault-ffi \(version()) works from Swift: \(entries.count) entries, a file, \(log.count) log entries")
+print("pinkvault-ffi \(version()) works from Swift: \(entries.count) entries, a file, \(log.count) log entries")

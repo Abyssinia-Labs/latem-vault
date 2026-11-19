@@ -62,7 +62,7 @@ Keys inside payloads use the crypto.md encodings, whose first bytes give their l
 Device names and platforms are sealed, so that the coordinator's copy of the log (from M3) doesn't show them. Default names are host names, which often contain the owner's name.
 
 **The key.**
-- `openvault init` generates the vault's **names key**: 32 random bytes.
+- `pinkvault init` generates the vault's **names key**: 32 random bytes.
 - Genesis carries it wrapped to the recovery wrapping key, and each add_device carries it wrapped to the device being added.
 - So each device gets the key from its own entry, which an admin signed, and recovery gets it from genesis.
 - Wrapping is crypto.md key wrapping, with context `"names key" ‖ 0x00 ‖ vault id`.
@@ -132,14 +132,14 @@ The log grows with membership changes, not with data. A vault with 10 devices an
 
 ## Creating a vault
 
-`openvault init` generates the recovery key, then signs two entries with the recovery admin key while it is still in memory:
+`pinkvault init` generates the recovery key, then signs two entries with the recovery admin key while it is still in memory:
 
 1. genesis, listing the recovery admin key, this device's admin key if it has one (keystore.md, admin key), the recovery wrapping key, and a new names key wrapped to it;
 2. add_device for this device, with its sealed name and the names key wrapped to it.
 
-The recovery key is then dropped. It's needed again only to recover, or to sign as an admin on a device that has no admin key. So `openvault collections create` asks for Touch ID on a Mac that has an admin key, and for the recovery phrase on any other device, including Macs whose vaults were created before admin keys existed.
+The recovery key is then dropped. It's needed again only to recover, or to sign as an admin on a device that has no admin key. So `pinkvault collections create` asks for Touch ID on a Mac that has an admin key, and for the recovery phrase on any other device, including Macs whose vaults were created before admin keys existed.
 
-Vaults created in M1 have no log. Opening one adds the empty `log` table (store version 2) and nothing else, so reading keeps working. The first time an admin signature is needed, which today means creating a collection, `openvault` asks for the recovery phrase. It checks that the phrase derives the vault's recovery wrapping key, then writes, in one transaction:
+Vaults created in M1 have no log. Opening one adds the empty `log` table (store version 2) and nothing else, so reading keeps working. The first time an admin signature is needed, which today means creating a collection, `pinkvault` asks for the recovery phrase. It checks that the phrase derives the vault's recovery wrapping key, then writes, in one transaction:
 
 1. genesis and add_device for the existing device;
 2. a set_scope giving it `write` on each existing collection, plus rotate_epoch entries for any epoch past 0.

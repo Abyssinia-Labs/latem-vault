@@ -62,5 +62,5 @@ jobs:
         # Nobody can grant this runner Local Network access, so the tests that need mDNS are
         # skipped here (scripts/ci.sh names them). The linux job runs them.
         env:
-          LATEM_VAULT_CI_NO_MULTICAST: "1"
+          PINKVAULT_CI_NO_MULTICAST: "1"
         run: scripts/ci.sh macos

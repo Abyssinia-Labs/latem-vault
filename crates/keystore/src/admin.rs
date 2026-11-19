@@ -3,8 +3,8 @@
 
 use std::path::Path;
 
-use latem_vault_core::membership;
-use latem_vault_crypto::{Signature, SignatureContext, VerifyingKey};
+use pinkvault_core::membership;
+use pinkvault_crypto::{Signature, SignatureContext, VerifyingKey};
 
 use crate::{Backend, Error, Result, file};
 
@@ -106,14 +106,10 @@ impl membership::AdminKey for AdminKey {
         self.verifying_key.clone()
     }
 
-    fn sign(
-        &self,
-        context: SignatureContext,
-        message: &[u8],
-    ) -> latem_vault_core::Result<Signature> {
+    fn sign(&self, context: SignatureContext, message: &[u8]) -> pinkvault_core::Result<Signature> {
         #[cfg(target_os = "macos")]
         {
-            let input = latem_vault_crypto::sign::signing_input(context, message);
+            let input = pinkvault_crypto::sign::signing_input(context, message);
             Ok(self.signer()?.sign(&input)?)
         }
         #[cfg(not(target_os = "macos"))]

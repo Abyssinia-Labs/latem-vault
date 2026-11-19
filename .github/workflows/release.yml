@@ -1,19 +1,19 @@
 # A release, from a pushed vMAJOR.MINOR.PATCH tag on main. docs/release.md is the part a
 # person does; this is the rest.
 #
-# What a release is. The names are a contract with the Homebrew tap's bin/bump-latem-vault,
+# What a release is. The names are a contract with the Homebrew tap's bin/bump-pinkvault,
 # which looks for exactly these:
 #
-#   latem-vault_<version>_<os>_<arch>.tar.gz    the binary at the archive root, `vault` and `lv`
-#                                               as relative links to it, the licences, README
-#   latem-vault_<version>_checksums.txt         sha256 of every archive above
-#   latem-vault_<version>_checksums.txt.minisig its minisign signature, by latem-vault.pub's key
+#   pinkvault_<version>_<os>_<arch>.tar.gz    the binary at the archive root, `pink`
+#                                             as a relative link to it, the licences, README
+#   pinkvault_<version>_checksums.txt         sha256 of every archive above
+#   pinkvault_<version>_checksums.txt.minisig its minisign signature, by pinkvault.pub's key
 #
 # <version> has no leading `v`; the tag does. os is darwin or linux, arch arm64 or amd64.
 #
 # One signature, over the manifest: it binds each archive to a name that carries the version, so
 # a genuine archive can't be passed off as another release's. The signature's trusted comment is
-# "latem-vault <tag>", and the tap checks that too.
+# "pinkvault <tag>", and the tap checks that too.
 #
 # `workflow_dispatch` is a rehearsal: it runs the checks, builds and smoke-tests all four
 # archives and writes the manifest, and signs and publishes nothing.
@@ -99,7 +99,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       TARGET: ${{ matrix.target }}
-      ARCHIVE: latem-vault_${{ needs.version.outputs.bare }}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
+      ARCHIVE: pinkvault_${{ needs.version.outputs.bare }}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: rust
@@ -115,18 +115,18 @@ jobs:
             echo "$cc_var=musl-gcc" >> "$GITHUB_ENV"
           fi
       - name: build
-        run: cargo build --release --locked -p latem-vault-cli --target "$TARGET"
+        run: cargo build --release --locked -p pinkvault-cli --target "$TARGET"
       - name: run it here
         env:
           BARE: ${{ needs.version.outputs.bare }}
         run: |
           set -euo pipefail
-          bin="target/$TARGET/release/latem-vault"
+          bin="target/$TARGET/release/pinkvault"
           echo "==> $TARGET on $(uname -srm)"
           file "$bin"
           # The version and commit the binary prints are what the release is: a build that lost
           # the commit (build.rs) says "unknown".
-          want="latem-vault $BARE ($(git rev-parse --short=7 HEAD))"
+          want="pinkvault $BARE ($(git rev-parse --short=7 HEAD))"
           got=$("$bin" --version)
           if [ "$got" != "$want" ]; then
             echo "::error::the binary says \"$got\", and this release is \"$want\"" >&2
@@ -141,25 +141,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/$TARGET/release/latem-vault" dist/
-          # The short names, as latem has ltm: relative links, so they run the latem-vault
+          cp "target/$TARGET/release/pinkvault" dist/
+          # The short names, as latem has ltm: relative links, so they run the pinkvault
           # beside them wherever the archive is unpacked. The same list as SHORT in
           # crates/cli/src/name.rs.
-          short_names="lv vlt"
+          short_names="pink"
           for name in $short_names; do
-            ln -s latem-vault "dist/$name"
+            ln -s pinkvault "dist/$name"
           done
           # shellcheck disable=SC2086 # one word per name
-          tar -czf "dist/$ARCHIVE" -C dist latem-vault $short_names -C "$GITHUB_WORKSPACE" \
+          tar -czf "dist/$ARCHIVE" -C dist pinkvault $short_names -C "$GITHUB_WORKSPACE" \
             LICENSE-APACHE LICENSE-MIT README.md
-          for name in latem-vault $short_names; do
+          for name in pinkvault $short_names; do
             rm "dist/$name"
           done
           # Unpacked, each name runs the binary, and its hints name it.
           unpacked=$(mktemp -d)
           tar -xzf "dist/$ARCHIVE" -C "$unpacked"
           for name in $short_names; do
-            test "$(readlink "$unpacked/$name")" = latem-vault
+            test "$(readlink "$unpacked/$name")" = pinkvault
             "$unpacked/$name" --version
             case "$("$unpacked/$name" --help)" in
               *"Usage: $name "*) ;;
@@ -191,9 +191,9 @@ jobs:
           set -- *.tar.gz
           test "$#" -eq 4
           # A glob is sorted, so the same archives make the same manifest.
-          sha256sum -- "$@" > "latem-vault_${BARE}_checksums.txt"
-          sha256sum -c "latem-vault_${BARE}_checksums.txt"
-          cat "latem-vault_${BARE}_checksums.txt"
+          sha256sum -- "$@" > "pinkvault_${BARE}_checksums.txt"
+          sha256sum -c "pinkvault_${BARE}_checksums.txt"
+          cat "pinkvault_${BARE}_checksums.txt"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
@@ -237,15 +237,15 @@ jobs:
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$keydir/minisign.key"
           # The trusted comment is signed as well; the tap checks it names this release.
           printf '%s\n' "$MINISIGN_PASSWORD" |
-            minisign -S -s "$keydir/minisign.key" -m "dist/latem-vault_${BARE}_checksums.txt" \
-              -t "latem-vault ${VERSION}"
+            minisign -S -s "$keydir/minisign.key" -m "dist/pinkvault_${BARE}_checksums.txt" \
+              -t "pinkvault ${VERSION}"
       # Against the committed key, which is the one the tap and anyone checking by hand use: this
       # is what catches a secret holding some other key.
-      - name: verify against latem-vault.pub
+      - name: verify against pinkvault.pub
         run: |
-          minisign -V -p latem-vault.pub \
-            -m "dist/latem-vault_${BARE}_checksums.txt" \
-            -x "dist/latem-vault_${BARE}_checksums.txt.minisig"
+          minisign -V -p pinkvault.pub \
+            -m "dist/pinkvault_${BARE}_checksums.txt" \
+            -x "dist/pinkvault_${BARE}_checksums.txt.minisig"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signature
@@ -283,20 +283,20 @@ jobs:
             echo "::error::$notes is missing. Every release says what changed (docs/release.md)." >&2
             exit 1
           fi
-          pubkey=$(sed -n 2p latem-vault.pub)
-          keyid=$(sed -n 's/^untrusted comment: minisign public key //p' latem-vault.pub)
+          pubkey=$(sed -n 2p pinkvault.pub)
+          keyid=$(sed -n 's/^untrusted comment: minisign public key //p' pinkvault.pub)
           body=$(mktemp)
           cat "$notes" > "$body"
           cat >> "$body" <<EOF
 
           ## Checking a download
 
-          \`latem-vault_${BARE}_checksums.txt\` lists the sha256 of each archive, and it is signed
-          with latem vault's release key \`${keyid}\` ([latem-vault.pub](https://github.com/${GITHUB_REPOSITORY}/blob/main/latem-vault.pub)):
+          \`pinkvault_${BARE}_checksums.txt\` lists the sha256 of each archive, and it is signed
+          with PinkVault's release key \`${keyid}\` ([pinkvault.pub](https://github.com/${GITHUB_REPOSITORY}/blob/main/pinkvault.pub)):
 
           \`\`\`sh
-          minisign -Vm latem-vault_${BARE}_checksums.txt -P '${pubkey}'
-          shasum -a 256 -c --ignore-missing latem-vault_${BARE}_checksums.txt
+          minisign -Vm pinkvault_${BARE}_checksums.txt -P '${pubkey}'
+          shasum -a 256 -c --ignore-missing pinkvault_${BARE}_checksums.txt
           \`\`\`
 
           The Homebrew formula checks the same signature before it takes a sha256.
@@ -304,8 +304,8 @@ jobs:
           gh release create "$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --title "latem vault ${BARE}" \
+            --title "PinkVault ${BARE}" \
             --notes-file "$body" \
             dist/*.tar.gz \
-            "dist/latem-vault_${BARE}_checksums.txt" \
-            "dist/latem-vault_${BARE}_checksums.txt.minisig"
+            "dist/pinkvault_${BARE}_checksums.txt" \
+            "dist/pinkvault_${BARE}_checksums.txt.minisig"

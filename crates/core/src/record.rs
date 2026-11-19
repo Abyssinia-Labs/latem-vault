@@ -1,7 +1,7 @@
 //! Immutable, signed, sealed records (records.md, records).
 
-use latem_vault_crypto::hash::{self, Hash, contexts};
-use latem_vault_crypto::{Signature, SignatureContext, SymmetricKey, VerifyingKey};
+use pinkvault_crypto::hash::{self, Hash, contexts};
+use pinkvault_crypto::{Signature, SignatureContext, SymmetricKey, VerifyingKey};
 use zeroize::Zeroizing;
 
 use crate::file::{Content, Manifest};

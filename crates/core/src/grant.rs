@@ -1,8 +1,8 @@
 //! Grants: one collection key, for one epoch, wrapped to one recipient and signed by whoever
 //! wrapped it (sync.md, grants).
 
-use latem_vault_crypto::hash::{contexts, derive_key};
-use latem_vault_crypto::{Signature, SignatureContext, VerifyingKey, WrappedKey};
+use pinkvault_crypto::hash::{contexts, derive_key};
+use pinkvault_crypto::{Signature, SignatureContext, VerifyingKey, WrappedKey};
 
 use crate::membership::{Membership, Scope};
 use crate::{CollectionId, DeviceId, Error, Result, VaultId};

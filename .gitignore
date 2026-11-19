@@ -1,5 +1,5 @@
 /target
 
-# minisign secret keys. Only the public half, latem-vault.pub, belongs here (docs/release.md).
+# minisign secret keys. Only the public half, pinkvault.pub, belongs here (docs/release.md).
 *.key
 minisign.key

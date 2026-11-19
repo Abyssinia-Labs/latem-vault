@@ -1,4 +1,4 @@
-//! latem vault's cryptographic building blocks.
+//! PinkVault's cryptographic building blocks.
 //!
 //! Everything here is a thin layer over audited crates: XChaCha20-Poly1305 for
 //! records, HPKE (RFC 9180) for wrapping collection keys, Ed25519 and ECDSA
